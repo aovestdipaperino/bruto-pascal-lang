@@ -9,4 +9,4 @@ description = "Mini-Pascal language implementation for bruto-ide"
 [dependencies]
 turbo-vision = { git = "https://github.com/aovestdipaperino/turbo-vision-4-rust.git" }
 inkwell = { version = "0.8.0", features = ["llvm18-1"] }
-bruto-ide = { path = "../bruto-ide" }
+bruto-ide = { git = "https://github.com/aovestdipaperino/bruto-ide.git" }
