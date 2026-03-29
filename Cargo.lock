@@ -64,6 +64,7 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 [[package]]
 name = "bruto-ide"
 version = "0.1.0"
+source = "git+https://github.com/aovestdipaperino/bruto-ide.git#72f1db3bf7b1782c34eca24e7c820d89df94c112"
 dependencies = [
  "turbo-vision",
 ]
