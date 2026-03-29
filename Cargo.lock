@@ -64,7 +64,7 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 [[package]]
 name = "bruto-ide"
 version = "0.1.0"
-source = "git+https://github.com/aovestdipaperino/bruto-ide.git#72f1db3bf7b1782c34eca24e7c820d89df94c112"
+source = "git+https://github.com/aovestdipaperino/bruto-ide.git#28dc1a62e5dbd037592a70995d8ace48eeeb1d9f"
 dependencies = [
  "turbo-vision",
 ]
@@ -891,8 +891,8 @@ dependencies = [
 
 [[package]]
 name = "turbo-vision"
-version = "1.0.3"
-source = "git+https://github.com/aovestdipaperino/turbo-vision-4-rust.git#b1f1b48b49f28fc2ec2a7b2e6b999076cf3581bf"
+version = "1.0.4"
+source = "git+https://github.com/aovestdipaperino/turbo-vision-4-rust.git#eae1206dfb12d020e5a1f7730b02b1464e704bbb"
 dependencies = [
  "arboard",
  "base64",
