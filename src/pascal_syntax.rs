@@ -23,11 +23,12 @@ impl PascalHighlighter {
                 | "div" | "mod" | "and" | "or" | "not"
                 | "true" | "false" | "const" | "type" | "procedure" | "function"
                 | "array" | "of" | "record" | "nil" | "case" | "with"
+                | "new" | "dispose" | "forward"
         )
     }
 
     fn is_type_name(word: &str) -> bool {
-        matches!(word, "integer" | "string" | "boolean" | "real" | "char" | "byte" | "word" | "longint")
+        matches!(word, "integer" | "string" | "boolean" | "real" | "char" | "byte" | "word" | "longint" | "text")
     }
 }
 

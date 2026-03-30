@@ -5,7 +5,9 @@ mod codegen;
 mod parser;
 mod pascal_syntax;
 
-use bruto_ide::language::{BuildResult, Language};
+use std::collections::HashSet;
+
+use bruto_lang::language::{BuildResult, Language};
 use codegen::CodeGen;
 use inkwell::context::Context;
 use parser::Parser;
@@ -28,6 +30,19 @@ impl Language for MiniPascal {
 
     fn create_highlighter(&self) -> Box<dyn turbo_vision::views::syntax::SyntaxHighlighter> {
         Box::new(PascalHighlighter::new())
+    }
+
+    fn valid_breakpoint_lines(&self, source: &str) -> HashSet<usize> {
+        let mut parser = Parser::new(source);
+        let Ok(program) = parser.parse_program() else {
+            return HashSet::new();
+        };
+        let mut lines = HashSet::new();
+        for proc in &program.procedures {
+            collect_block_lines(&proc.body, &mut lines);
+        }
+        collect_block_lines(&program.body, &mut lines);
+        lines
     }
 
     fn build(&self, source: &str) -> Result<BuildResult, String> {
@@ -57,23 +72,137 @@ impl Language for MiniPascal {
     }
 }
 
-const SAMPLE_PROGRAM: &str = r#"program Hello;
-var
-  x: integer;
-  i: integer;
-begin
-  x := 0;
-  i := 1;
-  while i <= 10 do
-  begin
-    x := x + i;
-    i := i + 1
+/// Collect lines where codegen emits debug locations (i.e. executable lines).
+fn collect_block_lines(block: &ast::Block, lines: &mut HashSet<usize>) {
+    for stmt in &block.statements {
+        collect_stmt_lines(stmt, lines);
+    }
+    // `end` keyword is breakpoint-eligible (codegen emits a debug alloca there)
+    lines.insert(block.end_span.line as usize);
+}
+
+fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
+    match stmt {
+        ast::Statement::Assignment { span, .. }
+        | ast::Statement::DerefAssignment { span, .. }
+        | ast::Statement::WriteLn { span, .. }
+        | ast::Statement::Write { span, .. }
+        | ast::Statement::ReadLn { span, .. }
+        | ast::Statement::New { span, .. }
+        | ast::Statement::Dispose { span, .. }
+        | ast::Statement::IndexAssignment { span, .. }
+        | ast::Statement::FieldAssignment { span, .. }
+        | ast::Statement::ProcCall { span, .. } => {
+            lines.insert(span.line as usize);
+        }
+        ast::Statement::If { condition: _, then_branch, else_branch, span } => {
+            lines.insert(span.line as usize); // the `if` condition line
+            collect_block_lines(then_branch, lines);
+            if let Some(eb) = else_branch {
+                collect_block_lines(eb, lines);
+            }
+        }
+        ast::Statement::While { condition: _, body, span } => {
+            lines.insert(span.line as usize);
+            collect_block_lines(body, lines);
+        }
+        ast::Statement::For { body, span, .. } => {
+            lines.insert(span.line as usize);
+            collect_block_lines(body, lines);
+        }
+        ast::Statement::RepeatUntil { body, span, .. } => {
+            lines.insert(span.line as usize);
+            for stmt in body {
+                collect_stmt_lines(stmt, lines);
+            }
+        }
+        ast::Statement::Block(block) => {
+            collect_block_lines(block, lines);
+        }
+    }
+}
+
+const SAMPLE_PROGRAM: &str = r#"program Demo;
+const
+  Size = 5;
+
+type
+  Vector = array[1..5] of integer;
+  Point = record
+    x, y: real;
   end;
-  writeln('Sum of 1..10 = ', x);
-  if x = 55 then
-    writeln('Correct!')
+
+var
+  nums: Vector;
+  pt: Point;
+  total, i: integer;
+  avg: real;
+  msg: string;
+  p: ^integer;
+
+procedure Fill(var a: Vector; n: integer);
+var
+  k: integer;
+begin
+  for k := 1 to n do
+    a[k] := k * k
+end;
+
+function Sum(var a: Vector; n: integer): integer;
+var
+  s, j: integer;
+begin
+  s := 0;
+  for j := 1 to n do
+    s := s + a[j];
+  Sum := s
+end;
+
+begin
+  { Arrays and procedures }
+  Fill(nums, Size);
+  total := Sum(nums, Size);
+  avg := total / Size;
+  writeln('Squares: 1..', Size);
+  for i := 1 to Size do
+    write(nums[i], ' ');
+  writeln;
+
+  { Real arithmetic }
+  writeln('Sum = ', total);
+  writeln('Avg = ', avg);
+
+  { Records }
+  pt.x := avg;
+  pt.y := 3.14;
+  writeln('Point = (', pt.x, ', ', pt.y, ')');
+
+  { Strings }
+  msg := 'Hello' + ' ' + 'Pascal!';
+  writeln(msg, ' len=', length(msg));
+
+  { Heap pointers }
+  new(p);
+  p^ := 42;
+  writeln('Heap value: ', p^);
+  dispose(p);
+
+  { Repeat-until }
+  i := 1;
+  repeat
+    i := i * 2
+  until i > 100;
+  writeln('First power of 2 > 100: ', i);
+
+  { ord / chr }
+  writeln('ord(A) = ', ord('A'));
+  write('chr(90) = ');
+  writeln(chr(90));
+
+  if total = 55 then
+    writeln('All correct!')
   else
-    writeln('Wrong!')
+    writeln('Something is wrong!')
 end.
 "#;
 
@@ -81,27 +210,172 @@ end.
 mod tests {
     use super::*;
 
-    #[test]
-    fn build_and_run() {
+    fn build_and_run_source(source: &str) -> (bool, String) {
         let lang = MiniPascal;
-        let result = lang.build(
-            "program Test;\nvar\n  x: integer;\nbegin\n  x := 42;\n  writeln(x)\nend.\n",
-        ).expect("build failed");
-
+        let result = lang.build(source).expect("build failed");
         let _ = std::fs::remove_file("/tmp/turbo_pascal_console.txt");
         let status = std::process::Command::new(&result.exe_path)
             .stdout(std::process::Stdio::null())
             .status()
             .expect("run failed");
-        assert!(status.success());
-
         let captured = std::fs::read_to_string(&result.console_capture_path)
-            .expect("capture file missing");
-        assert_eq!(captured.trim(), "42");
-
+            .unwrap_or_default();
         let _ = std::fs::remove_file(&result.exe_path);
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&result.source_path);
         let _ = std::fs::remove_file(&result.console_capture_path);
+        (status.success(), captured)
+    }
+
+    #[test]
+    fn build_and_run_simple() {
+        let (ok, out) = build_and_run_source(
+            "program Test;\nvar\n  x: integer;\nbegin\n  x := 42;\n  writeln(x)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn sample_program_runs() {
+        let (ok, out) = build_and_run_source(SAMPLE_PROGRAM);
+        assert!(ok, "sample program failed to run");
+        assert!(out.contains("Sum = 55"), "expected sum, got: {out}");
+        assert!(out.contains("Avg = "), "expected avg, got: {out}");
+        assert!(out.contains("Point = ("), "expected point, got: {out}");
+        assert!(out.contains("Hello Pascal!"), "expected string, got: {out}");
+        assert!(out.contains("Heap value: 42"), "expected heap, got: {out}");
+        assert!(out.contains("First power of 2 > 100: 128"), "expected repeat, got: {out}");
+        assert!(out.contains("ord(A) = 65"), "expected ord, got: {out}");
+        assert!(out.contains("chr(90) = Z"), "expected chr, got: {out}");
+        assert!(out.contains("All correct!"), "expected correct, got: {out}");
+    }
+
+    #[test]
+    fn for_loop() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar i: integer;\nbegin\n  for i := 1 to 5 do\n    write(i);\n  writeln\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "12345");
+    }
+
+    #[test]
+    fn repeat_until() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar i: integer;\nbegin\n  i := 0;\n  repeat\n    i := i + 1\n  until i = 3;\n  writeln(i)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "3");
+    }
+
+    #[test]
+    fn procedure_call() {
+        let (ok, out) = build_and_run_source(
+            "program T;\n\nprocedure Hello;\nbegin\n  writeln('Hi')\nend;\n\nbegin\n  Hello\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "Hi");
+    }
+
+    #[test]
+    fn function_call() {
+        let (ok, out) = build_and_run_source(
+            "program T;\n\nfunction Double(x: integer): integer;\nbegin\n  Double := x * 2\nend;\n\nbegin\n  writeln(Double(21))\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn var_parameter() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar a: integer;\n\nprocedure Inc(var x: integer);\nbegin\n  x := x + 1\nend;\n\nbegin\n  a := 5;\n  Inc(a);\n  writeln(a)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "6");
+    }
+
+    #[test]
+    fn real_arithmetic() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar r: real;\nbegin\n  r := 3.14;\n  writeln(r)\nend.\n",
+        );
+        assert!(ok);
+        assert!(out.trim().starts_with("3.14"), "got: {out}");
+    }
+
+    #[test]
+    fn heap_new_dispose() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar p: ^integer;\nbegin\n  new(p);\n  p^ := 99;\n  writeln(p^);\n  dispose(p)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "99");
+    }
+
+    #[test]
+    fn const_section() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nconst\n  X = 42;\nbegin\n  writeln(X)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn array_indexing() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar a: array[1..5] of integer;\n  i: integer;\nbegin\n  for i := 1 to 5 do\n    a[i] := i * i;\n  writeln(a[3])\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "9");
+    }
+
+    #[test]
+    fn record_field_access() {
+        let (ok, out) = build_and_run_source(
+            "program T;\ntype\n  Point = record\n    x, y: integer;\n  end;\nvar p: Point;\nbegin\n  p.x := 10;\n  p.y := 20;\n  writeln(p.x + p.y)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "30");
+    }
+
+    #[test]
+    fn string_concat() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar s: string;\nbegin\n  s := 'Hello' + ' ' + 'World';\n  writeln(s)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "Hello World");
+    }
+
+    #[test]
+    fn string_length() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nbegin\n  writeln(length('Hello'))\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "5");
+    }
+
+    #[test]
+    fn type_alias() {
+        let (ok, out) = build_and_run_source(
+            "program T;\ntype\n  Numbers = array[0..2] of integer;\nvar a: Numbers;\nbegin\n  a[0] := 10;\n  a[1] := 20;\n  a[2] := 30;\n  writeln(a[0] + a[1] + a[2])\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "60");
+    }
+
+    #[test]
+    fn ord_chr() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nbegin\n  writeln(ord('A'));\n  write(chr(66))\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], "65");
+        assert_eq!(lines[1], "B");
     }
 }

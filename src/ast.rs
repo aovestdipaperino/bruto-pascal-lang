@@ -15,10 +15,55 @@ impl Span {
     }
 }
 
-/// Top-level program: `program Name; [var ...] begin ... end.`
+/// Top-level program: `program Name; [const ...] [type ...] [var ...] {proc|func} begin ... end.`
 #[derive(Debug, Clone)]
 pub struct Program {
     pub name: String,
+    pub consts: Vec<ConstDecl>,
+    pub type_decls: Vec<TypeDecl>,
+    pub vars: Vec<VarDecl>,
+    pub procedures: Vec<ProcDecl>,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// Type alias declaration: `type Name = T;`
+#[derive(Debug, Clone)]
+pub struct TypeDecl {
+    pub name: String,
+    pub ty: PascalType,
+    pub span: Span,
+}
+
+/// Constant declaration: `name = value`
+#[derive(Debug, Clone)]
+pub struct ConstDecl {
+    pub name: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// Parameter passing mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamMode {
+    Value,
+    Var, // pass by reference
+}
+
+/// A single parameter group: `a, b: integer` or `var x: integer`
+#[derive(Debug, Clone)]
+pub struct ParamGroup {
+    pub mode: ParamMode,
+    pub names: Vec<String>,
+    pub ty: PascalType,
+}
+
+/// Procedure or function declaration
+#[derive(Debug, Clone)]
+pub struct ProcDecl {
+    pub name: String,
+    pub params: Vec<ParamGroup>,
+    pub return_type: Option<PascalType>, // None = procedure, Some = function
     pub vars: Vec<VarDecl>,
     pub body: Block,
     pub span: Span,
@@ -33,11 +78,24 @@ pub struct VarDecl {
 }
 
 /// Supported types in Mini-Pascal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PascalType {
     Integer,
+    Real,
     String,
     Boolean,
+    Char,
+    Pointer(Box<PascalType>),
+    Array {
+        lo: i64,
+        hi: i64,
+        elem: Box<PascalType>,
+    },
+    Record {
+        fields: Vec<(String, PascalType)>,
+    },
+    /// A named type alias (resolved to canonical type during compilation)
+    Named(String),
 }
 
 /// A begin/end block containing statements.
@@ -67,6 +125,19 @@ pub enum Statement {
         body: Block,
         span: Span,
     },
+    For {
+        var: String,
+        from: Expr,
+        to: Expr,
+        downto: bool,
+        body: Block,
+        span: Span,
+    },
+    RepeatUntil {
+        body: Vec<Statement>,
+        condition: Expr,
+        span: Span,
+    },
     WriteLn {
         args: Vec<Expr>,
         span: Span,
@@ -80,17 +151,59 @@ pub enum Statement {
         span: Span,
     },
     Block(Block),
+    /// Pointer dereference assignment: `p^ := expr`
+    DerefAssignment {
+        target: String,
+        expr: Expr,
+        span: Span,
+    },
+    New {
+        target: String,
+        span: Span,
+    },
+    Dispose {
+        target: String,
+        span: Span,
+    },
+    /// Array index assignment: `a[i] := expr`
+    IndexAssignment {
+        target: String,
+        index: Expr,
+        expr: Expr,
+        span: Span,
+    },
+    /// Record field assignment: `r.field := expr`
+    FieldAssignment {
+        target: String,
+        field: String,
+        expr: Expr,
+        span: Span,
+    },
+    /// Procedure call: `proc(args)`
+    ProcCall {
+        name: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
 }
 
 impl Statement {
     pub fn span(&self) -> Span {
         match self {
             Self::Assignment { span, .. }
+            | Self::DerefAssignment { span, .. }
             | Self::If { span, .. }
             | Self::While { span, .. }
+            | Self::For { span, .. }
+            | Self::RepeatUntil { span, .. }
             | Self::WriteLn { span, .. }
             | Self::Write { span, .. }
-            | Self::ReadLn { span, .. } => *span,
+            | Self::ReadLn { span, .. }
+            | Self::New { span, .. }
+            | Self::Dispose { span, .. }
+            | Self::IndexAssignment { span, .. }
+            | Self::FieldAssignment { span, .. }
+            | Self::ProcCall { span, .. } => *span,
             Self::Block(b) => b.span,
         }
     }
@@ -99,6 +212,8 @@ impl Statement {
 #[derive(Debug, Clone)]
 pub enum Expr {
     IntLit(i64, Span),
+    RealLit(f64, Span),
+    CharLit(u8, Span),
     StrLit(String, Span),
     BoolLit(bool, Span),
     Var(String, Span),
@@ -113,16 +228,43 @@ pub enum Expr {
         operand: Box<Expr>,
         span: Span,
     },
+    /// Pointer dereference: `p^`
+    Deref(Box<Expr>, Span),
+    /// Function call: `func(args)`
+    Call {
+        name: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    /// Array indexing: `a[i]`
+    Index {
+        array: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
+    /// Record field access: `r.field`
+    FieldAccess {
+        record: Box<Expr>,
+        field: String,
+        span: Span,
+    },
 }
 
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Self::IntLit(_, s)
+            | Self::RealLit(_, s)
+            | Self::CharLit(_, s)
             | Self::StrLit(_, s)
             | Self::BoolLit(_, s)
             | Self::Var(_, s) => *s,
-            Self::BinOp { span, .. } | Self::UnaryOp { span, .. } => *span,
+            Self::BinOp { span, .. }
+            | Self::UnaryOp { span, .. }
+            | Self::Deref(_, span)
+            | Self::Call { span, .. }
+            | Self::Index { span, .. }
+            | Self::FieldAccess { span, .. } => *span,
         }
     }
 }
@@ -132,7 +274,8 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
-    Div,
+    Div,     // integer division (div)
+    RealDiv, // real division (/)
     Mod,
     Eq,
     Neq,

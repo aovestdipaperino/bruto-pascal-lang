@@ -28,20 +28,28 @@ use std::fmt;
 enum Tok {
     // Keywords
     Program, Var, Begin, End, If, Then, Else, While, Do,
-    KwWrite, KwWriteLn, KwReadLn,
+    For, To, DownTo, Repeat, Until,
+    KwWrite, KwWriteLn, KwReadLn, KwRead,
     KwDiv, KwMod, KwAnd, KwOr, KwNot,
     KwTrue, KwFalse,
+    KwNew, KwDispose,
+    Const, KwType,
+    KwProcedure, KwFunction, KwForward,
+    TyReal, TyChar,
     // Type keywords
     TyInteger, TyString, TyBoolean,
     // Literals
     IntLit(i64),
+    RealLit(f64),
+    CharLit(u8),
     StrLit(String),
     // Identifier
     Ident(String),
     // Operators
-    Plus, Minus, Star, Assign, Eq, Neq, Lt, Gt, Lte, Gte,
+    Plus, Minus, Star, Slash, Assign, Eq, Neq, Lt, Gt, Lte, Gte,
+    KwArray, KwOf, KwRecord,
     // Delimiters
-    LParen, RParen, Semi, Colon, Comma, Dot,
+    LParen, RParen, LBracket, RBracket, Semi, Colon, Comma, Dot, DotDot, Caret,
     // End of input
     Eof,
 }
@@ -68,15 +76,36 @@ impl fmt::Display for Tok {
             Tok::KwNot => write!(f, "'not'"),
             Tok::KwTrue => write!(f, "'true'"),
             Tok::KwFalse => write!(f, "'false'"),
+            Tok::KwNew => write!(f, "'new'"),
+            Tok::KwDispose => write!(f, "'dispose'"),
+            Tok::For => write!(f, "'for'"),
+            Tok::To => write!(f, "'to'"),
+            Tok::DownTo => write!(f, "'downto'"),
+            Tok::Repeat => write!(f, "'repeat'"),
+            Tok::Until => write!(f, "'until'"),
+            Tok::KwRead => write!(f, "'read'"),
+            Tok::Const => write!(f, "'const'"),
+            Tok::KwType => write!(f, "'type'"),
+            Tok::KwProcedure => write!(f, "'procedure'"),
+            Tok::KwFunction => write!(f, "'function'"),
+            Tok::KwForward => write!(f, "'forward'"),
+            Tok::TyReal => write!(f, "'real'"),
+            Tok::TyChar => write!(f, "'char'"),
+            Tok::KwArray => write!(f, "'array'"),
+            Tok::KwOf => write!(f, "'of'"),
+            Tok::KwRecord => write!(f, "'record'"),
             Tok::TyInteger => write!(f, "'integer'"),
             Tok::TyString => write!(f, "'string'"),
             Tok::TyBoolean => write!(f, "'boolean'"),
             Tok::IntLit(n) => write!(f, "{n}"),
+            Tok::RealLit(r) => write!(f, "{r}"),
+            Tok::CharLit(c) => write!(f, "#{c}"),
             Tok::StrLit(s) => write!(f, "'{s}'"),
             Tok::Ident(s) => write!(f, "identifier '{s}'"),
             Tok::Plus => write!(f, "'+'"),
             Tok::Minus => write!(f, "'-'"),
             Tok::Star => write!(f, "'*'"),
+            Tok::Slash => write!(f, "'/'"),
             Tok::Assign => write!(f, "':='"),
             Tok::Eq => write!(f, "'='"),
             Tok::Neq => write!(f, "'<>'"),
@@ -86,10 +115,14 @@ impl fmt::Display for Tok {
             Tok::Gte => write!(f, "'>='"),
             Tok::LParen => write!(f, "'('"),
             Tok::RParen => write!(f, "')'"),
+            Tok::LBracket => write!(f, "'['"),
+            Tok::RBracket => write!(f, "']'"),
+            Tok::DotDot => write!(f, "'..'"),
             Tok::Semi => write!(f, "';'"),
             Tok::Colon => write!(f, "':'"),
             Tok::Comma => write!(f, "','"),
             Tok::Dot => write!(f, "'.'"),
+            Tok::Caret => write!(f, "'^'"),
             Tok::Eof => write!(f, "end of file"),
         }
     }
@@ -226,13 +259,35 @@ impl Lexer {
             return (Tok::StrLit(s), span);
         }
 
-        // Number
+        // Number (integer or real)
         if ch.is_ascii_digit() {
             let mut n: i64 = 0;
             while self.pos < self.chars.len() && self.peek().is_ascii_digit() {
                 n = n * 10 + (self.advance() as i64 - '0' as i64);
             }
+            // Check for decimal point (but not ".." range operator)
+            if self.peek() == '.' && self.chars.get(self.pos + 1) != Some(&'.') {
+                self.advance(); // consume '.'
+                let mut frac = String::new();
+                frac.push_str(&n.to_string());
+                frac.push('.');
+                while self.pos < self.chars.len() && self.peek().is_ascii_digit() {
+                    frac.push(self.advance());
+                }
+                let val: f64 = frac.parse().unwrap_or(0.0);
+                return (Tok::RealLit(val), span);
+            }
             return (Tok::IntLit(n), span);
+        }
+
+        // Char literal: #nn
+        if ch == '#' {
+            self.advance();
+            let mut n: u8 = 0;
+            while self.pos < self.chars.len() && self.peek().is_ascii_digit() {
+                n = n.wrapping_mul(10).wrapping_add(self.advance() as u8 - b'0');
+            }
+            return (Tok::CharLit(n), span);
         }
 
         // Hex number: $FF
@@ -275,15 +330,37 @@ impl Lexer {
                 "not"      => Tok::KwNot,
                 "true"     => Tok::KwTrue,
                 "false"    => Tok::KwFalse,
+                "new"      => Tok::KwNew,
+                "dispose"  => Tok::KwDispose,
+                "for"      => Tok::For,
+                "to"       => Tok::To,
+                "downto"   => Tok::DownTo,
+                "repeat"   => Tok::Repeat,
+                "until"    => Tok::Until,
+                "read"     => Tok::KwRead,
+                "const"    => Tok::Const,
+                "type"     => Tok::KwType,
+                "procedure" => Tok::KwProcedure,
+                "function" => Tok::KwFunction,
+                "forward"  => Tok::KwForward,
+                "array"    => Tok::KwArray,
+                "of"       => Tok::KwOf,
+                "record"   => Tok::KwRecord,
                 "integer"  => Tok::TyInteger,
                 "string"   => Tok::TyString,
                 "boolean"  => Tok::TyBoolean,
+                "real"     => Tok::TyReal,
+                "char"     => Tok::TyChar,
                 _          => Tok::Ident(word),
             };
             return (tok, span);
         }
 
         // Two-character operators
+        if ch == '.' && self.chars.get(self.pos + 1) == Some(&'.') {
+            self.advance(); self.advance();
+            return (Tok::DotDot, span);
+        }
         if ch == ':' && self.chars.get(self.pos + 1) == Some(&'=') {
             self.advance(); self.advance();
             return (Tok::Assign, span);
@@ -307,15 +384,19 @@ impl Lexer {
             '+' => Tok::Plus,
             '-' => Tok::Minus,
             '*' => Tok::Star,
+            '/' => Tok::Slash,
             '=' => Tok::Eq,
             '<' => Tok::Lt,
             '>' => Tok::Gt,
             '(' => Tok::LParen,
             ')' => Tok::RParen,
+            '[' => Tok::LBracket,
+            ']' => Tok::RBracket,
             ';' => Tok::Semi,
             ':' => Tok::Colon,
             ',' => Tok::Comma,
             '.' => Tok::Dot,
+            '^' => Tok::Caret,
             _ => {
                 // Unknown character — return as identifier for error recovery
                 return (Tok::Ident(ch.to_string()), span);
@@ -395,16 +476,77 @@ impl Parser {
         let (name, _) = self.expect_ident()?;
         self.expect(&Tok::Semi)?;
 
+        let consts = if *self.peek() == Tok::Const {
+            self.parse_const_section()?
+        } else {
+            Vec::new()
+        };
+
+        let type_decls = if *self.peek() == Tok::KwType {
+            self.parse_type_section()?
+        } else {
+            Vec::new()
+        };
+
         let vars = if *self.peek() == Tok::Var {
             self.parse_var_section()?
         } else {
             Vec::new()
         };
 
+        let mut procedures = Vec::new();
+        while *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
+            procedures.push(self.parse_proc_decl()?);
+        }
+
         let body = self.parse_block()?;
         self.expect(&Tok::Dot)?;
 
-        Ok(Program { name, vars, body, span })
+        Ok(Program { name, consts, type_decls, vars, procedures, body, span })
+    }
+
+    // ── type section ─────────────────────────────────────
+
+    fn parse_type_section(&mut self) -> Result<Vec<TypeDecl>, ParseError> {
+        self.expect(&Tok::KwType)?;
+        let mut decls = Vec::new();
+        while matches!(self.peek(), Tok::Ident(_)) {
+            let span = self.span();
+            let (name, _) = self.expect_ident()?;
+            self.expect(&Tok::Eq)?;
+            let ty = self.parse_type()?;
+            self.expect(&Tok::Semi)?;
+            decls.push(TypeDecl { name, ty, span });
+        }
+        if decls.is_empty() {
+            return Err(ParseError {
+                message: "expected at least one type declaration after 'type'".into(),
+                span: self.span(),
+            });
+        }
+        Ok(decls)
+    }
+
+    // ── const section ────────────────────────────────────
+
+    fn parse_const_section(&mut self) -> Result<Vec<ConstDecl>, ParseError> {
+        self.expect(&Tok::Const)?;
+        let mut decls = Vec::new();
+        while matches!(self.peek(), Tok::Ident(_)) {
+            let span = self.span();
+            let (name, _) = self.expect_ident()?;
+            self.expect(&Tok::Eq)?;
+            let value = self.parse_expr()?;
+            self.expect(&Tok::Semi)?;
+            decls.push(ConstDecl { name, value, span });
+        }
+        if decls.is_empty() {
+            return Err(ParseError {
+                message: "expected at least one constant declaration after 'const'".into(),
+                span: self.span(),
+            });
+        }
+        Ok(decls)
     }
 
     // ── var section ──────────────────────────────────────
@@ -442,15 +584,160 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<PascalType, ParseError> {
+        if *self.peek() == Tok::Caret {
+            self.advance();
+            let pointed = self.parse_type()?;
+            return Ok(PascalType::Pointer(Box::new(pointed)));
+        }
+        if *self.peek() == Tok::KwArray {
+            return self.parse_array_type();
+        }
+        if *self.peek() == Tok::KwRecord {
+            return self.parse_record_type();
+        }
         match self.peek() {
             Tok::TyInteger => { self.advance(); Ok(PascalType::Integer) }
+            Tok::TyReal    => { self.advance(); Ok(PascalType::Real) }
             Tok::TyString  => { self.advance(); Ok(PascalType::String) }
             Tok::TyBoolean => { self.advance(); Ok(PascalType::Boolean) }
+            Tok::TyChar    => { self.advance(); Ok(PascalType::Char) }
+            Tok::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(PascalType::Named(name))
+            }
             _ => Err(ParseError {
                 message: format!("expected type name, found {}", self.peek()),
                 span: self.span(),
             }),
         }
+    }
+
+    fn parse_array_type(&mut self) -> Result<PascalType, ParseError> {
+        self.expect(&Tok::KwArray)?;
+        self.expect(&Tok::LBracket)?;
+        // Parse lo..hi
+        let lo = self.parse_int_literal()?;
+        self.expect(&Tok::DotDot)?;
+        let hi = self.parse_int_literal()?;
+        self.expect(&Tok::RBracket)?;
+        self.expect(&Tok::KwOf)?;
+        let elem = self.parse_type()?;
+        Ok(PascalType::Array { lo, hi, elem: Box::new(elem) })
+    }
+
+    fn parse_int_literal(&mut self) -> Result<i64, ParseError> {
+        let neg = if *self.peek() == Tok::Minus {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        match self.peek().clone() {
+            Tok::IntLit(n) => {
+                self.advance();
+                Ok(if neg { -n } else { n })
+            }
+            _ => Err(ParseError {
+                message: format!("expected integer literal, found {}", self.peek()),
+                span: self.span(),
+            }),
+        }
+    }
+
+    fn parse_record_type(&mut self) -> Result<PascalType, ParseError> {
+        self.expect(&Tok::KwRecord)?;
+        let mut fields = Vec::new();
+        while *self.peek() != Tok::End {
+            // field1, field2: type;
+            let mut names = Vec::new();
+            let (first, _) = self.expect_ident()?;
+            names.push(first);
+            while *self.peek() == Tok::Comma {
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                names.push(name);
+            }
+            self.expect(&Tok::Colon)?;
+            let ty = self.parse_type()?;
+            for name in names {
+                fields.push((name, ty.clone()));
+            }
+            if *self.peek() == Tok::Semi {
+                self.advance();
+            }
+        }
+        self.expect(&Tok::End)?;
+        Ok(PascalType::Record { fields })
+    }
+
+    // ── procedure / function ──────────────────────────────
+
+    fn parse_proc_decl(&mut self) -> Result<ProcDecl, ParseError> {
+        let span = self.span();
+        let is_function = *self.peek() == Tok::KwFunction;
+        self.advance(); // consume 'procedure' or 'function'
+        let (name, _) = self.expect_ident()?;
+
+        let params = if *self.peek() == Tok::LParen {
+            self.parse_param_list()?
+        } else {
+            Vec::new()
+        };
+
+        let return_type = if is_function {
+            self.expect(&Tok::Colon)?;
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        self.expect(&Tok::Semi)?;
+
+        let vars = if *self.peek() == Tok::Var {
+            self.parse_var_section()?
+        } else {
+            Vec::new()
+        };
+
+        let body = self.parse_block()?;
+        self.expect(&Tok::Semi)?;
+
+        Ok(ProcDecl { name, params, return_type, vars, body, span })
+    }
+
+    fn parse_param_list(&mut self) -> Result<Vec<ParamGroup>, ParseError> {
+        self.expect(&Tok::LParen)?;
+        let mut groups = Vec::new();
+        if *self.peek() != Tok::RParen {
+            groups.push(self.parse_param_group()?);
+            while *self.peek() == Tok::Semi {
+                self.advance();
+                groups.push(self.parse_param_group()?);
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(groups)
+    }
+
+    fn parse_param_group(&mut self) -> Result<ParamGroup, ParseError> {
+        let mode = if *self.peek() == Tok::Var {
+            self.advance();
+            ParamMode::Var
+        } else {
+            ParamMode::Value
+        };
+        let mut names = Vec::new();
+        let (first, _) = self.expect_ident()?;
+        names.push(first);
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            let (name, _) = self.expect_ident()?;
+            names.push(name);
+        }
+        self.expect(&Tok::Colon)?;
+        let ty = self.parse_type()?;
+        Ok(ParamGroup { mode, names, ty })
     }
 
     // ── block ────────────────────────────────────────────
@@ -482,10 +769,14 @@ impl Parser {
             Tok::Begin => Ok(Statement::Block(self.parse_block()?)),
             Tok::If => self.parse_if(),
             Tok::While => self.parse_while(),
+            Tok::For => self.parse_for(),
+            Tok::Repeat => self.parse_repeat_until(),
             Tok::KwWrite => self.parse_write(false),
             Tok::KwWriteLn => self.parse_write(true),
             Tok::KwReadLn => self.parse_readln(),
-            Tok::Ident(_) => self.parse_assignment(),
+            Tok::KwNew => self.parse_new(),
+            Tok::KwDispose => self.parse_dispose(),
+            Tok::Ident(_) => self.parse_ident_statement(),
             _ => Err(ParseError {
                 message: format!("expected statement, found {}", self.peek()),
                 span: self.span(),
@@ -493,12 +784,57 @@ impl Parser {
         }
     }
 
-    fn parse_assignment(&mut self) -> Result<Statement, ParseError> {
+    fn parse_ident_statement(&mut self) -> Result<Statement, ParseError> {
         let span = self.span();
-        let (target, _) = self.expect_ident()?;
-        self.expect(&Tok::Assign)?;
-        let expr = self.parse_expr()?;
-        Ok(Statement::Assignment { target, expr, span })
+        let (name, _) = self.expect_ident()?;
+        match self.peek() {
+            Tok::Assign => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                Ok(Statement::Assignment { target: name, expr, span })
+            }
+            Tok::Caret => {
+                self.advance();
+                self.expect(&Tok::Assign)?;
+                let expr = self.parse_expr()?;
+                Ok(Statement::DerefAssignment { target: name, expr, span })
+            }
+            Tok::LBracket => {
+                // a[i] := expr
+                self.advance();
+                let index = self.parse_expr()?;
+                self.expect(&Tok::RBracket)?;
+                self.expect(&Tok::Assign)?;
+                let expr = self.parse_expr()?;
+                Ok(Statement::IndexAssignment { target: name, index, expr, span })
+            }
+            Tok::Dot => {
+                // r.field := expr
+                self.advance();
+                let (field, _) = self.expect_ident()?;
+                self.expect(&Tok::Assign)?;
+                let expr = self.parse_expr()?;
+                Ok(Statement::FieldAssignment { target: name, field, expr, span })
+            }
+            Tok::LParen => {
+                // Procedure call: name(args)
+                self.advance();
+                let mut args = Vec::new();
+                if *self.peek() != Tok::RParen {
+                    args.push(self.parse_expr()?);
+                    while *self.peek() == Tok::Comma {
+                        self.advance();
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                Ok(Statement::ProcCall { name, args, span })
+            }
+            _ => {
+                // Procedure call without parentheses (no arguments)
+                Ok(Statement::ProcCall { name, args: Vec::new(), span })
+            }
+        }
     }
 
     fn parse_if(&mut self) -> Result<Statement, ParseError> {
@@ -538,19 +874,80 @@ impl Parser {
         Ok(Statement::While { condition, body, span })
     }
 
+    fn parse_for(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        self.expect(&Tok::For)?;
+        let (var, _) = self.expect_ident()?;
+        self.expect(&Tok::Assign)?;
+        let from = self.parse_expr()?;
+        let downto = match self.peek() {
+            Tok::To => { self.advance(); false }
+            Tok::DownTo => { self.advance(); true }
+            _ => return Err(ParseError {
+                message: format!("expected 'to' or 'downto', found {}", self.peek()),
+                span: self.span(),
+            }),
+        };
+        let to = self.parse_expr()?;
+        self.expect(&Tok::Do)?;
+        let body_stmt = self.parse_statement()?;
+        let body = match body_stmt {
+            Statement::Block(b) => b,
+            other => { let s = other.span(); Block { span: s, end_span: s, statements: vec![other] } },
+        };
+        Ok(Statement::For { var, from, to, downto, body, span })
+    }
+
+    fn parse_repeat_until(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        self.expect(&Tok::Repeat)?;
+        let mut stmts = Vec::new();
+        if *self.peek() != Tok::Until {
+            stmts.push(self.parse_statement()?);
+            while *self.peek() == Tok::Semi {
+                self.advance();
+                if *self.peek() == Tok::Until { break; }
+                stmts.push(self.parse_statement()?);
+            }
+        }
+        self.expect(&Tok::Until)?;
+        let condition = self.parse_expr()?;
+        Ok(Statement::RepeatUntil { body: stmts, condition, span })
+    }
+
+    fn parse_new(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        self.advance(); // consume 'new'
+        self.expect(&Tok::LParen)?;
+        let (target, _) = self.expect_ident()?;
+        self.expect(&Tok::RParen)?;
+        Ok(Statement::New { target, span })
+    }
+
+    fn parse_dispose(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        self.advance(); // consume 'dispose'
+        self.expect(&Tok::LParen)?;
+        let (target, _) = self.expect_ident()?;
+        self.expect(&Tok::RParen)?;
+        Ok(Statement::Dispose { target, span })
+    }
+
     fn parse_write(&mut self, is_writeln: bool) -> Result<Statement, ParseError> {
         let span = self.span();
         self.advance(); // consume 'write' or 'writeln'
-        self.expect(&Tok::LParen)?;
         let mut args = Vec::new();
-        if *self.peek() != Tok::RParen {
-            args.push(self.parse_expr()?);
-            while *self.peek() == Tok::Comma {
-                self.advance();
+        if *self.peek() == Tok::LParen {
+            self.advance();
+            if *self.peek() != Tok::RParen {
                 args.push(self.parse_expr()?);
+                while *self.peek() == Tok::Comma {
+                    self.advance();
+                    args.push(self.parse_expr()?);
+                }
             }
+            self.expect(&Tok::RParen)?;
         }
-        self.expect(&Tok::RParen)?;
         if is_writeln {
             Ok(Statement::WriteLn { args, span })
         } else {
@@ -615,6 +1012,7 @@ impl Parser {
         loop {
             let op = match self.peek() {
                 Tok::Star  => BinOp::Mul,
+                Tok::Slash => BinOp::RealDiv,
                 Tok::KwDiv => BinOp::Div,
                 Tok::KwMod => BinOp::Mod,
                 Tok::KwAnd => BinOp::And,
@@ -653,6 +1051,16 @@ impl Parser {
                 self.advance();
                 Ok(Expr::IntLit(n, span))
             }
+            Tok::RealLit(r) => {
+                let span = self.span();
+                self.advance();
+                Ok(Expr::RealLit(r, span))
+            }
+            Tok::CharLit(c) => {
+                let span = self.span();
+                self.advance();
+                Ok(Expr::CharLit(c, span))
+            }
             Tok::StrLit(s) => {
                 let span = self.span();
                 self.advance();
@@ -671,7 +1079,44 @@ impl Parser {
             Tok::Ident(name) => {
                 let span = self.span();
                 self.advance();
-                Ok(Expr::Var(name, span))
+                let mut expr = if *self.peek() == Tok::LParen {
+                    // Function call
+                    self.advance();
+                    let mut args = Vec::new();
+                    if *self.peek() != Tok::RParen {
+                        args.push(self.parse_expr()?);
+                        while *self.peek() == Tok::Comma {
+                            self.advance();
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    self.expect(&Tok::RParen)?;
+                    Expr::Call { name, args, span }
+                } else {
+                    Expr::Var(name, span)
+                };
+                // Postfix operators: [i], .field, ^
+                loop {
+                    match self.peek() {
+                        Tok::LBracket => {
+                            self.advance();
+                            let index = self.parse_expr()?;
+                            self.expect(&Tok::RBracket)?;
+                            expr = Expr::Index { array: Box::new(expr), index: Box::new(index), span };
+                        }
+                        Tok::Dot => {
+                            self.advance();
+                            let (field, _) = self.expect_ident()?;
+                            expr = Expr::FieldAccess { record: Box::new(expr), field, span };
+                        }
+                        Tok::Caret => {
+                            self.advance();
+                            expr = Expr::Deref(Box::new(expr), span);
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(expr)
             }
             Tok::LParen => {
                 self.advance();
