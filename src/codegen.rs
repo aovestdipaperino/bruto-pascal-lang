@@ -749,7 +749,33 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Statement::New { target, span } => self.compile_new(target, *span),
             Statement::Dispose { target, span } => self.compile_dispose(target, *span),
-            Statement::ProcCall { name, args, span } => self.compile_proc_call(name, args, *span),
+            Statement::ProcCall { name, args, span } => {
+                if name == "inc" && (args.len() == 1 || args.len() == 2) {
+                    return self.compile_inc_dec(args, true, *span);
+                }
+                if name == "dec" && (args.len() == 1 || args.len() == 2) {
+                    return self.compile_inc_dec(args, false, *span);
+                }
+                if name == "delete" && args.len() == 3 {
+                    return self.compile_str_delete(args, *span);
+                }
+                if name == "insert" && args.len() == 3 {
+                    return self.compile_str_insert(args, *span);
+                }
+                if name == "str" && args.len() == 2 {
+                    return self.compile_str_proc(args, *span);
+                }
+                if name == "val" && args.len() == 3 {
+                    return self.compile_val(args, *span);
+                }
+                if name == "include" && args.len() == 2 {
+                    return self.compile_set_include_exclude(args, true, *span);
+                }
+                if name == "exclude" && args.len() == 2 {
+                    return self.compile_set_include_exclude(args, false, *span);
+                }
+                self.compile_proc_call(name, args, *span)
+            }
             Statement::Case { expr, branches, else_branch, span } => {
                 self.compile_case(expr, branches, else_branch.as_deref(), *span)
             }
@@ -1203,6 +1229,175 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    fn compile_inc_dec(&mut self, args: &[Expr], is_inc: bool, span: Span) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let var_name = match &args[0] {
+            Expr::Var(name, _) => name.clone(),
+            _ => return Err(CodeGenError::new("inc/dec requires a variable", Some(span))),
+        };
+        let alloca = *self.variables.get(var_name.as_str())
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{var_name}'"), Some(span)))?;
+        let var_type = self.var_types.get(var_name.as_str()).cloned()
+            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{var_name}'"), Some(span)))?;
+        let llvm_ty = self.llvm_type_for(&var_type);
+
+        let cur = self.builder.build_load(llvm_ty, alloca, "cur")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+
+        let step = if args.len() == 2 {
+            self.compile_expr(&args[1])?.into_int_value()
+        } else {
+            cur.get_type().const_int(1, false)
+        };
+
+        let result = if is_inc {
+            self.builder.build_int_add(cur, step, "inc")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+        } else {
+            self.builder.build_int_sub(cur, step, "dec")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+        };
+
+        self.builder.build_store(alloca, result)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
+    fn compile_str_delete(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let s_name = match &args[0] {
+            Expr::Var(name, _) => name.clone(),
+            _ => return Err(CodeGenError::new("delete requires a string variable", Some(span))),
+        };
+        let alloca = *self.variables.get(s_name.as_str())
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span)))?;
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let s_val = self.builder.build_load(ptr_ty, alloca, "s")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        let idx = self.compile_expr(&args[1])?;
+        let cnt = self.compile_expr(&args[2])?;
+        let f = self.module.get_function("bruto_str_delete").unwrap();
+        let result = self.builder.build_call(f, &[s_val.into(), idx.into(), cnt.into()], "deleted")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            .try_as_basic_value().basic().unwrap();
+        self.builder.build_store(alloca, result)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
+    fn compile_str_insert(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let source = self.compile_expr(&args[0])?;
+        let s_name = match &args[1] {
+            Expr::Var(name, _) => name.clone(),
+            _ => return Err(CodeGenError::new("insert requires a string variable as 2nd arg", Some(span))),
+        };
+        let alloca = *self.variables.get(s_name.as_str())
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span)))?;
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let s_val = self.builder.build_load(ptr_ty, alloca, "s")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        let idx = self.compile_expr(&args[2])?;
+        let f = self.module.get_function("bruto_str_insert").unwrap();
+        let result = self.builder.build_call(f, &[source.into(), s_val.into(), idx.into()], "inserted")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            .try_as_basic_value().basic().unwrap();
+        self.builder.build_store(alloca, result)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
+    fn compile_str_proc(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let val = self.compile_expr(&args[0])?;
+        let s_name = match &args[1] {
+            Expr::Var(name, _) => name.clone(),
+            _ => return Err(CodeGenError::new("str requires a string variable as 2nd arg", Some(span))),
+        };
+        let alloca = *self.variables.get(s_name.as_str())
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span)))?;
+        let fn_name = if val.is_float_value() { "bruto_real_to_str" } else { "bruto_int_to_str" };
+        let f = self.module.get_function(fn_name).unwrap();
+        let result = self.builder.build_call(f, &[val.into()], "str_result")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            .try_as_basic_value().basic().unwrap();
+        self.builder.build_store(alloca, result)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
+    fn compile_val(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let s_val = self.compile_expr(&args[0])?;
+        let x_name = match &args[1] {
+            Expr::Var(name, _) => name.clone(),
+            _ => return Err(CodeGenError::new("val requires a variable as 2nd arg", Some(span))),
+        };
+        let alloca = *self.variables.get(x_name.as_str())
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{x_name}'"), Some(span)))?;
+        let f = self.module.get_function("bruto_str_to_int").unwrap();
+        let result = self.builder.build_call(f, &[s_val.into()], "val_result")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            .try_as_basic_value().basic().unwrap();
+        self.builder.build_store(alloca, result)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        // Set code to 0 (success)
+        let code_name = match &args[2] {
+            Expr::Var(name, _) => name.clone(),
+            _ => return Err(CodeGenError::new("val requires a variable as 3rd arg", Some(span))),
+        };
+        let code_alloca = *self.variables.get(code_name.as_str())
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{code_name}'"), Some(span)))?;
+        self.builder.build_store(code_alloca, self.context.i64_type().const_int(0, false))
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
+    fn compile_set_include_exclude(&mut self, args: &[Expr], is_include: bool, span: Span) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let s_name = match &args[0] {
+            Expr::Var(name, _) => name.clone(),
+            _ => return Err(CodeGenError::new("include/exclude requires a set variable", Some(span))),
+        };
+        let alloca = *self.variables.get(s_name.as_str())
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span)))?;
+        let elem_val = self.compile_expr(&args[1])?.into_int_value();
+
+        let i64_ty = self.context.i64_type();
+        let set_ty = i64_ty.array_type(4);
+        let elem_val = if elem_val.get_type().get_bit_width() < 64 {
+            self.builder.build_int_z_extend(elem_val, i64_ty, "elem_ext")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+        } else {
+            elem_val
+        };
+        let word_idx = self.builder.build_int_unsigned_div(elem_val, i64_ty.const_int(64, false), "word_idx")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        let bit_idx = self.builder.build_int_unsigned_rem(elem_val, i64_ty.const_int(64, false), "bit_idx")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        let bit = self.builder.build_left_shift(i64_ty.const_int(1, false), bit_idx, "bit")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        let gep = unsafe {
+            self.builder.build_in_bounds_gep(set_ty, alloca, &[i64_ty.const_int(0, false), word_idx], "set_gep")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+        };
+        let cur = self.builder.build_load(i64_ty, gep, "cur_word")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+
+        let new_word = if is_include {
+            self.builder.build_or(cur, bit, "include")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+        } else {
+            let not_bit = self.builder.build_not(bit, "not_bit")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.builder.build_and(cur, not_bit, "exclude")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+        };
+        self.builder.build_store(gep, new_word)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
     fn compile_call_args(&mut self, name: &str, args: &[Expr], span: Span) -> Result<Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>, CodeGenError> {
         let param_modes = self.proc_param_modes.get(name).cloned();
         let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
@@ -1500,6 +1695,215 @@ impl<'ctx> CodeGen<'ctx> {
                     let trunc = self.builder.build_int_truncate(val.into_int_value(), self.context.i8_type(), "chr")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(trunc.into());
+                }
+                if name == "abs" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    if val.is_float_value() {
+                        let intrinsic = self.get_or_declare_f64_intrinsic("llvm.fabs.f64");
+                        let r = self.builder.build_call(intrinsic, &[val.into()], "fabs")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                            .try_as_basic_value().basic().unwrap();
+                        return Ok(r);
+                    }
+                    let iv = val.into_int_value();
+                    let is_neg = self.builder.build_int_compare(inkwell::IntPredicate::SLT, iv, self.context.i64_type().const_int(0, false), "is_neg")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let neg = self.builder.build_int_neg(iv, "neg")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let r = self.builder.build_select(is_neg, neg, iv, "abs")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    return Ok(r);
+                }
+                if name == "sqr" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    if val.is_float_value() {
+                        let fv = val.into_float_value();
+                        let r = self.builder.build_float_mul(fv, fv, "sqr")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                        return Ok(r.into());
+                    }
+                    let iv = val.into_int_value();
+                    let r = self.builder.build_int_mul(iv, iv, "sqr")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    return Ok(r.into());
+                }
+                if name == "sqrt" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let intrinsic = self.get_or_declare_f64_intrinsic("llvm.sqrt.f64");
+                    let r = self.builder.build_call(intrinsic, &[fval.into()], "sqrt")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    return Ok(r);
+                }
+                if name == "sin" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let intrinsic = self.get_or_declare_f64_intrinsic("llvm.sin.f64");
+                    let r = self.builder.build_call(intrinsic, &[fval.into()], "sin")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    return Ok(r);
+                }
+                if name == "cos" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let intrinsic = self.get_or_declare_f64_intrinsic("llvm.cos.f64");
+                    let r = self.builder.build_call(intrinsic, &[fval.into()], "cos")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    return Ok(r);
+                }
+                if name == "exp" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let intrinsic = self.get_or_declare_f64_intrinsic("llvm.exp.f64");
+                    let r = self.builder.build_call(intrinsic, &[fval.into()], "exp")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    return Ok(r);
+                }
+                if name == "ln" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let intrinsic = self.get_or_declare_f64_intrinsic("llvm.log.f64");
+                    let r = self.builder.build_call(intrinsic, &[fval.into()], "ln")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    return Ok(r);
+                }
+                if name == "arctan" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let atan_fn = self.module.get_function("atan").unwrap_or_else(|| {
+                        let ft = self.context.f64_type().fn_type(&[self.context.f64_type().into()], false);
+                        self.module.add_function("atan", ft, None)
+                    });
+                    let r = self.builder.build_call(atan_fn, &[fval.into()], "arctan")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    return Ok(r);
+                }
+                if name == "trunc" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let r = self.builder.build_float_to_signed_int(fval, self.context.i64_type(), "trunc")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    return Ok(r.into());
+                }
+                if name == "round" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let round_fn = self.get_or_declare_f64_intrinsic("llvm.round.f64");
+                    let rounded = self.builder.build_call(round_fn, &[fval.into()], "rounded")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    let r = self.builder.build_float_to_signed_int(rounded.into_float_value(), self.context.i64_type(), "round")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    return Ok(r.into());
+                }
+                if name == "succ" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let iv = val.into_int_value();
+                    let r = self.builder.build_int_add(iv, iv.get_type().const_int(1, false), "succ")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    return Ok(r.into());
+                }
+                if name == "pred" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let iv = val.into_int_value();
+                    let r = self.builder.build_int_sub(iv, iv.get_type().const_int(1, false), "pred")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    return Ok(r.into());
+                }
+                if name == "low" && args.len() == 1 {
+                    if let Expr::Var(vname, _) = &args[0] {
+                        let var_type = self.var_types.get(vname.as_str()).cloned()
+                            .or_else(|| self.type_defs.get(vname.as_str()).cloned());
+                        if let Some(ty) = var_type {
+                            let resolved = self.resolve_type(&ty);
+                            match &resolved {
+                                PascalType::Array { lo, .. } => return Ok(self.context.i64_type().const_int(*lo as u64, true).into()),
+                                PascalType::Subrange { lo, .. } => return Ok(self.context.i64_type().const_int(*lo as u64, true).into()),
+                                PascalType::Enum { .. } => return Ok(self.context.i64_type().const_int(0, false).into()),
+                                PascalType::Char => return Ok(self.context.i64_type().const_int(0, false).into()),
+                                PascalType::Boolean => return Ok(self.context.i64_type().const_int(0, false).into()),
+                                PascalType::Integer => return Ok(self.context.i64_type().const_int(i64::MIN as u64, true).into()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    return Err(CodeGenError::new("low() requires an array, subrange, or enum variable", Some(*span)));
+                }
+                if name == "high" && args.len() == 1 {
+                    if let Expr::Var(vname, _) = &args[0] {
+                        let var_type = self.var_types.get(vname.as_str()).cloned()
+                            .or_else(|| self.type_defs.get(vname.as_str()).cloned());
+                        if let Some(ty) = var_type {
+                            let resolved = self.resolve_type(&ty);
+                            match &resolved {
+                                PascalType::Array { hi, .. } => return Ok(self.context.i64_type().const_int(*hi as u64, true).into()),
+                                PascalType::Subrange { hi, .. } => return Ok(self.context.i64_type().const_int(*hi as u64, true).into()),
+                                PascalType::Enum { values, .. } => return Ok(self.context.i64_type().const_int((values.len() - 1) as u64, false).into()),
+                                PascalType::Char => return Ok(self.context.i64_type().const_int(255, false).into()),
+                                PascalType::Boolean => return Ok(self.context.i64_type().const_int(1, false).into()),
+                                PascalType::Integer => return Ok(self.context.i64_type().const_int(i64::MAX as u64, true).into()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    return Err(CodeGenError::new("high() requires an array, subrange, or enum variable", Some(*span)));
+                }
+                if name == "copy" && args.len() == 3 {
+                    let s = self.compile_expr(&args[0])?;
+                    let idx = self.compile_expr(&args[1])?;
+                    let cnt = self.compile_expr(&args[2])?;
+                    let f = self.module.get_function("bruto_str_copy").unwrap();
+                    let r = self.builder.build_call(f, &[s.into(), idx.into(), cnt.into()], "copy")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    return Ok(r);
+                }
+                if name == "pos" && args.len() == 2 {
+                    let substr = self.compile_expr(&args[0])?;
+                    let s = self.compile_expr(&args[1])?;
+                    let f = self.module.get_function("bruto_str_pos").unwrap();
+                    let r = self.builder.build_call(f, &[substr.into(), s.into()], "pos")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value().basic().unwrap();
+                    return Ok(r);
+                }
+                if name == "upcase" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    // Handle both char (i8) and string (ptr) — for strings, load first byte
+                    let ch = if val.is_pointer_value() {
+                        self.builder.build_load(self.context.i8_type(), val.into_pointer_value(), "first_ch")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?.into_int_value()
+                    } else {
+                        val.into_int_value()
+                    };
+                    let is_lower_a = self.builder.build_int_compare(inkwell::IntPredicate::UGE, ch, self.context.i8_type().const_int(b'a' as u64, false), "ge_a")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let is_lower_z = self.builder.build_int_compare(inkwell::IntPredicate::ULE, ch, self.context.i8_type().const_int(b'z' as u64, false), "le_z")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let is_lower = self.builder.build_and(is_lower_a, is_lower_z, "is_lower")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let upper = self.builder.build_int_sub(ch, self.context.i8_type().const_int(32, false), "upper")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let r = self.builder.build_select(is_lower, upper, ch, "upcase")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    return Ok(r);
+                }
+                if name == "concat" && args.len() >= 2 {
+                    let concat_fn = self.module.get_function("bruto_str_concat").unwrap();
+                    let mut result = self.compile_expr(&args[0])?;
+                    for arg in &args[1..] {
+                        let next = self.compile_expr(arg)?;
+                        result = self.builder.build_call(concat_fn, &[result.into(), next.into()], "concat")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                            .try_as_basic_value().basic().unwrap();
+                    }
+                    return Ok(result);
                 }
                 let func = self.module.get_function(name)
                     .ok_or_else(|| CodeGenError::new(format!("undefined function '{name}'"), Some(*span)))?;
@@ -1840,7 +2244,7 @@ impl<'ctx> CodeGen<'ctx> {
             return Ok(result.into());
         }
 
-        // Set binary ops: +, -, * on [4 x i64]
+        // Set binary ops: +, -, *, =, <>, <=, >= on [4 x i64]
         if lhs.is_array_value() && rhs.is_array_value() {
             let i64_ty = self.context.i64_type();
             let set_ty = i64_ty.array_type(4);
@@ -1854,6 +2258,65 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             self.builder.build_store(r_alloca, rhs)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+            // Set comparison operators return a boolean, not a set
+            if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::Lte | BinOp::Gte) {
+                // Accumulate per-word results: start with true (1)
+                let bool_ty = self.context.bool_type();
+                let mut acc = bool_ty.const_int(1, false);
+                for i in 0..4u64 {
+                    let idx = i64_ty.const_int(i, false);
+                    let l_gep = unsafe {
+                        self.builder.build_in_bounds_gep(set_ty, l_alloca, &[zero, idx], "lg")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    };
+                    let r_gep = unsafe {
+                        self.builder.build_in_bounds_gep(set_ty, r_alloca, &[zero, idx], "rg")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    };
+                    let lw = self.builder.build_load(i64_ty, l_gep, "lw")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+                    let rw = self.builder.build_load(i64_ty, r_gep, "rw")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+
+                    let word_ok = match op {
+                        BinOp::Eq | BinOp::Neq => {
+                            // Per-word equality
+                            self.builder.build_int_compare(inkwell::IntPredicate::EQ, lw, rw, "weq")
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        }
+                        BinOp::Lte => {
+                            // Subset: (l & ~r) == 0
+                            let not_r = self.builder.build_not(rw, "not_r")
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                            let diff = self.builder.build_and(lw, not_r, "diff")
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                            self.builder.build_int_compare(inkwell::IntPredicate::EQ, diff, zero, "sub_ok")
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        }
+                        BinOp::Gte => {
+                            // Superset: (r & ~l) == 0
+                            let not_l = self.builder.build_not(lw, "not_l")
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                            let diff = self.builder.build_and(rw, not_l, "diff")
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                            self.builder.build_int_compare(inkwell::IntPredicate::EQ, diff, zero, "sup_ok")
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        }
+                        _ => unreachable!(),
+                    };
+                    acc = self.builder.build_and(acc, word_ok, "acc")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                }
+                // For <>, negate the final result
+                if op == BinOp::Neq {
+                    acc = self.builder.build_not(acc, "neq_result")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                }
+                return Ok(acc.into());
+            }
+
+            // Set arithmetic ops (+, -, *) return a set
             let out_alloca = self.builder.build_alloca(set_ty, "set_out")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
@@ -2088,6 +2551,24 @@ impl<'ctx> CodeGen<'ctx> {
 
     // ── type inference (for write formatting) ────────────
 
+    fn promote_to_f64(&self, val: BasicValueEnum<'ctx>, span: Span) -> Result<inkwell::values::FloatValue<'ctx>, CodeGenError> {
+        if val.is_float_value() {
+            Ok(val.into_float_value())
+        } else if val.is_int_value() {
+            self.builder.build_signed_int_to_float(val.into_int_value(), self.context.f64_type(), "itof")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))
+        } else {
+            Err(CodeGenError::new("expected numeric value".to_string(), Some(span)))
+        }
+    }
+
+    fn get_or_declare_f64_intrinsic(&self, name: &str) -> FunctionValue<'ctx> {
+        self.module.get_function(name).unwrap_or_else(|| {
+            let ft = self.context.f64_type().fn_type(&[self.context.f64_type().into()], false);
+            self.module.add_function(name, ft, None)
+        })
+    }
+
     fn infer_expr_type(&self, expr: &Expr) -> PascalType {
         match expr {
             Expr::IntLit(..) => PascalType::Integer,
@@ -2120,11 +2601,24 @@ impl<'ctx> CodeGen<'ctx> {
                 UnaryOp::Neg => PascalType::Integer,
                 UnaryOp::Not => PascalType::Boolean,
             },
-            Expr::Call { name, .. } => {
+            Expr::Call { name, args, .. } => {
                 // Built-in functions
                 match name.as_str() {
-                    "length" | "ord" => PascalType::Integer,
-                    "chr" => PascalType::Char,
+                    "length" | "ord" | "trunc" | "round" | "pos" => PascalType::Integer,
+                    "chr" | "upcase" => PascalType::Char,
+                    "copy" | "concat" => PascalType::String,
+                    "abs" | "sqr" => {
+                        if !args.is_empty() {
+                            self.infer_expr_type(&args[0])
+                        } else {
+                            PascalType::Integer
+                        }
+                    }
+                    "succ" | "pred" => {
+                        if !args.is_empty() { self.infer_expr_type(&args[0]) } else { PascalType::Integer }
+                    }
+                    "low" | "high" => PascalType::Integer,
+                    "sqrt" | "sin" | "cos" | "arctan" | "exp" | "ln" => PascalType::Real,
                     _ => self.proc_return_types.get(name.as_str())
                         .and_then(|rt| rt.clone())
                         .unwrap_or(PascalType::Integer),

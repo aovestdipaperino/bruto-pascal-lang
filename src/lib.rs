@@ -443,6 +443,32 @@ mod tests {
     }
 
     #[test]
+    fn math_builtins() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar x: integer;\n  r: real;\nbegin\n  x := abs(-5);\n  writeln(x);\n  x := sqr(4);\n  writeln(x);\n  r := sqrt(16.0);\n  writeln(trunc(r));\n  writeln(round(3.7))\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], "5");
+        assert_eq!(lines[1], "16");
+        assert_eq!(lines[2], "4");
+        assert_eq!(lines[3], "4");
+    }
+
+    #[test]
+    fn trig_builtins() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar r: real;\nbegin\n  r := sin(0.0);\n  writeln(trunc(r));\n  r := cos(0.0);\n  writeln(trunc(r));\n  r := exp(0.0);\n  writeln(trunc(r));\n  r := ln(1.0);\n  writeln(trunc(r))\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], "0");  // sin(0) = 0
+        assert_eq!(lines[1], "1");  // cos(0) = 1
+        assert_eq!(lines[2], "1");  // exp(0) = 1
+        assert_eq!(lines[3], "0");  // ln(1) = 0
+    }
+
+    #[test]
     fn ord_chr() {
         let (ok, out) = build_and_run_source(
             "program T;\nbegin\n  writeln(ord('A'));\n  write(chr(66))\nend.\n",
@@ -544,5 +570,46 @@ end.
         assert!(out.contains("pt = 300"), "with: {out}");
         assert!(out.contains("m[1,2] = 42"), "multi-dim: {out}");
         assert!(out.contains("goto count = 3"), "goto: {out}");
+    }
+
+    #[test]
+    fn ordinal_builtins() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar x: integer;\n  a: array[1..5] of integer;\nbegin\n  x := 10;\n  inc(x);\n  writeln(x);\n  dec(x, 3);\n  writeln(x);\n  writeln(succ(5));\n  writeln(pred(5));\n  writeln(low(a));\n  writeln(high(a))\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], "11");
+        assert_eq!(lines[1], "8");
+        assert_eq!(lines[2], "6");
+        assert_eq!(lines[3], "4");
+        assert_eq!(lines[4], "1");
+        assert_eq!(lines[5], "5");
+    }
+
+    #[test]
+    fn set_include_exclude() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar s: set of integer;\nbegin\n  s := [1, 3];\n  include(s, 5);\n  writeln(5 in s);\n  exclude(s, 3);\n  writeln(3 in s)\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], "true");
+        assert_eq!(lines[1], "false");
+    }
+
+    #[test]
+    fn string_builtins() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar s, t: string;\n  n, code: integer;\nbegin\n  s := 'Hello World';\n  t := copy(s, 7, 5);\n  writeln(t);\n  n := pos('World', s);\n  writeln(n);\n  writeln(upcase('a'));\n  t := concat('abc', 'def', 'ghi');\n  writeln(t);\n  str(42, t);\n  writeln(t);\n  val('123', n, code);\n  writeln(n)\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], "World");
+        assert_eq!(lines[1], "7");
+        assert_eq!(lines[2], "A");
+        assert_eq!(lines[3], "abcdefghi");
+        assert_eq!(lines[4], "42");
+        assert_eq!(lines[5], "123");
     }
 }
