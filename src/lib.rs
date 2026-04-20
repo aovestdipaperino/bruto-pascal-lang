@@ -369,6 +369,15 @@ mod tests {
     }
 
     #[test]
+    fn enum_type() {
+        let (ok, out) = build_and_run_source(
+            "program T;\ntype\n  Color = (Red, Green, Blue);\nvar c: Color;\nbegin\n  c := Green;\n  writeln(c)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "1");
+    }
+
+    #[test]
     fn ord_chr() {
         let (ok, out) = build_and_run_source(
             "program T;\nbegin\n  writeln(ord('A'));\n  write(chr(66))\nend.\n",

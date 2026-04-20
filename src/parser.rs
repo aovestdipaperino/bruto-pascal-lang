@@ -512,11 +512,14 @@ impl Parser {
         let mut decls = Vec::new();
         while matches!(self.peek(), Tok::Ident(_)) {
             let span = self.span();
-            let (name, _) = self.expect_ident()?;
+            let (decl_name, _) = self.expect_ident()?;
             self.expect(&Tok::Eq)?;
-            let ty = self.parse_type()?;
+            let mut ty = self.parse_type()?;
+            if let PascalType::Enum { ref mut name, .. } = ty {
+                *name = decl_name.clone();
+            }
             self.expect(&Tok::Semi)?;
-            decls.push(TypeDecl { name, ty, span });
+            decls.push(TypeDecl { name: decl_name, ty, span });
         }
         if decls.is_empty() {
             return Err(ParseError {
@@ -588,6 +591,9 @@ impl Parser {
             self.advance();
             let pointed = self.parse_type()?;
             return Ok(PascalType::Pointer(Box::new(pointed)));
+        }
+        if *self.peek() == Tok::LParen {
+            return self.parse_enum_type();
         }
         if *self.peek() == Tok::KwArray {
             return self.parse_array_type();
@@ -669,6 +675,20 @@ impl Parser {
         }
         self.expect(&Tok::End)?;
         Ok(PascalType::Record { fields })
+    }
+
+    fn parse_enum_type(&mut self) -> Result<PascalType, ParseError> {
+        self.expect(&Tok::LParen)?;
+        let mut values = Vec::new();
+        let (first, _) = self.expect_ident()?;
+        values.push(first);
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            let (name, _) = self.expect_ident()?;
+            values.push(name);
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(PascalType::Enum { name: String::new(), values })
     }
 
     // ── procedure / function ──────────────────────────────

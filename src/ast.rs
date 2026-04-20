@@ -94,6 +94,12 @@ pub enum PascalType {
     Record {
         fields: Vec<(String, PascalType)>,
     },
+    /// Enumerated type: (val1, val2, val3)
+    Enum {
+        /// The type name (e.g., "Color") — set during type section parsing
+        name: String,
+        values: Vec<String>,
+    },
     /// A named type alias (resolved to canonical type during compilation)
     Named(String),
 }

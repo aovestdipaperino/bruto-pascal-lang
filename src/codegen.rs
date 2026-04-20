@@ -64,6 +64,11 @@ pub struct CodeGen<'ctx> {
     // Type aliases (from `type` section)
     type_defs: HashMap<String, PascalType>,
 
+    // Enum value → ordinal mapping
+    enum_values: HashMap<String, i64>,
+    // Enum type name → value names
+    enum_type_values: HashMap<String, Vec<String>>,
+
     // Procedure/function metadata
     proc_return_types: HashMap<String, Option<PascalType>>,
     proc_param_modes: HashMap<String, Vec<(String, ParamMode, PascalType)>>,
@@ -115,6 +120,8 @@ impl<'ctx> CodeGen<'ctx> {
             var_types: HashMap::new(),
             saved_scopes: Vec::new(),
             type_defs: HashMap::new(),
+            enum_values: HashMap::new(),
+            enum_type_values: HashMap::new(),
             proc_return_types: HashMap::new(),
             proc_param_modes: HashMap::new(),
             current_fn: None,
@@ -168,6 +175,12 @@ impl<'ctx> CodeGen<'ctx> {
         // Register type aliases
         for td in &program.type_decls {
             self.type_defs.insert(td.name.clone(), td.ty.clone());
+            if let PascalType::Enum { values, .. } = &td.ty {
+                for (i, val) in values.iter().enumerate() {
+                    self.enum_values.insert(val.clone(), i as i64);
+                }
+                self.enum_type_values.insert(td.name.clone(), values.clone());
+            }
         }
 
         // Compile procedures/functions first (they are separate LLVM functions)
@@ -318,7 +331,7 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Initialize scalar types to zero
             match &resolved_ty {
-                PascalType::Integer => {
+                PascalType::Integer | PascalType::Enum { .. } => {
                     self.builder.build_store(alloca, self.context.i64_type().const_int(0, false))
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
@@ -499,7 +512,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
             // Initialize to zero
             let zero: BasicValueEnum = match ret_ty {
-                PascalType::Integer => self.context.i64_type().const_int(0, false).into(),
+                PascalType::Integer | PascalType::Enum { .. } => self.context.i64_type().const_int(0, false).into(),
                 PascalType::Real => self.context.f64_type().const_float(0.0).into(),
                 PascalType::Boolean => self.context.bool_type().const_int(0, false).into(),
                 PascalType::Char => self.context.i8_type().const_int(0, false).into(),
@@ -705,7 +718,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn sizeof_type(&self, ty: &PascalType) -> u64 {
         match ty {
-            PascalType::Integer => 8,
+            PascalType::Integer | PascalType::Enum { .. } => 8,
             PascalType::Real => 8,
             PascalType::Boolean => 1,
             PascalType::Char => 1,
@@ -976,7 +989,7 @@ impl<'ctx> CodeGen<'ctx> {
             let arg_type = self.infer_expr_type(arg);
 
             let (write_fn, capture_fn) = match arg_type {
-                PascalType::Integer => ("bruto_write_int", "bruto_capture_write_int"),
+                PascalType::Integer | PascalType::Enum { .. } => ("bruto_write_int", "bruto_capture_write_int"),
                 PascalType::Real => ("bruto_write_real", "bruto_capture_write_real"),
                 PascalType::Boolean => ("bruto_write_bool", "bruto_capture_write_bool"),
                 PascalType::Char => ("bruto_write_char", "bruto_capture_write_char"),
@@ -1054,6 +1067,10 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(self.context.bool_type().const_int(if *b { 1 } else { 0 }, false).into())
             }
             Expr::Var(name, span) => {
+                // Check if this is an enum constant before looking up variables
+                if let Some(&ordinal) = self.enum_values.get(name.as_str()) {
+                    return Ok(self.context.i64_type().const_int(ordinal as u64, true).into());
+                }
                 let alloca = *self.variables.get(name.as_str())
                     .ok_or_else(|| CodeGenError::new(format!("undefined variable '{name}'"), Some(*span)))?;
                 let var_type = self.var_types.get(name.as_str()).cloned()
@@ -1205,13 +1222,14 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Record { fields } => PascalType::Record {
                 fields: fields.iter().map(|(n, t)| (n.clone(), self.resolve_type(t))).collect(),
             },
+            PascalType::Enum { .. } => ty.clone(),
             other => other.clone(),
         }
     }
 
     fn create_debug_type(&self, ty: &PascalType) -> Option<DIType<'ctx>> {
         match ty {
-            PascalType::Integer => {
+            PascalType::Integer | PascalType::Enum { .. } => {
                 self.di_builder.create_basic_type("long", 64, 0x05, DIFlags::ZERO)
                     .ok().map(|t| t.as_type())
             }
@@ -1258,7 +1276,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn llvm_type_for(&self, ty: &PascalType) -> inkwell::types::BasicTypeEnum<'ctx> {
         match ty {
-            PascalType::Integer => self.context.i64_type().as_basic_type_enum(),
+            PascalType::Integer | PascalType::Enum { .. } => self.context.i64_type().as_basic_type_enum(),
             PascalType::Real => self.context.f64_type().as_basic_type_enum(),
             PascalType::Boolean => self.context.bool_type().as_basic_type_enum(),
             PascalType::Char => self.context.i8_type().as_basic_type_enum(),
