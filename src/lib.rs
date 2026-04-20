@@ -631,4 +631,12 @@ end.
         assert_eq!(lines[4], "42");
         assert_eq!(lines[5], "123");
     }
+
+    #[test]
+    fn sample_pas_showcase() {
+        let source = include_str!("../../SAMPLE.PAS");
+        let (ok, out) = build_and_run_source(source);
+        assert!(ok, "SAMPLE.PAS failed to run");
+        assert!(out.contains("=== All features OK ==="), "missing final line: {out}");
+    }
 }
