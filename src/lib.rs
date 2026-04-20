@@ -387,6 +387,17 @@ mod tests {
     }
 
     #[test]
+    fn set_operations() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar s: set of integer;\n  x: boolean;\nbegin\n  s := [1, 3, 5..8];\n  x := 3 in s;\n  writeln(x);\n  x := 4 in s;\n  writeln(x)\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], "true");
+        assert_eq!(lines[1], "false");
+    }
+
+    #[test]
     fn ord_chr() {
         let (ok, out) = build_and_run_source(
             "program T;\nbegin\n  writeln(ord('A'));\n  write(chr(66))\nend.\n",

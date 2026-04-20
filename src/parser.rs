@@ -35,6 +35,7 @@ enum Tok {
     KwNew, KwDispose,
     Const, KwType,
     KwProcedure, KwFunction, KwForward,
+    KwSet, KwIn,
     TyReal, TyChar,
     // Type keywords
     TyInteger, TyString, TyBoolean,
@@ -89,6 +90,8 @@ impl fmt::Display for Tok {
             Tok::KwProcedure => write!(f, "'procedure'"),
             Tok::KwFunction => write!(f, "'function'"),
             Tok::KwForward => write!(f, "'forward'"),
+            Tok::KwSet => write!(f, "'set'"),
+            Tok::KwIn => write!(f, "'in'"),
             Tok::TyReal => write!(f, "'real'"),
             Tok::TyChar => write!(f, "'char'"),
             Tok::KwArray => write!(f, "'array'"),
@@ -343,6 +346,8 @@ impl Lexer {
                 "procedure" => Tok::KwProcedure,
                 "function" => Tok::KwFunction,
                 "forward"  => Tok::KwForward,
+                "set"      => Tok::KwSet,
+                "in"       => Tok::KwIn,
                 "array"    => Tok::KwArray,
                 "of"       => Tok::KwOf,
                 "record"   => Tok::KwRecord,
@@ -600,6 +605,12 @@ impl Parser {
             self.expect(&Tok::DotDot)?;
             let hi = self.parse_int_literal()?;
             return Ok(PascalType::Subrange { lo, hi });
+        }
+        if *self.peek() == Tok::KwSet {
+            self.advance();
+            self.expect(&Tok::KwOf)?;
+            let elem = self.parse_type()?;
+            return Ok(PascalType::Set { elem: Box::new(elem) });
         }
         if *self.peek() == Tok::KwArray {
             return self.parse_array_type();
@@ -992,6 +1003,17 @@ impl Parser {
 
     // ── expressions (precedence climbing) ────────────────
 
+    fn parse_set_element(&mut self) -> Result<SetElement, ParseError> {
+        let first = self.parse_expr()?;
+        if *self.peek() == Tok::DotDot {
+            self.advance();
+            let last = self.parse_expr()?;
+            Ok(SetElement::Range(first, last))
+        } else {
+            Ok(SetElement::Single(first))
+        }
+    }
+
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_comparison()
     }
@@ -1000,12 +1022,13 @@ impl Parser {
         let mut left = self.parse_additive()?;
         loop {
             let op = match self.peek() {
-                Tok::Eq  => BinOp::Eq,
-                Tok::Neq => BinOp::Neq,
-                Tok::Lt  => BinOp::Lt,
-                Tok::Gt  => BinOp::Gt,
-                Tok::Lte => BinOp::Lte,
-                Tok::Gte => BinOp::Gte,
+                Tok::Eq   => BinOp::Eq,
+                Tok::Neq  => BinOp::Neq,
+                Tok::Lt   => BinOp::Lt,
+                Tok::Gt   => BinOp::Gt,
+                Tok::Lte  => BinOp::Lte,
+                Tok::Gte  => BinOp::Gte,
+                Tok::KwIn => BinOp::In,
                 _ => break,
             };
             let span = self.span();
@@ -1149,6 +1172,20 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;
                 Ok(expr)
+            }
+            Tok::LBracket => {
+                self.advance();
+                let mut elements = Vec::new();
+                if *self.peek() != Tok::RBracket {
+                    elements.push(self.parse_set_element()?);
+                    while *self.peek() == Tok::Comma {
+                        self.advance();
+                        elements.push(self.parse_set_element()?);
+                    }
+                }
+                let span = self.span();
+                self.expect(&Tok::RBracket)?;
+                Ok(Expr::SetConstructor { elements, span })
             }
             _ => Err(ParseError {
                 message: format!("expected expression, found {}", self.peek()),

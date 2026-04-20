@@ -23,7 +23,7 @@ impl PascalHighlighter {
                 | "div" | "mod" | "and" | "or" | "not"
                 | "true" | "false" | "const" | "type" | "procedure" | "function"
                 | "array" | "of" | "record" | "nil" | "case" | "with"
-                | "new" | "dispose" | "forward"
+                | "new" | "dispose" | "forward" | "set" | "in"
         )
     }
 

@@ -358,7 +358,7 @@ impl<'ctx> CodeGen<'ctx> {
                     self.builder.build_store(alloca, ptr_type.const_null())
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
-                PascalType::Array { .. } | PascalType::Record { .. } | PascalType::Named(_) => {
+                PascalType::Array { .. } | PascalType::Record { .. } | PascalType::Set { .. } | PascalType::Named(_) => {
                     // Aggregate types: zero-initialized by alloca (no explicit store needed)
                 }
             }
@@ -723,6 +723,7 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Boolean => 1,
             PascalType::Char => 1,
             PascalType::String | PascalType::Pointer(_) => 8,
+            PascalType::Set { .. } => 32, // 4 x i64 = 256 bits
             PascalType::Array { lo, hi, elem } => {
                 let count = (hi - lo + 1).max(0) as u64;
                 count * self.sizeof_type(elem)
@@ -1201,6 +1202,9 @@ impl<'ctx> CodeGen<'ctx> {
                 ret.try_as_basic_value().basic()
                     .ok_or_else(|| CodeGenError::new(format!("function '{name}' does not return a value"), Some(*span)))
             }
+            Expr::SetConstructor { elements, span } => {
+                self.compile_set_constructor(elements, *span)
+            }
             Expr::BinOp { op, left, right, span } => {
                 self.compile_binop(*op, left, right, *span)
             }
@@ -1208,6 +1212,160 @@ impl<'ctx> CodeGen<'ctx> {
                 self.compile_unaryop(*op, operand, *span)
             }
         }
+    }
+
+    fn compile_set_constructor(
+        &mut self,
+        elements: &[SetElement],
+        span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let set_ty = self.context.i64_type().array_type(4);
+        let alloca = self.builder.build_alloca(set_ty, "set_tmp")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+        // Zero-initialize with memset
+        let i8_ptr = self.context.ptr_type(AddressSpace::default());
+        let memset_fn = self.module.get_function("llvm.memset.p0.i64").unwrap_or_else(|| {
+            let fn_type = self.context.void_type().fn_type(
+                &[
+                    i8_ptr.into(),
+                    self.context.i8_type().into(),
+                    self.context.i64_type().into(),
+                    self.context.bool_type().into(),
+                ],
+                false,
+            );
+            self.module.add_function("llvm.memset.p0.i64", fn_type, None)
+        });
+        self.builder.build_call(
+            memset_fn,
+            &[
+                alloca.into(),
+                self.context.i8_type().const_int(0, false).into(),
+                self.context.i64_type().const_int(32, false).into(),
+                self.context.bool_type().const_int(0, false).into(),
+            ],
+            "",
+        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+        let i64_ty = self.context.i64_type();
+        let zero = i64_ty.const_int(0, false);
+        let sixty_four = i64_ty.const_int(64, false);
+        let one_i64 = i64_ty.const_int(1, false);
+
+        for elem in elements {
+            match elem {
+                SetElement::Single(expr) => {
+                    let ord_val = self.compile_expr(expr)?;
+                    let ord = ord_val.into_int_value();
+                    // Extend to i64 if needed (e.g., from i8 for char)
+                    let ord = if ord.get_type().get_bit_width() < 64 {
+                        self.builder.build_int_z_extend(ord, i64_ty, "ord_ext")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    } else {
+                        ord
+                    };
+                    // word_idx = ord / 64, bit_idx = ord % 64
+                    let word_idx = self.builder.build_int_unsigned_div(ord, sixty_four, "word_idx")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let bit_idx = self.builder.build_int_unsigned_rem(ord, sixty_four, "bit_idx")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let mask = self.builder.build_left_shift(one_i64, bit_idx, "mask")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    // GEP into the word
+                    let gep = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            set_ty, alloca,
+                            &[zero, word_idx],
+                            "set_word_ptr",
+                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    };
+                    let cur = self.builder.build_load(i64_ty, gep, "cur_word")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let new = self.builder.build_or(cur.into_int_value(), mask, "new_word")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder.build_store(gep, new)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                }
+                SetElement::Range(lo_expr, hi_expr) => {
+                    let lo_val = self.compile_expr(lo_expr)?.into_int_value();
+                    let hi_val = self.compile_expr(hi_expr)?.into_int_value();
+                    let lo_val = if lo_val.get_type().get_bit_width() < 64 {
+                        self.builder.build_int_z_extend(lo_val, i64_ty, "lo_ext")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    } else {
+                        lo_val
+                    };
+                    let hi_val = if hi_val.get_type().get_bit_width() < 64 {
+                        self.builder.build_int_z_extend(hi_val, i64_ty, "hi_ext")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    } else {
+                        hi_val
+                    };
+
+                    let current_fn = self.current_fn.unwrap();
+                    let loop_bb = self.context.append_basic_block(current_fn, "set_range_loop");
+                    let body_bb = self.context.append_basic_block(current_fn, "set_range_body");
+                    let done_bb = self.context.append_basic_block(current_fn, "set_range_done");
+
+                    // Store loop variable
+                    let iter_alloca = self.builder.build_alloca(i64_ty, "set_iter")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder.build_store(iter_alloca, lo_val)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder.build_unconditional_branch(loop_bb)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+                    // Loop header: check iter <= hi
+                    self.builder.position_at_end(loop_bb);
+                    let iter_val = self.builder.build_load(i64_ty, iter_alloca, "iter")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        .into_int_value();
+                    let cond = self.builder.build_int_compare(
+                        inkwell::IntPredicate::SLE, iter_val, hi_val, "range_cond",
+                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder.build_conditional_branch(cond, body_bb, done_bb)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+                    // Loop body: set bit for iter_val
+                    self.builder.position_at_end(body_bb);
+                    let word_idx = self.builder.build_int_unsigned_div(iter_val, sixty_four, "word_idx")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let bit_idx = self.builder.build_int_unsigned_rem(iter_val, sixty_four, "bit_idx")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let mask = self.builder.build_left_shift(one_i64, bit_idx, "mask")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let gep = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            set_ty, alloca,
+                            &[zero, word_idx],
+                            "set_word_ptr",
+                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    };
+                    let cur = self.builder.build_load(i64_ty, gep, "cur_word")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let new = self.builder.build_or(cur.into_int_value(), mask, "new_word")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder.build_store(gep, new)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+                    // Increment
+                    let next = self.builder.build_int_add(iter_val, one_i64, "next_iter")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder.build_store(iter_alloca, next)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder.build_unconditional_branch(loop_bb)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+                    self.builder.position_at_end(done_bb);
+                }
+            }
+        }
+
+        // Load and return the set value
+        let result = self.builder.build_load(set_ty, alloca, "set_val")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(result)
     }
 
     fn resolve_type(&self, ty: &PascalType) -> PascalType {
@@ -1222,6 +1380,7 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Record { fields } => PascalType::Record {
                 fields: fields.iter().map(|(n, t)| (n.clone(), self.resolve_type(t))).collect(),
             },
+            PascalType::Set { elem } => PascalType::Set { elem: Box::new(self.resolve_type(elem)) },
             PascalType::Enum { .. } | PascalType::Subrange { .. } => ty.clone(),
             other => other.clone(),
         }
@@ -1283,6 +1442,7 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::String | PascalType::Pointer(_) => {
                 self.context.ptr_type(AddressSpace::default()).as_basic_type_enum()
             }
+            PascalType::Set { .. } => self.context.i64_type().array_type(4).as_basic_type_enum(),
             PascalType::Array { lo, hi, elem } => {
                 let count = (hi - lo + 1).max(0) as u32;
                 let elem_ty = self.llvm_type_for(elem);
@@ -1309,6 +1469,118 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let lhs = self.compile_expr(left)?;
         let rhs = self.compile_expr(right)?;
+
+        // Set membership: x in S
+        if op == BinOp::In {
+            let i64_ty = self.context.i64_type();
+            let set_ty = i64_ty.array_type(4);
+            let zero = i64_ty.const_int(0, false);
+            let sixty_four = i64_ty.const_int(64, false);
+            let one_i64 = i64_ty.const_int(1, false);
+
+            // lhs is the ordinal, rhs is the set ([4 x i64])
+            let ord = lhs.into_int_value();
+            let ord = if ord.get_type().get_bit_width() < 64 {
+                self.builder.build_int_z_extend(ord, i64_ty, "ord_ext")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            } else {
+                ord
+            };
+
+            // Store set to alloca so we can GEP into it
+            let set_alloca = self.builder.build_alloca(set_ty, "set_in_tmp")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.builder.build_store(set_alloca, rhs)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+            let word_idx = self.builder.build_int_unsigned_div(ord, sixty_four, "word_idx")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let bit_idx = self.builder.build_int_unsigned_rem(ord, sixty_four, "bit_idx")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let mask = self.builder.build_left_shift(one_i64, bit_idx, "mask")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+            let gep = unsafe {
+                self.builder.build_in_bounds_gep(
+                    set_ty, set_alloca,
+                    &[zero, word_idx],
+                    "set_word_ptr",
+                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            };
+            let word = self.builder.build_load(i64_ty, gep, "word")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let anded = self.builder.build_and(word.into_int_value(), mask, "anded")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let result = self.builder.build_int_compare(
+                inkwell::IntPredicate::NE, anded, zero, "in_result",
+            ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            return Ok(result.into());
+        }
+
+        // Set binary ops: +, -, * on [4 x i64]
+        if lhs.is_array_value() && rhs.is_array_value() {
+            let i64_ty = self.context.i64_type();
+            let set_ty = i64_ty.array_type(4);
+            let zero = i64_ty.const_int(0, false);
+
+            let l_alloca = self.builder.build_alloca(set_ty, "set_l")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.builder.build_store(l_alloca, lhs)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let r_alloca = self.builder.build_alloca(set_ty, "set_r")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.builder.build_store(r_alloca, rhs)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let out_alloca = self.builder.build_alloca(set_ty, "set_out")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+            for i in 0..4u64 {
+                let idx = i64_ty.const_int(i, false);
+                let l_gep = unsafe {
+                    self.builder.build_in_bounds_gep(set_ty, l_alloca, &[zero, idx], "lg")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                };
+                let r_gep = unsafe {
+                    self.builder.build_in_bounds_gep(set_ty, r_alloca, &[zero, idx], "rg")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                };
+                let o_gep = unsafe {
+                    self.builder.build_in_bounds_gep(set_ty, out_alloca, &[zero, idx], "og")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                };
+                let lw = self.builder.build_load(i64_ty, l_gep, "lw")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+                let rw = self.builder.build_load(i64_ty, r_gep, "rw")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+
+                let result_word = match op {
+                    BinOp::Add => {
+                        // Union: OR
+                        self.builder.build_or(lw, rw, "union")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    }
+                    BinOp::Sub => {
+                        // Difference: AND(l, NOT(r))
+                        let not_r = self.builder.build_not(rw, "not_r")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        self.builder.build_and(lw, not_r, "diff")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    }
+                    BinOp::Mul => {
+                        // Intersection: AND
+                        self.builder.build_and(lw, rw, "isect")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    }
+                    _ => return Err(CodeGenError::new("unsupported operator for set type", Some(span))),
+                };
+                self.builder.build_store(o_gep, result_word)
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            }
+
+            let result = self.builder.build_load(set_ty, out_alloca, "set_result")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            return Ok(result);
+        }
 
         // Real division (/) always uses float even for integer operands
         if op == BinOp::RealDiv {
@@ -1373,7 +1645,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
                 BinOp::Or => self.builder.build_or(l, r, "or")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::RealDiv => unreachable!("handled above"),
+                BinOp::RealDiv | BinOp::In => unreachable!("handled above"),
             };
 
             return Ok(result.into());
@@ -1501,16 +1773,19 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::StrLit(..) => PascalType::String,
             Expr::BoolLit(..) => PascalType::Boolean,
             Expr::Var(name, _) => self.var_types.get(name.as_str()).cloned().unwrap_or(PascalType::Integer),
+            Expr::SetConstructor { .. } => PascalType::Set { elem: Box::new(PascalType::Integer) },
             Expr::BinOp { op, left, right, .. } => {
                 match op {
                     BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
-                    | BinOp::And | BinOp::Or => PascalType::Boolean,
+                    | BinOp::And | BinOp::Or | BinOp::In => PascalType::Boolean,
                     BinOp::RealDiv => PascalType::Real,
                     _ => {
-                        // If either operand is real, result is real
                         let lt = self.infer_expr_type(left);
                         let rt = self.infer_expr_type(right);
-                        if lt == PascalType::Real || rt == PascalType::Real {
+                        // Set operations return a set
+                        if matches!(lt, PascalType::Set { .. }) || matches!(rt, PascalType::Set { .. }) {
+                            PascalType::Set { elem: Box::new(PascalType::Integer) }
+                        } else if lt == PascalType::Real || rt == PascalType::Real {
                             PascalType::Real
                         } else {
                             PascalType::Integer

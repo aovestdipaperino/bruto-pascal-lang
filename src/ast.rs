@@ -102,6 +102,8 @@ pub enum PascalType {
     },
     /// Subrange type: lo..hi (stored as i64)
     Subrange { lo: i64, hi: i64 },
+    /// Set of ordinal type — stored as 256-bit bitmask (4 x i64)
+    Set { elem: Box<PascalType> },
     /// A named type alias (resolved to canonical type during compilation)
     Named(String),
 }
@@ -256,6 +258,17 @@ pub enum Expr {
         field: String,
         span: Span,
     },
+    /// Set constructor: [1, 3, 5..10]
+    SetConstructor {
+        elements: Vec<SetElement>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum SetElement {
+    Single(Expr),
+    Range(Expr, Expr),
 }
 
 impl Expr {
@@ -272,7 +285,8 @@ impl Expr {
             | Self::Deref(_, span)
             | Self::Call { span, .. }
             | Self::Index { span, .. }
-            | Self::FieldAccess { span, .. } => *span,
+            | Self::FieldAccess { span, .. }
+            | Self::SetConstructor { span, .. } => *span,
         }
     }
 }
@@ -293,6 +307,7 @@ pub enum BinOp {
     Gte,
     And,
     Or,
+    In, // element membership: x in S
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
