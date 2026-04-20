@@ -91,6 +91,7 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         | ast::Statement::New { span, .. }
         | ast::Statement::Dispose { span, .. }
         | ast::Statement::IndexAssignment { span, .. }
+        | ast::Statement::MultiIndexAssignment { span, .. }
         | ast::Statement::FieldAssignment { span, .. }
         | ast::Statement::ProcCall { span, .. } => {
             lines.insert(span.line as usize);
@@ -115,6 +116,23 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
             for stmt in body {
                 collect_stmt_lines(stmt, lines);
             }
+        }
+        ast::Statement::Case { branches, else_branch, span, .. } => {
+            lines.insert(span.line as usize);
+            for branch in branches {
+                for stmt in &branch.body { collect_stmt_lines(stmt, lines); }
+            }
+            if let Some(stmts) = else_branch {
+                for stmt in stmts { collect_stmt_lines(stmt, lines); }
+            }
+        }
+        ast::Statement::Goto { span, .. }
+        | ast::Statement::Label { span, .. } => {
+            lines.insert(span.line as usize);
+        }
+        ast::Statement::With { body, span, .. } => {
+            lines.insert(span.line as usize);
+            collect_block_lines(body, lines);
         }
         ast::Statement::Block(block) => {
             collect_block_lines(block, lines);
@@ -398,6 +416,33 @@ mod tests {
     }
 
     #[test]
+    fn case_statement() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar x: integer;\nbegin\n  x := 2;\n  case x of\n    1: writeln('one');\n    2, 3: writeln('two or three');\n  else\n    writeln('other')\n  end\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "two or three");
+    }
+
+    #[test]
+    fn goto_label() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nlabel 10;\nvar i: integer;\nbegin\n  i := 0;\n  10: i := i + 1;\n  if i < 5 then\n    goto 10;\n  writeln(i)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "5");
+    }
+
+    #[test]
+    fn with_statement() {
+        let (ok, out) = build_and_run_source(
+            "program T;\ntype\n  Point = record\n    x, y: integer;\n  end;\nvar p: Point;\nbegin\n  with p do\n  begin\n    x := 10;\n    y := 20\n  end;\n  writeln(p.x + p.y)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "30");
+    }
+
+    #[test]
     fn ord_chr() {
         let (ok, out) = build_and_run_source(
             "program T;\nbegin\n  writeln(ord('A'));\n  write(chr(66))\nend.\n",
@@ -406,5 +451,98 @@ mod tests {
         let lines: Vec<&str> = out.trim().lines().collect();
         assert_eq!(lines[0], "65");
         assert_eq!(lines[1], "B");
+    }
+
+    #[test]
+    fn multi_dim_array() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar\n  m: array[1..2, 1..3] of integer;\nbegin\n  m[1, 2] := 42;\n  writeln(m[1, 2])\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn variant_record() {
+        let (ok, out) = build_and_run_source(
+            "program T;\ntype\n  Shape = record\n    kind: integer;\n    case tag: integer of\n      1: (radius: integer);\n      2: (width, height: integer);\n  end;\nvar s: Shape;\nbegin\n  s.kind := 1;\n  s.tag := 1;\n  s.radius := 10;\n  writeln(s.radius)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "10");
+    }
+
+    #[test]
+    fn all_new_features() {
+        let source = r#"program NewFeatures;
+label 99;
+type
+  Color = (Red, Green, Blue);
+  SmallInt = 1..10;
+  Point = record
+    x, y: integer;
+  end;
+
+var
+  c: Color;
+  n: SmallInt;
+  s: set of integer;
+  ok: boolean;
+  pt: Point;
+  m: array[1..2, 1..3] of integer;
+  i: integer;
+
+begin
+  { Enumerated types }
+  c := Blue;
+  writeln('Blue = ', c);
+
+  { Subrange }
+  n := 7;
+  writeln('n = ', n);
+
+  { Sets }
+  s := [1, 3, 5..9];
+  ok := 5 in s;
+  writeln('5 in set: ', ok);
+  ok := 4 in s;
+  writeln('4 in set: ', ok);
+
+  { Case }
+  case c of
+    0: writeln('Red');
+    1: writeln('Green');
+    2: writeln('Blue')
+  end;
+
+  { With }
+  with pt do
+  begin
+    x := 100;
+    y := 200
+  end;
+  writeln('pt = ', pt.x + pt.y);
+
+  { Multi-dim arrays }
+  m[1, 2] := 42;
+  writeln('m[1,2] = ', m[1, 2]);
+
+  { Goto }
+  i := 0;
+  99: i := i + 1;
+  if i < 3 then
+    goto 99;
+  writeln('goto count = ', i)
+end.
+"#;
+        let (ok, out) = build_and_run_source(source);
+        assert!(ok, "new features program failed to run");
+        assert!(out.contains("Blue = 2"), "enum: {out}");
+        assert!(out.contains("n = 7"), "subrange: {out}");
+        assert!(out.contains("5 in set: true"), "set-in: {out}");
+        assert!(out.contains("4 in set: false"), "set-not-in: {out}");
+        assert!(out.contains("Blue"), "case: {out}");
+        assert!(out.contains("pt = 300"), "with: {out}");
+        assert!(out.contains("m[1,2] = 42"), "multi-dim: {out}");
+        assert!(out.contains("goto count = 3"), "goto: {out}");
     }
 }

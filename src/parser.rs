@@ -35,7 +35,7 @@ enum Tok {
     KwNew, KwDispose,
     Const, KwType,
     KwProcedure, KwFunction, KwForward,
-    KwSet, KwIn,
+    KwSet, KwIn, KwCase, KwLabel, KwGoto, KwWith,
     TyReal, TyChar,
     // Type keywords
     TyInteger, TyString, TyBoolean,
@@ -92,6 +92,10 @@ impl fmt::Display for Tok {
             Tok::KwForward => write!(f, "'forward'"),
             Tok::KwSet => write!(f, "'set'"),
             Tok::KwIn => write!(f, "'in'"),
+            Tok::KwCase => write!(f, "'case'"),
+            Tok::KwLabel => write!(f, "'label'"),
+            Tok::KwGoto => write!(f, "'goto'"),
+            Tok::KwWith => write!(f, "'with'"),
             Tok::TyReal => write!(f, "'real'"),
             Tok::TyChar => write!(f, "'char'"),
             Tok::KwArray => write!(f, "'array'"),
@@ -348,6 +352,10 @@ impl Lexer {
                 "forward"  => Tok::KwForward,
                 "set"      => Tok::KwSet,
                 "in"       => Tok::KwIn,
+                "case"     => Tok::KwCase,
+                "label"    => Tok::KwLabel,
+                "goto"     => Tok::KwGoto,
+                "with"     => Tok::KwWith,
                 "array"    => Tok::KwArray,
                 "of"       => Tok::KwOf,
                 "record"   => Tok::KwRecord,
@@ -481,6 +489,12 @@ impl Parser {
         let (name, _) = self.expect_ident()?;
         self.expect(&Tok::Semi)?;
 
+        let labels = if *self.peek() == Tok::KwLabel {
+            self.parse_label_section()?
+        } else {
+            Vec::new()
+        };
+
         let consts = if *self.peek() == Tok::Const {
             self.parse_const_section()?
         } else {
@@ -507,7 +521,21 @@ impl Parser {
         let body = self.parse_block()?;
         self.expect(&Tok::Dot)?;
 
-        Ok(Program { name, consts, type_decls, vars, procedures, body, span })
+        Ok(Program { name, labels, consts, type_decls, vars, procedures, body, span })
+    }
+
+    // ── label section ────────────────────────────────────
+
+    fn parse_label_section(&mut self) -> Result<Vec<i64>, ParseError> {
+        self.expect(&Tok::KwLabel)?;
+        let mut labels = Vec::new();
+        labels.push(self.parse_int_literal()?);
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            labels.push(self.parse_int_literal()?);
+        }
+        self.expect(&Tok::Semi)?;
+        Ok(labels)
     }
 
     // ── type section ─────────────────────────────────────
@@ -639,14 +667,30 @@ impl Parser {
     fn parse_array_type(&mut self) -> Result<PascalType, ParseError> {
         self.expect(&Tok::KwArray)?;
         self.expect(&Tok::LBracket)?;
-        // Parse lo..hi
+
+        let mut dimensions = Vec::new();
         let lo = self.parse_int_literal()?;
         self.expect(&Tok::DotDot)?;
         let hi = self.parse_int_literal()?;
+        dimensions.push((lo, hi));
+
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            let lo = self.parse_int_literal()?;
+            self.expect(&Tok::DotDot)?;
+            let hi = self.parse_int_literal()?;
+            dimensions.push((lo, hi));
+        }
         self.expect(&Tok::RBracket)?;
         self.expect(&Tok::KwOf)?;
         let elem = self.parse_type()?;
-        Ok(PascalType::Array { lo, hi, elem: Box::new(elem) })
+
+        // Build nested array types from innermost to outermost
+        let mut result = elem;
+        for (lo, hi) in dimensions.into_iter().rev() {
+            result = PascalType::Array { lo, hi, elem: Box::new(result) };
+        }
+        Ok(result)
     }
 
     fn parse_int_literal(&mut self) -> Result<i64, ParseError> {
@@ -671,7 +715,13 @@ impl Parser {
     fn parse_record_type(&mut self) -> Result<PascalType, ParseError> {
         self.expect(&Tok::KwRecord)?;
         let mut fields = Vec::new();
+        let mut variant = None;
+
         while *self.peek() != Tok::End {
+            if *self.peek() == Tok::KwCase {
+                variant = Some(Box::new(self.parse_variant_part()?));
+                break;
+            }
             // field1, field2: type;
             let mut names = Vec::new();
             let (first, _) = self.expect_ident()?;
@@ -691,7 +741,52 @@ impl Parser {
             }
         }
         self.expect(&Tok::End)?;
-        Ok(PascalType::Record { fields })
+        Ok(PascalType::Record { fields, variant })
+    }
+
+    fn parse_variant_part(&mut self) -> Result<RecordVariant, ParseError> {
+        self.expect(&Tok::KwCase)?;
+        let (tag_name, _) = self.expect_ident()?;
+        self.expect(&Tok::Colon)?;
+        let tag_type = self.parse_type()?;
+        self.expect(&Tok::KwOf)?;
+
+        let mut variants = Vec::new();
+        while *self.peek() != Tok::End {
+            let mut values = Vec::new();
+            values.push(self.parse_int_literal()?);
+            while *self.peek() == Tok::Comma {
+                self.advance();
+                values.push(self.parse_int_literal()?);
+            }
+            self.expect(&Tok::Colon)?;
+            self.expect(&Tok::LParen)?;
+            let mut vfields = Vec::new();
+            while *self.peek() != Tok::RParen {
+                let mut names = Vec::new();
+                let (first, _) = self.expect_ident()?;
+                names.push(first);
+                while *self.peek() == Tok::Comma {
+                    self.advance();
+                    let (name, _) = self.expect_ident()?;
+                    names.push(name);
+                }
+                self.expect(&Tok::Colon)?;
+                let ty = self.parse_type()?;
+                for name in names {
+                    vfields.push((name, ty.clone()));
+                }
+                if *self.peek() == Tok::Semi {
+                    self.advance();
+                }
+            }
+            self.expect(&Tok::RParen)?;
+            variants.push((values, vfields));
+            if *self.peek() == Tok::Semi {
+                self.advance();
+            }
+        }
+        Ok(RecordVariant { tag_name, tag_type, variants })
     }
 
     fn parse_enum_type(&mut self) -> Result<PascalType, ParseError> {
@@ -785,13 +880,24 @@ impl Parser {
         let mut statements = Vec::new();
         // Parse statements separated by semicolons, until 'end'
         if *self.peek() != Tok::End {
-            statements.push(self.parse_statement()?);
+            let stmt = self.parse_statement()?;
+            let is_label = matches!(&stmt, Statement::Label { .. });
+            statements.push(stmt);
+            // After a label, the labeled statement follows without a semicolon
+            if is_label && *self.peek() != Tok::End && *self.peek() != Tok::Semi {
+                statements.push(self.parse_statement()?);
+            }
             while *self.peek() == Tok::Semi {
                 self.advance();
                 if *self.peek() == Tok::End {
                     break;
                 }
-                statements.push(self.parse_statement()?);
+                let stmt = self.parse_statement()?;
+                let is_label = matches!(&stmt, Statement::Label { .. });
+                statements.push(stmt);
+                if is_label && *self.peek() != Tok::End && *self.peek() != Tok::Semi {
+                    statements.push(self.parse_statement()?);
+                }
             }
         }
         let end_span = self.span();
@@ -802,6 +908,16 @@ impl Parser {
     // ── statement ────────────────────────────────────────
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        // Check for label: N: statement
+        if let Tok::IntLit(n) = self.peek().clone() {
+            if self.tokens.get(self.pos + 1).map(|(t, _)| t == &Tok::Colon).unwrap_or(false) {
+                let span = self.span();
+                self.advance(); // consume number
+                self.advance(); // consume colon
+                return Ok(Statement::Label { label: n, span });
+            }
+        }
+
         match self.peek() {
             Tok::Begin => Ok(Statement::Block(self.parse_block()?)),
             Tok::If => self.parse_if(),
@@ -813,6 +929,22 @@ impl Parser {
             Tok::KwReadLn => self.parse_readln(),
             Tok::KwNew => self.parse_new(),
             Tok::KwDispose => self.parse_dispose(),
+            Tok::KwCase => self.parse_case(),
+            Tok::KwWith => self.parse_with(),
+            Tok::KwGoto => {
+                let span = self.span();
+                self.advance();
+                match self.peek().clone() {
+                    Tok::IntLit(n) => {
+                        self.advance();
+                        Ok(Statement::Goto { label: n, span })
+                    }
+                    _ => Err(ParseError {
+                        message: format!("expected label number after 'goto', found {}", self.peek()),
+                        span: self.span(),
+                    }),
+                }
+            }
             Tok::Ident(_) => self.parse_ident_statement(),
             _ => Err(ParseError {
                 message: format!("expected statement, found {}", self.peek()),
@@ -837,13 +969,21 @@ impl Parser {
                 Ok(Statement::DerefAssignment { target: name, expr, span })
             }
             Tok::LBracket => {
-                // a[i] := expr
                 self.advance();
-                let index = self.parse_expr()?;
+                let mut indices = Vec::new();
+                indices.push(self.parse_expr()?);
+                while *self.peek() == Tok::Comma {
+                    self.advance();
+                    indices.push(self.parse_expr()?);
+                }
                 self.expect(&Tok::RBracket)?;
                 self.expect(&Tok::Assign)?;
                 let expr = self.parse_expr()?;
-                Ok(Statement::IndexAssignment { target: name, index, expr, span })
+                if indices.len() == 1 {
+                    Ok(Statement::IndexAssignment { target: name, index: indices.into_iter().next().unwrap(), expr, span })
+                } else {
+                    Ok(Statement::MultiIndexAssignment { target: name, indices, expr, span })
+                }
             }
             Tok::Dot => {
                 // r.field := expr
@@ -950,6 +1090,77 @@ impl Parser {
         self.expect(&Tok::Until)?;
         let condition = self.parse_expr()?;
         Ok(Statement::RepeatUntil { body: stmts, condition, span })
+    }
+
+    fn parse_case(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        self.expect(&Tok::KwCase)?;
+        let expr = self.parse_expr()?;
+        self.expect(&Tok::KwOf)?;
+
+        let mut branches = Vec::new();
+        let mut else_branch = None;
+
+        loop {
+            if *self.peek() == Tok::End { break; }
+            if *self.peek() == Tok::Else {
+                self.advance();
+                let mut stmts = Vec::new();
+                if *self.peek() != Tok::End {
+                    stmts.push(self.parse_statement()?);
+                    while *self.peek() == Tok::Semi {
+                        self.advance();
+                        if *self.peek() == Tok::End { break; }
+                        stmts.push(self.parse_statement()?);
+                    }
+                }
+                else_branch = Some(stmts);
+                break;
+            }
+
+            let branch_span = self.span();
+            let mut values = Vec::new();
+            values.push(self.parse_case_value()?);
+            while *self.peek() == Tok::Comma {
+                self.advance();
+                values.push(self.parse_case_value()?);
+            }
+            self.expect(&Tok::Colon)?;
+            let mut body = Vec::new();
+            body.push(self.parse_statement()?);
+            branches.push(CaseBranch { values, body, span: branch_span });
+            if *self.peek() == Tok::Semi { self.advance(); }
+        }
+
+        self.expect(&Tok::End)?;
+        Ok(Statement::Case { expr, branches, else_branch, span })
+    }
+
+    fn parse_case_value(&mut self) -> Result<CaseValue, ParseError> {
+        let first = self.parse_expr()?;
+        if *self.peek() == Tok::DotDot {
+            self.advance();
+            let last = self.parse_expr()?;
+            Ok(CaseValue::Range(first, last))
+        } else {
+            Ok(CaseValue::Single(first))
+        }
+    }
+
+    fn parse_with(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        self.expect(&Tok::KwWith)?;
+        let (record_var, _) = self.expect_ident()?;
+        self.expect(&Tok::Do)?;
+        let body_stmt = self.parse_statement()?;
+        let body = match body_stmt {
+            Statement::Block(b) => b,
+            other => {
+                let s = other.span();
+                Block { span: s, end_span: s, statements: vec![other] }
+            }
+        };
+        Ok(Statement::With { record_var, body, span })
     }
 
     fn parse_new(&mut self) -> Result<Statement, ParseError> {
@@ -1150,8 +1361,19 @@ impl Parser {
                         Tok::LBracket => {
                             self.advance();
                             let index = self.parse_expr()?;
-                            self.expect(&Tok::RBracket)?;
-                            expr = Expr::Index { array: Box::new(expr), index: Box::new(index), span };
+                            if *self.peek() == Tok::Comma {
+                                let mut expr_so_far = Expr::Index { array: Box::new(expr), index: Box::new(index), span };
+                                while *self.peek() == Tok::Comma {
+                                    self.advance();
+                                    let next_index = self.parse_expr()?;
+                                    expr_so_far = Expr::Index { array: Box::new(expr_so_far), index: Box::new(next_index), span };
+                                }
+                                self.expect(&Tok::RBracket)?;
+                                expr = expr_so_far;
+                            } else {
+                                self.expect(&Tok::RBracket)?;
+                                expr = Expr::Index { array: Box::new(expr), index: Box::new(index), span };
+                            }
                         }
                         Tok::Dot => {
                             self.advance();

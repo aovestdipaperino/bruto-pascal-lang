@@ -77,6 +77,9 @@ pub struct CodeGen<'ctx> {
     current_fn: Option<FunctionValue<'ctx>>,
     current_scope: Option<DIScope<'ctx>>,
 
+    // Goto/label support
+    label_blocks: HashMap<i64, inkwell::basic_block::BasicBlock<'ctx>>,
+
     source_path: String,
 }
 
@@ -126,6 +129,7 @@ impl<'ctx> CodeGen<'ctx> {
             proc_param_modes: HashMap::new(),
             current_fn: None,
             current_scope: None,
+            label_blocks: HashMap::new(),
             source_path: source_path.to_string(),
         }
     }
@@ -171,6 +175,12 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.current_fn = Some(main_fn);
         self.current_scope = Some(di_main.as_debug_info_scope());
+
+        // Pre-create basic blocks for all declared labels
+        for &label in &program.labels {
+            let bb = self.context.append_basic_block(main_fn, &format!("label_{label}"));
+            self.label_blocks.insert(label, bb);
+        }
 
         // Register type aliases
         for td in &program.type_decls {
@@ -359,7 +369,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::Array { .. } | PascalType::Record { .. } | PascalType::Set { .. } | PascalType::Named(_) => {
-                    // Aggregate types: zero-initialized by alloca (no explicit store needed)
+                    // Aggregate types: zero-initialized by alloca (no explicit store needed).
                 }
             }
 
@@ -639,6 +649,42 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(())
             }
+            Statement::MultiIndexAssignment { target, indices, expr, span } => {
+                self.set_debug_loc(*span);
+                let val = self.compile_expr(expr)?;
+                let alloca = *self.variables.get(target.as_str())
+                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(*span)))?;
+                let var_type = self.var_types.get(target.as_str()).cloned()
+                    .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(*span)))?;
+
+                let mut current_ptr = alloca;
+                let mut current_type = var_type;
+                for (dim, index_expr) in indices.iter().enumerate() {
+                    let idx_val = self.compile_expr(index_expr)?;
+                    let (lo, elem_ty) = match &current_type {
+                        PascalType::Array { lo, elem, .. } => (*lo, elem.as_ref().clone()),
+                        _ => return Err(CodeGenError::new(format!("too many indices for '{target}'"), Some(*span))),
+                    };
+                    let adj = self.builder.build_int_sub(
+                        idx_val.into_int_value(),
+                        self.context.i64_type().const_int(lo as u64, true), "adj_idx",
+                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let gep = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            self.llvm_type_for(&current_type), current_ptr,
+                            &[self.context.i64_type().const_int(0, false), adj], "multi_gep",
+                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                    };
+                    if dim == indices.len() - 1 {
+                        self.builder.build_store(gep, val)
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    } else {
+                        current_ptr = gep;
+                        current_type = elem_ty;
+                    }
+                }
+                Ok(())
+            }
             Statement::FieldAssignment { target, field, expr, span } => {
                 self.set_debug_loc(*span);
                 let val = self.compile_expr(expr)?;
@@ -646,26 +692,90 @@ impl<'ctx> CodeGen<'ctx> {
                     .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(*span)))?;
                 let var_type = self.var_types.get(target.as_str()).cloned()
                     .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(*span)))?;
-                let field_idx = match &var_type {
-                    PascalType::Record { fields } => {
-                        fields.iter().position(|(n, _)| n == field)
-                            .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(*span)))?
+                let resolved = self.resolve_type(&var_type);
+                match &resolved {
+                    PascalType::Record { fields, variant } => {
+                        // Check fixed fields first
+                        if let Some(idx) = fields.iter().position(|(n, _)| n == field) {
+                            let gep = self.builder.build_struct_gep(
+                                self.llvm_type_for(&resolved),
+                                alloca,
+                                idx as u32,
+                                "field_gep",
+                            ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                            self.builder.build_store(gep, val)
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                        } else if let Some(v) = variant {
+                            if field == &v.tag_name {
+                                // Tag field: index = fields.len()
+                                let gep = self.builder.build_struct_gep(
+                                    self.llvm_type_for(&resolved),
+                                    alloca,
+                                    fields.len() as u32,
+                                    "tag_gep",
+                                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                self.builder.build_store(gep, val)
+                                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                            } else {
+                                // Search variant fields
+                                let (byte_offset, _field_ty) = self.find_variant_field(v, field)
+                                    .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(*span)))?;
+                                // GEP to union array (index = fields.len() + 1)
+                                let union_gep = self.builder.build_struct_gep(
+                                    self.llvm_type_for(&resolved),
+                                    alloca,
+                                    (fields.len() + 1) as u32,
+                                    "union_gep",
+                                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                // Byte-offset into the union array
+                                let byte_gep = unsafe {
+                                    self.builder.build_in_bounds_gep(
+                                        self.context.i8_type(),
+                                        union_gep,
+                                        &[self.context.i64_type().const_int(byte_offset, false)],
+                                        "vfield_ptr",
+                                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                                };
+                                self.builder.build_store(byte_gep, val)
+                                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                            }
+                        } else {
+                            return Err(CodeGenError::new(format!("no field '{field}' in record"), Some(*span)));
+                        }
                     }
                     _ => return Err(CodeGenError::new(format!("'{target}' is not a record"), Some(*span))),
                 };
-                let gep = self.builder.build_struct_gep(
-                    self.llvm_type_for(&var_type),
-                    alloca,
-                    field_idx as u32,
-                    "field_gep",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                self.builder.build_store(gep, val)
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(())
             }
             Statement::New { target, span } => self.compile_new(target, *span),
             Statement::Dispose { target, span } => self.compile_dispose(target, *span),
             Statement::ProcCall { name, args, span } => self.compile_proc_call(name, args, *span),
+            Statement::Case { expr, branches, else_branch, span } => {
+                self.compile_case(expr, branches, else_branch.as_deref(), *span)
+            }
+            Statement::Label { label, span } => {
+                self.set_debug_loc(*span);
+                let bb = *self.label_blocks.get(label)
+                    .ok_or_else(|| CodeGenError::new(format!("undeclared label {label}"), Some(*span)))?;
+                self.builder.build_unconditional_branch(bb)
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                self.builder.position_at_end(bb);
+                Ok(())
+            }
+            Statement::Goto { label, span } => {
+                self.set_debug_loc(*span);
+                let bb = *self.label_blocks.get(label)
+                    .ok_or_else(|| CodeGenError::new(format!("undeclared label {label}"), Some(*span)))?;
+                self.builder.build_unconditional_branch(bb)
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                let func = self.current_fn.unwrap();
+                let dead_bb = self.context.append_basic_block(func, "after_goto");
+                self.builder.position_at_end(dead_bb);
+                Ok(())
+            }
+            Statement::With { record_var, body, span } => {
+                self.compile_with(record_var, body, *span)
+            }
         }
     }
 
@@ -716,6 +826,118 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    fn compile_with(&mut self, record_var: &str, body: &Block, span: Span) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let alloca = *self.variables.get(record_var)
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{record_var}'"), Some(span)))?;
+        let var_type = self.var_types.get(record_var).cloned()
+            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{record_var}'"), Some(span)))?;
+        let resolved = self.resolve_type(&var_type);
+        let fields = match &resolved {
+            PascalType::Record { fields, .. } => fields.clone(),
+            _ => return Err(CodeGenError::new(format!("'{record_var}' is not a record"), Some(span))),
+        };
+
+        // Save any existing variables that would be shadowed
+        let mut saved: Vec<(String, Option<PointerValue<'ctx>>, Option<PascalType>)> = Vec::new();
+        for (i, (name, ty)) in fields.iter().enumerate() {
+            let old_var = self.variables.remove(name);
+            let old_type = self.var_types.remove(name);
+            saved.push((name.clone(), old_var, old_type));
+
+            let gep = self.builder.build_struct_gep(
+                self.llvm_type_for(&resolved),
+                alloca,
+                i as u32,
+                &format!("with_{name}"),
+            ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.variables.insert(name.clone(), gep);
+            self.var_types.insert(name.clone(), ty.clone());
+        }
+
+        self.compile_block(body)?;
+
+        // Restore saved variables
+        for (name, old_var, old_type) in saved {
+            self.variables.remove(&name);
+            self.var_types.remove(&name);
+            if let Some(v) = old_var {
+                self.variables.insert(name.clone(), v);
+            }
+            if let Some(t) = old_type {
+                self.var_types.insert(name, t);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compile_case(
+        &mut self, expr: &Expr, branches: &[CaseBranch],
+        else_branch: Option<&[Statement]>, span: Span,
+    ) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let sel_val = self.compile_expr(expr)?;
+        let func = self.current_fn.unwrap();
+        let end_bb = self.context.append_basic_block(func, "case_end");
+
+        for branch in branches {
+            let match_bb = self.context.append_basic_block(func, "case_match");
+            let next_bb = self.context.append_basic_block(func, "case_next");
+
+            let mut any_match: Option<inkwell::values::IntValue> = None;
+            for val in &branch.values {
+                let cmp = match val {
+                    CaseValue::Single(v) => {
+                        let v_val = self.compile_expr(v)?;
+                        self.builder.build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            sel_val.into_int_value(), v_val.into_int_value(), "case_eq",
+                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    }
+                    CaseValue::Range(lo, hi) => {
+                        let lo_val = self.compile_expr(lo)?;
+                        let hi_val = self.compile_expr(hi)?;
+                        let ge = self.builder.build_int_compare(
+                            inkwell::IntPredicate::SGE,
+                            sel_val.into_int_value(), lo_val.into_int_value(), "case_ge",
+                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        let le = self.builder.build_int_compare(
+                            inkwell::IntPredicate::SLE,
+                            sel_val.into_int_value(), hi_val.into_int_value(), "case_le",
+                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        self.builder.build_and(ge, le, "case_range")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    }
+                };
+                any_match = Some(match any_match {
+                    None => cmp,
+                    Some(prev) => self.builder.build_or(prev, cmp, "case_or")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
+                });
+            }
+
+            self.builder.build_conditional_branch(any_match.unwrap(), match_bb, next_bb)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+            self.builder.position_at_end(match_bb);
+            for stmt in &branch.body { self.compile_statement(stmt)?; }
+            self.builder.build_unconditional_branch(end_bb)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+            self.builder.position_at_end(next_bb);
+        }
+
+        if let Some(stmts) = else_branch {
+            for stmt in stmts { self.compile_statement(stmt)?; }
+        }
+        self.builder.build_unconditional_branch(end_bb)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+
+        self.builder.position_at_end(end_bb);
+        Ok(())
+    }
+
     fn sizeof_type(&self, ty: &PascalType) -> u64 {
         match ty {
             PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => 8,
@@ -728,14 +950,38 @@ impl<'ctx> CodeGen<'ctx> {
                 let count = (hi - lo + 1).max(0) as u64;
                 count * self.sizeof_type(elem)
             }
-            PascalType::Record { fields } => {
-                fields.iter().map(|(_, t)| self.sizeof_type(t)).sum()
+            PascalType::Record { fields, variant } => {
+                let fixed: u64 = fields.iter().map(|(_, t)| self.sizeof_type(t)).sum();
+                let var_size = variant.as_ref().map(|v| {
+                    let tag_size = self.sizeof_type(&v.tag_type);
+                    let max_body = v.variants.iter()
+                        .map(|(_, vf)| vf.iter().map(|(_, t)| self.sizeof_type(t)).sum::<u64>())
+                        .max().unwrap_or(0);
+                    tag_size + max_body
+                }).unwrap_or(0);
+                fixed + var_size
             }
             PascalType::Named(_) => {
                 let resolved = self.resolve_type(ty);
                 self.sizeof_type(&resolved)
             }
         }
+    }
+
+    /// Find a field in the variant part of a record. Returns (byte_offset, field_type).
+    /// Each variant's fields are laid out at byte offset 0 within the union (they overlap).
+    /// Within a single variant, fields are sequential.
+    fn find_variant_field(&self, v: &RecordVariant, field: &str) -> Option<(u64, PascalType)> {
+        for (_values, vfields) in &v.variants {
+            let mut offset = 0u64;
+            for (name, ty) in vfields {
+                if name == field {
+                    return Some((offset, ty.clone()));
+                }
+                offset += self.sizeof_type(ty);
+            }
+        }
+        None
     }
 
     fn compile_if(
@@ -1046,6 +1292,44 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    // ── array base resolution (for multi-dimensional indexing) ──
+
+    fn resolve_array_base(&mut self, expr: &Expr, span: Span) -> Result<(PointerValue<'ctx>, PascalType), CodeGenError> {
+        match expr {
+            Expr::Var(name, vspan) => {
+                let a = *self.variables.get(name.as_str())
+                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{name}'"), Some(*vspan)))?;
+                let t = self.var_types.get(name.as_str()).cloned()
+                    .ok_or_else(|| CodeGenError::new(format!("unknown type for '{name}'"), Some(*vspan)))?;
+                Ok((a, t))
+            }
+            Expr::Index { array, index, span: idx_span } => {
+                let (base_ptr, base_type) = self.resolve_array_base(array, *idx_span)?;
+                let idx_val = self.compile_expr(index)?;
+                let lo = match &base_type {
+                    PascalType::Array { lo, .. } => *lo,
+                    _ => return Err(CodeGenError::new("indexing non-array", Some(span))),
+                };
+                let elem_ty = match &base_type {
+                    PascalType::Array { elem, .. } => elem.as_ref().clone(),
+                    _ => unreachable!(),
+                };
+                let adj = self.builder.build_int_sub(
+                    idx_val.into_int_value(),
+                    self.context.i64_type().const_int(lo as u64, true), "adj_idx",
+                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                let gep = unsafe {
+                    self.builder.build_in_bounds_gep(
+                        self.llvm_type_for(&base_type), base_ptr,
+                        &[self.context.i64_type().const_int(0, false), adj], "arr_gep",
+                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                };
+                Ok((gep, elem_ty))
+            }
+            _ => Err(CodeGenError::new("array indexing requires a variable", Some(span))),
+        }
+    }
+
     // ── expressions ──────────────────────────────────────
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
@@ -1095,43 +1379,28 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(val)
             }
             Expr::Index { array, index, span } => {
-                // array must be a Var — get its alloca
-                let (alloca, var_type) = match array.as_ref() {
-                    Expr::Var(name, vspan) => {
-                        let a = *self.variables.get(name.as_str())
-                            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{name}'"), Some(*vspan)))?;
-                        let t = self.var_types.get(name.as_str()).cloned()
-                            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{name}'"), Some(*vspan)))?;
-                        (a, t)
-                    }
-                    _ => return Err(CodeGenError::new("array indexing requires a variable", Some(*span))),
-                };
+                let (base_ptr, base_type) = self.resolve_array_base(array, *span)?;
                 let idx_val = self.compile_expr(index)?;
-                let lo = match &var_type {
-                    PascalType::Array { lo, elem, .. } => {
-                        let _ = elem;
-                        *lo
-                    }
+                let lo = match &base_type {
+                    PascalType::Array { lo, .. } => *lo,
                     _ => return Err(CodeGenError::new("indexing non-array", Some(*span))),
+                };
+                let elem_ty = match &base_type {
+                    PascalType::Array { elem, .. } => elem.as_ref().clone(),
+                    _ => unreachable!(),
                 };
                 let adj = self.builder.build_int_sub(
                     idx_val.into_int_value(),
-                    self.context.i64_type().const_int(lo as u64, true),
-                    "adj_idx",
+                    self.context.i64_type().const_int(lo as u64, true), "adj_idx",
                 ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                let elem_ty = match &var_type {
-                    PascalType::Array { elem, .. } => self.llvm_type_for(elem),
-                    _ => unreachable!(),
-                };
                 let gep = unsafe {
                     self.builder.build_in_bounds_gep(
-                        self.llvm_type_for(&var_type),
-                        alloca,
-                        &[self.context.i64_type().const_int(0, false), adj],
-                        "arr_gep",
+                        self.llvm_type_for(&base_type), base_ptr,
+                        &[self.context.i64_type().const_int(0, false), adj], "arr_gep",
                     ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                 };
-                let val = self.builder.build_load(elem_ty, gep, "arr_load")
+                let elem_llvm_ty = self.llvm_type_for(&elem_ty);
+                let val = self.builder.build_load(elem_llvm_ty, gep, "arr_load")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(val)
             }
@@ -1146,23 +1415,61 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     _ => return Err(CodeGenError::new("field access requires a variable", Some(*span))),
                 };
-                let (field_idx, field_ty) = match &var_type {
-                    PascalType::Record { fields } => {
-                        let idx = fields.iter().position(|(n, _)| n == field)
-                            .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(*span)))?;
-                        (idx, fields[idx].1.clone())
+                let resolved = self.resolve_type(&var_type);
+                match &resolved {
+                    PascalType::Record { fields, variant } => {
+                        // Check fixed fields first
+                        if let Some(idx) = fields.iter().position(|(n, _)| n == field) {
+                            let field_ty = &fields[idx].1;
+                            let gep = self.builder.build_struct_gep(
+                                self.llvm_type_for(&resolved),
+                                alloca,
+                                idx as u32,
+                                "field_gep",
+                            ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                            let val = self.builder.build_load(self.llvm_type_for(field_ty), gep, "field_load")
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                            Ok(val)
+                        } else if let Some(v) = variant {
+                            if field == &v.tag_name {
+                                // Tag field: index = fields.len()
+                                let gep = self.builder.build_struct_gep(
+                                    self.llvm_type_for(&resolved),
+                                    alloca,
+                                    fields.len() as u32,
+                                    "tag_gep",
+                                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                let val = self.builder.build_load(self.llvm_type_for(&v.tag_type), gep, "tag_load")
+                                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                Ok(val)
+                            } else {
+                                // Variant field in union
+                                let (byte_offset, field_ty) = self.find_variant_field(v, field)
+                                    .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(*span)))?;
+                                let union_gep = self.builder.build_struct_gep(
+                                    self.llvm_type_for(&resolved),
+                                    alloca,
+                                    (fields.len() + 1) as u32,
+                                    "union_gep",
+                                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                let byte_gep = unsafe {
+                                    self.builder.build_in_bounds_gep(
+                                        self.context.i8_type(),
+                                        union_gep,
+                                        &[self.context.i64_type().const_int(byte_offset, false)],
+                                        "vfield_ptr",
+                                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                                };
+                                let val = self.builder.build_load(self.llvm_type_for(&field_ty), byte_gep, "vfield_load")
+                                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                Ok(val)
+                            }
+                        } else {
+                            Err(CodeGenError::new(format!("no field '{field}' in record"), Some(*span)))
+                        }
                     }
-                    _ => return Err(CodeGenError::new("field access on non-record", Some(*span))),
-                };
-                let gep = self.builder.build_struct_gep(
-                    self.llvm_type_for(&var_type),
-                    alloca,
-                    field_idx as u32,
-                    "field_gep",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                let val = self.builder.build_load(self.llvm_type_for(&field_ty), gep, "field_load")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                Ok(val)
+                    _ => Err(CodeGenError::new("field access on non-record", Some(*span))),
+                }
             }
             Expr::Call { name, args, span } => {
                 // Built-in functions
@@ -1377,8 +1684,15 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Array { lo, hi, elem } => PascalType::Array {
                 lo: *lo, hi: *hi, elem: Box::new(self.resolve_type(elem)),
             },
-            PascalType::Record { fields } => PascalType::Record {
+            PascalType::Record { fields, variant } => PascalType::Record {
                 fields: fields.iter().map(|(n, t)| (n.clone(), self.resolve_type(t))).collect(),
+                variant: variant.as_ref().map(|v| Box::new(RecordVariant {
+                    tag_name: v.tag_name.clone(),
+                    tag_type: self.resolve_type(&v.tag_type),
+                    variants: v.variants.iter().map(|(vals, vf)| {
+                        (vals.clone(), vf.iter().map(|(n, t)| (n.clone(), self.resolve_type(t))).collect())
+                    }).collect(),
+                })),
             },
             PascalType::Set { elem } => PascalType::Set { elem: Box::new(self.resolve_type(elem)) },
             PascalType::Enum { .. } | PascalType::Subrange { .. } => ty.clone(),
@@ -1448,9 +1762,18 @@ impl<'ctx> CodeGen<'ctx> {
                 let elem_ty = self.llvm_type_for(elem);
                 elem_ty.array_type(count).as_basic_type_enum()
             }
-            PascalType::Record { fields } => {
-                let field_types: Vec<inkwell::types::BasicTypeEnum> =
+            PascalType::Record { fields, variant } => {
+                let mut field_types: Vec<inkwell::types::BasicTypeEnum> =
                     fields.iter().map(|(_, t)| self.llvm_type_for(t)).collect();
+                if let Some(v) = variant {
+                    field_types.push(self.llvm_type_for(&v.tag_type));
+                    let max_size = v.variants.iter()
+                        .map(|(_, vf)| vf.iter().map(|(_, t)| self.sizeof_type(t)).sum::<u64>())
+                        .max().unwrap_or(0);
+                    if max_size > 0 {
+                        field_types.push(self.context.i8_type().array_type(max_size as u32).as_basic_type_enum());
+                    }
+                }
                 self.context.struct_type(&field_types, false).as_basic_type_enum()
             }
             PascalType::Named(_) => {
@@ -1816,9 +2139,22 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Expr::FieldAccess { record, field, .. } => {
                 let rec_ty = self.infer_expr_type(record);
-                match rec_ty {
-                    PascalType::Record { fields } => {
-                        fields.iter().find(|(n, _)| n == field).map(|(_, t)| t.clone()).unwrap_or(PascalType::Integer)
+                let resolved = self.resolve_type(&rec_ty);
+                match &resolved {
+                    PascalType::Record { fields, variant } => {
+                        if let Some((_, t)) = fields.iter().find(|(n, _)| n == field) {
+                            t.clone()
+                        } else if let Some(v) = variant {
+                            if field == &v.tag_name {
+                                v.tag_type.clone()
+                            } else {
+                                self.find_variant_field(v, field)
+                                    .map(|(_, t)| t)
+                                    .unwrap_or(PascalType::Integer)
+                            }
+                        } else {
+                            PascalType::Integer
+                        }
                     }
                     _ => PascalType::Integer,
                 }

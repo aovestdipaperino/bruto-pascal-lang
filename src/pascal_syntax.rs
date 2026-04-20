@@ -24,6 +24,7 @@ impl PascalHighlighter {
                 | "true" | "false" | "const" | "type" | "procedure" | "function"
                 | "array" | "of" | "record" | "nil" | "case" | "with"
                 | "new" | "dispose" | "forward" | "set" | "in"
+                | "label" | "goto"
         )
     }
 

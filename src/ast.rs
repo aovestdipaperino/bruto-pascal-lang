@@ -19,6 +19,7 @@ impl Span {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub name: String,
+    pub labels: Vec<i64>,
     pub consts: Vec<ConstDecl>,
     pub type_decls: Vec<TypeDecl>,
     pub vars: Vec<VarDecl>,
@@ -93,6 +94,8 @@ pub enum PascalType {
     },
     Record {
         fields: Vec<(String, PascalType)>,
+        /// Optional variant part: (tag_name, tag_type, variants)
+        variant: Option<Box<RecordVariant>>,
     },
     /// Enumerated type: (val1, val2, val3)
     Enum {
@@ -106,6 +109,14 @@ pub enum PascalType {
     Set { elem: Box<PascalType> },
     /// A named type alias (resolved to canonical type during compilation)
     Named(String),
+}
+
+/// Variant part of a record type: `case tag: type of ...`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordVariant {
+    pub tag_name: String,
+    pub tag_type: PascalType,
+    pub variants: Vec<(Vec<i64>, Vec<(String, PascalType)>)>, // (case_values, fields)
 }
 
 /// A begin/end block containing statements.
@@ -182,6 +193,13 @@ pub enum Statement {
         expr: Expr,
         span: Span,
     },
+    /// Multi-dimensional array index assignment: `a[i, j] := expr`
+    MultiIndexAssignment {
+        target: String,
+        indices: Vec<Expr>,
+        expr: Expr,
+        span: Span,
+    },
     /// Record field assignment: `r.field := expr`
     FieldAssignment {
         target: String,
@@ -193,6 +211,23 @@ pub enum Statement {
     ProcCall {
         name: String,
         args: Vec<Expr>,
+        span: Span,
+    },
+    /// Case/of statement: `case expr of ... end`
+    Case {
+        expr: Expr,
+        branches: Vec<CaseBranch>,
+        else_branch: Option<Vec<Statement>>,
+        span: Span,
+    },
+    /// Goto statement: `goto 10`
+    Goto { label: i64, span: Span },
+    /// Label marker: `10: statement`
+    Label { label: i64, span: Span },
+    /// With statement: `with record_var do statement`
+    With {
+        record_var: String,
+        body: Block,
         span: Span,
     },
 }
@@ -212,11 +247,31 @@ impl Statement {
             | Self::New { span, .. }
             | Self::Dispose { span, .. }
             | Self::IndexAssignment { span, .. }
+            | Self::MultiIndexAssignment { span, .. }
             | Self::FieldAssignment { span, .. }
-            | Self::ProcCall { span, .. } => *span,
+            | Self::ProcCall { span, .. }
+            | Self::Case { span, .. }
+            | Self::Goto { span, .. }
+            | Self::Label { span, .. }
+            | Self::With { span, .. } => *span,
             Self::Block(b) => b.span,
         }
     }
+}
+
+/// A single case branch: one or more values -> a statement list
+#[derive(Debug, Clone)]
+pub struct CaseBranch {
+    pub values: Vec<CaseValue>,
+    pub body: Vec<Statement>,
+    pub span: Span,
+}
+
+/// A value or range in a case label
+#[derive(Debug, Clone)]
+pub enum CaseValue {
+    Single(Expr),
+    Range(Expr, Expr),
 }
 
 #[derive(Debug, Clone)]
