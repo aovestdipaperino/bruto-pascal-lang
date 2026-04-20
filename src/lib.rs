@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 mod ast;
-mod codegen;
-mod parser;
+pub mod codegen;
+pub mod parser;
 mod pascal_syntax;
 
 use std::collections::HashSet;
