@@ -100,6 +100,8 @@ pub enum PascalType {
         name: String,
         values: Vec<String>,
     },
+    /// Subrange type: lo..hi (stored as i64)
+    Subrange { lo: i64, hi: i64 },
     /// A named type alias (resolved to canonical type during compilation)
     Named(String),
 }

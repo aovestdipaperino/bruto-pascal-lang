@@ -378,6 +378,15 @@ mod tests {
     }
 
     #[test]
+    fn subrange_type() {
+        let (ok, out) = build_and_run_source(
+            "program T;\ntype\n  SmallInt = 1..10;\nvar x: SmallInt;\nbegin\n  x := 5;\n  writeln(x)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "5");
+    }
+
+    #[test]
     fn ord_chr() {
         let (ok, out) = build_and_run_source(
             "program T;\nbegin\n  writeln(ord('A'));\n  write(chr(66))\nend.\n",

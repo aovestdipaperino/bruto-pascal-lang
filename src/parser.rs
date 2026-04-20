@@ -595,6 +595,12 @@ impl Parser {
         if *self.peek() == Tok::LParen {
             return self.parse_enum_type();
         }
+        if matches!(self.peek(), Tok::IntLit(_) | Tok::Minus) {
+            let lo = self.parse_int_literal()?;
+            self.expect(&Tok::DotDot)?;
+            let hi = self.parse_int_literal()?;
+            return Ok(PascalType::Subrange { lo, hi });
+        }
         if *self.peek() == Tok::KwArray {
             return self.parse_array_type();
         }

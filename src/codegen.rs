@@ -331,7 +331,7 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Initialize scalar types to zero
             match &resolved_ty {
-                PascalType::Integer | PascalType::Enum { .. } => {
+                PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
                     self.builder.build_store(alloca, self.context.i64_type().const_int(0, false))
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
@@ -512,7 +512,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
             // Initialize to zero
             let zero: BasicValueEnum = match ret_ty {
-                PascalType::Integer | PascalType::Enum { .. } => self.context.i64_type().const_int(0, false).into(),
+                PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => self.context.i64_type().const_int(0, false).into(),
                 PascalType::Real => self.context.f64_type().const_float(0.0).into(),
                 PascalType::Boolean => self.context.bool_type().const_int(0, false).into(),
                 PascalType::Char => self.context.i8_type().const_int(0, false).into(),
@@ -718,7 +718,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn sizeof_type(&self, ty: &PascalType) -> u64 {
         match ty {
-            PascalType::Integer | PascalType::Enum { .. } => 8,
+            PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => 8,
             PascalType::Real => 8,
             PascalType::Boolean => 1,
             PascalType::Char => 1,
@@ -989,7 +989,7 @@ impl<'ctx> CodeGen<'ctx> {
             let arg_type = self.infer_expr_type(arg);
 
             let (write_fn, capture_fn) = match arg_type {
-                PascalType::Integer | PascalType::Enum { .. } => ("bruto_write_int", "bruto_capture_write_int"),
+                PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => ("bruto_write_int", "bruto_capture_write_int"),
                 PascalType::Real => ("bruto_write_real", "bruto_capture_write_real"),
                 PascalType::Boolean => ("bruto_write_bool", "bruto_capture_write_bool"),
                 PascalType::Char => ("bruto_write_char", "bruto_capture_write_char"),
@@ -1222,14 +1222,14 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Record { fields } => PascalType::Record {
                 fields: fields.iter().map(|(n, t)| (n.clone(), self.resolve_type(t))).collect(),
             },
-            PascalType::Enum { .. } => ty.clone(),
+            PascalType::Enum { .. } | PascalType::Subrange { .. } => ty.clone(),
             other => other.clone(),
         }
     }
 
     fn create_debug_type(&self, ty: &PascalType) -> Option<DIType<'ctx>> {
         match ty {
-            PascalType::Integer | PascalType::Enum { .. } => {
+            PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
                 self.di_builder.create_basic_type("long", 64, 0x05, DIFlags::ZERO)
                     .ok().map(|t| t.as_type())
             }
@@ -1276,7 +1276,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn llvm_type_for(&self, ty: &PascalType) -> inkwell::types::BasicTypeEnum<'ctx> {
         match ty {
-            PascalType::Integer | PascalType::Enum { .. } => self.context.i64_type().as_basic_type_enum(),
+            PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => self.context.i64_type().as_basic_type_enum(),
             PascalType::Real => self.context.f64_type().as_basic_type_enum(),
             PascalType::Boolean => self.context.bool_type().as_basic_type_enum(),
             PascalType::Char => self.context.i8_type().as_basic_type_enum(),
