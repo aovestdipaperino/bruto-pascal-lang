@@ -599,6 +599,15 @@ end.
     }
 
     #[test]
+    fn forward_declaration() {
+        let (ok, out) = build_and_run_source(
+            "program T;\n\nprocedure B; forward;\n\nprocedure A;\nbegin\n  B\nend;\n\nprocedure B;\nbegin\n  writeln('B called')\nend;\n\nbegin\n  A\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "B called");
+    }
+
+    #[test]
     fn string_builtins() {
         let (ok, out) = build_and_run_source(
             "program T;\nvar s, t: string;\n  n, code: integer;\nbegin\n  s := 'Hello World';\n  t := copy(s, 7, 5);\n  writeln(t);\n  n := pos('World', s);\n  writeln(n);\n  writeln(upcase('a'));\n  t := concat('abc', 'def', 'ghi');\n  writeln(t);\n  str(42, t);\n  writeln(t);\n  val('123', n, code);\n  writeln(n)\nend.\n",

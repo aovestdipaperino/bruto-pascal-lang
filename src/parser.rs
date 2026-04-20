@@ -826,6 +826,18 @@ impl Parser {
 
         self.expect(&Tok::Semi)?;
 
+        // Forward declaration: procedure Foo; forward;
+        if *self.peek() == Tok::KwForward {
+            self.advance();
+            self.expect(&Tok::Semi)?;
+            return Ok(ProcDecl {
+                name, params, return_type,
+                vars: Vec::new(),
+                body: Block { statements: Vec::new(), span, end_span: span },
+                span,
+            });
+        }
+
         let vars = if *self.peek() == Tok::Var {
             self.parse_var_section()?
         } else {

@@ -451,11 +451,21 @@ impl<'ctx> CodeGen<'ctx> {
             self.context.void_type().fn_type(&param_llvm_types, false)
         };
 
-        let func = self.module.add_function(&proc.name, fn_type, None);
+        // Reuse existing function if this is the real definition after a forward decl
+        let func = if let Some(existing) = self.module.get_function(&proc.name) {
+            existing
+        } else {
+            self.module.add_function(&proc.name, fn_type, None)
+        };
 
         // Store metadata
         self.proc_return_types.insert(proc.name.clone(), proc.return_type.clone());
         self.proc_param_modes.insert(proc.name.clone(), param_info.clone());
+
+        // Forward declaration: empty body means just register the prototype
+        if proc.body.statements.is_empty() {
+            return Ok(());
+        }
 
         // Debug info
         let di_i64 = self.di_builder.create_basic_type("integer", 64, 0x05, DIFlags::ZERO).unwrap();
