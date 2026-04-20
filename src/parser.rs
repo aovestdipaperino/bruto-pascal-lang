@@ -968,62 +968,74 @@ impl Parser {
     fn parse_ident_statement(&mut self) -> Result<Statement, ParseError> {
         let span = self.span();
         let (name, _) = self.expect_ident()?;
-        match self.peek() {
-            Tok::Assign => {
-                self.advance();
-                let expr = self.parse_expr()?;
-                Ok(Statement::Assignment { target: name, expr, span })
-            }
-            Tok::Caret => {
-                self.advance();
-                self.expect(&Tok::Assign)?;
-                let expr = self.parse_expr()?;
-                Ok(Statement::DerefAssignment { target: name, expr, span })
-            }
-            Tok::LBracket => {
-                self.advance();
-                let mut indices = Vec::new();
-                indices.push(self.parse_expr()?);
-                while *self.peek() == Tok::Comma {
+
+        // Collect chain of postfix accesses (.field, [index], ^)
+        let mut chain: Vec<LValueAccess> = Vec::new();
+        loop {
+            match self.peek() {
+                Tok::Dot => {
                     self.advance();
-                    indices.push(self.parse_expr()?);
+                    let (field, _) = self.expect_ident()?;
+                    chain.push(LValueAccess::Field(field));
                 }
-                self.expect(&Tok::RBracket)?;
-                self.expect(&Tok::Assign)?;
-                let expr = self.parse_expr()?;
-                if indices.len() == 1 {
-                    Ok(Statement::IndexAssignment { target: name, index: indices.into_iter().next().unwrap(), expr, span })
-                } else {
-                    Ok(Statement::MultiIndexAssignment { target: name, indices, expr, span })
-                }
-            }
-            Tok::Dot => {
-                // r.field := expr
-                self.advance();
-                let (field, _) = self.expect_ident()?;
-                self.expect(&Tok::Assign)?;
-                let expr = self.parse_expr()?;
-                Ok(Statement::FieldAssignment { target: name, field, expr, span })
-            }
-            Tok::LParen => {
-                // Procedure call: name(args)
-                self.advance();
-                let mut args = Vec::new();
-                if *self.peek() != Tok::RParen {
-                    args.push(self.parse_expr()?);
+                Tok::LBracket => {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    chain.push(LValueAccess::Index(index));
                     while *self.peek() == Tok::Comma {
                         self.advance();
-                        args.push(self.parse_expr()?);
+                        let next = self.parse_expr()?;
+                        chain.push(LValueAccess::Index(next));
                     }
+                    self.expect(&Tok::RBracket)?;
                 }
-                self.expect(&Tok::RParen)?;
-                Ok(Statement::ProcCall { name, args, span })
-            }
-            _ => {
-                // Procedure call without parentheses (no arguments)
-                Ok(Statement::ProcCall { name, args: Vec::new(), span })
+                Tok::Caret => {
+                    self.advance();
+                    chain.push(LValueAccess::Deref);
+                }
+                _ => break,
             }
         }
+
+        if *self.peek() == Tok::Assign {
+            self.advance();
+            let expr = self.parse_expr()?;
+            if chain.is_empty() {
+                return Ok(Statement::Assignment { target: name, expr, span });
+            }
+            // Single-step chains: emit the specific existing statement types
+            if chain.len() == 1 {
+                match chain.into_iter().next().unwrap() {
+                    LValueAccess::Field(field) => return Ok(Statement::FieldAssignment { target: name, field, expr, span }),
+                    LValueAccess::Index(index) => return Ok(Statement::IndexAssignment { target: name, index, expr, span }),
+                    LValueAccess::Deref => return Ok(Statement::DerefAssignment { target: name, expr, span }),
+                }
+            }
+            // Multi-index shorthand: a[i, j] := expr
+            if chain.iter().all(|a| matches!(a, LValueAccess::Index(_))) {
+                let indices: Vec<Expr> = chain.into_iter().map(|a| match a { LValueAccess::Index(e) => e, _ => unreachable!() }).collect();
+                return Ok(Statement::MultiIndexAssignment { target: name, indices, expr, span });
+            }
+            return Ok(Statement::ChainedAssignment { target: name, chain, expr, span });
+        }
+
+        // Procedure call (chain should be empty for proc calls)
+        if *self.peek() == Tok::LParen {
+            self.advance();
+            let mut args = Vec::new();
+            if *self.peek() != Tok::RParen {
+                args.push(self.parse_expr()?);
+                while *self.peek() == Tok::Comma {
+                    self.advance();
+                    args.push(self.parse_expr()?);
+                }
+            }
+            self.expect(&Tok::RParen)?;
+            return Ok(Statement::ProcCall { name, args, span });
+        }
+
+        // No-arg procedure call
+        Ok(Statement::ProcCall { name, args: Vec::new(), span })
     }
 
     fn parse_if(&mut self) -> Result<Statement, ParseError> {

@@ -93,7 +93,8 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         | ast::Statement::IndexAssignment { span, .. }
         | ast::Statement::MultiIndexAssignment { span, .. }
         | ast::Statement::FieldAssignment { span, .. }
-        | ast::Statement::ProcCall { span, .. } => {
+        | ast::Statement::ProcCall { span, .. }
+        | ast::Statement::ChainedAssignment { span, .. } => {
             lines.insert(span.line as usize);
         }
         ast::Statement::If { condition: _, then_branch, else_branch, span } => {
@@ -605,6 +606,15 @@ end.
         );
         assert!(ok);
         assert_eq!(out.trim(), "B called");
+    }
+
+    #[test]
+    fn nested_lvalue() {
+        let (ok, out) = build_and_run_source(
+            "program T;\ntype\n  Rec = record\n    vals: array[1..3] of integer;\n  end;\nvar r: Rec;\nbegin\n  r.vals[2] := 42;\n  writeln(r.vals[2])\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "42");
     }
 
     #[test]

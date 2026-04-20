@@ -230,6 +230,21 @@ pub enum Statement {
         body: Block,
         span: Span,
     },
+    /// Chained LValue assignment: a[i].field := expr, p^.next := expr, etc.
+    ChainedAssignment {
+        target: String,
+        chain: Vec<LValueAccess>,
+        expr: Expr,
+        span: Span,
+    },
+}
+
+/// A single step in a chained LValue access path.
+#[derive(Debug, Clone)]
+pub enum LValueAccess {
+    Field(String),
+    Index(Expr),
+    Deref,
 }
 
 impl Statement {
@@ -253,7 +268,8 @@ impl Statement {
             | Self::Case { span, .. }
             | Self::Goto { span, .. }
             | Self::Label { span, .. }
-            | Self::With { span, .. } => *span,
+            | Self::With { span, .. }
+            | Self::ChainedAssignment { span, .. } => *span,
             Self::Block(b) => b.span,
         }
     }

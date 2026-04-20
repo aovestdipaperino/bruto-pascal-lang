@@ -812,6 +812,9 @@ impl<'ctx> CodeGen<'ctx> {
             Statement::With { record_var, body, span } => {
                 self.compile_with(record_var, body, *span)
             }
+            Statement::ChainedAssignment { target, chain, expr, span } => {
+                self.compile_chained_assignment(target, chain, expr, *span)
+            }
         }
     }
 
@@ -905,6 +908,84 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
 
+        Ok(())
+    }
+
+    fn compile_chained_assignment(&mut self, target: &str, chain: &[LValueAccess], expr: &Expr, span: Span) -> Result<(), CodeGenError> {
+        self.set_debug_loc(span);
+        let val = self.compile_expr(expr)?;
+
+        let mut ptr = *self.variables.get(target)
+            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(span)))?;
+        let mut cur_type = self.var_types.get(target).cloned()
+            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(span)))?;
+        cur_type = self.resolve_type(&cur_type);
+
+        for (i, access) in chain.iter().enumerate() {
+            let is_last = i == chain.len() - 1;
+            match access {
+                LValueAccess::Field(field) => {
+                    let (field_idx, field_ty) = match &cur_type {
+                        PascalType::Record { fields, .. } => {
+                            let idx = fields.iter().position(|(n, _)| n == field)
+                                .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(span)))?;
+                            (idx, fields[idx].1.clone())
+                        }
+                        _ => return Err(CodeGenError::new("field access on non-record", Some(span))),
+                    };
+                    let gep = self.builder.build_struct_gep(self.llvm_type_for(&cur_type), ptr, field_idx as u32, "chain_field")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    if is_last {
+                        self.builder.build_store(gep, val).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        return Ok(());
+                    }
+                    ptr = gep;
+                    cur_type = self.resolve_type(&field_ty);
+                }
+                LValueAccess::Index(index_expr) => {
+                    let idx_val = self.compile_expr(index_expr)?;
+                    let lo = match &cur_type {
+                        PascalType::Array { lo, .. } => *lo,
+                        _ => return Err(CodeGenError::new("indexing non-array", Some(span))),
+                    };
+                    let elem_ty = match &cur_type {
+                        PascalType::Array { elem, .. } => elem.as_ref().clone(),
+                        _ => unreachable!(),
+                    };
+                    let adj = self.builder.build_int_sub(
+                        idx_val.into_int_value(),
+                        self.context.i64_type().const_int(lo as u64, true), "adj",
+                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let gep = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            self.llvm_type_for(&cur_type), ptr,
+                            &[self.context.i64_type().const_int(0, false), adj], "chain_idx",
+                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    };
+                    if is_last {
+                        self.builder.build_store(gep, val).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        return Ok(());
+                    }
+                    ptr = gep;
+                    cur_type = self.resolve_type(&elem_ty);
+                }
+                LValueAccess::Deref => {
+                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                    let loaded = self.builder.build_load(ptr_ty, ptr, "deref_ptr")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_pointer_value();
+                    let pointed = match &cur_type {
+                        PascalType::Pointer(inner) => inner.as_ref().clone(),
+                        _ => return Err(CodeGenError::new("dereference of non-pointer", Some(span))),
+                    };
+                    if is_last {
+                        self.builder.build_store(loaded, val).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        return Ok(());
+                    }
+                    ptr = loaded;
+                    cur_type = self.resolve_type(&pointed);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1531,6 +1612,33 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 Ok((gep, elem_ty))
             }
+            Expr::FieldAccess { record, field, span: fa_span } => {
+                let (rec_ptr, rec_type) = self.resolve_array_base(record, *fa_span)?;
+                let resolved = self.resolve_type(&rec_type);
+                let (field_idx, field_ty) = match &resolved {
+                    PascalType::Record { fields, .. } => {
+                        let idx = fields.iter().position(|(n, _)| n == field)
+                            .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(span)))?;
+                        (idx, fields[idx].1.clone())
+                    }
+                    _ => return Err(CodeGenError::new("field access on non-record", Some(span))),
+                };
+                let gep = self.builder.build_struct_gep(self.llvm_type_for(&resolved), rec_ptr, field_idx as u32, "fa_gep")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                Ok((gep, field_ty))
+            }
+            Expr::Deref(inner, dspan) => {
+                let (ptr, ptr_type) = self.resolve_array_base(inner, *dspan)?;
+                let resolved = self.resolve_type(&ptr_type);
+                let pointed = match &resolved {
+                    PascalType::Pointer(inner) => inner.as_ref().clone(),
+                    _ => return Err(CodeGenError::new("dereference of non-pointer", Some(span))),
+                };
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let loaded = self.builder.build_load(ptr_ty, ptr, "deref_base")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_pointer_value();
+                Ok((loaded, pointed))
+            }
             _ => Err(CodeGenError::new("array indexing requires a variable", Some(span))),
         }
     }
@@ -1610,16 +1718,7 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(val)
             }
             Expr::FieldAccess { record, field, span } => {
-                let (alloca, var_type) = match record.as_ref() {
-                    Expr::Var(name, vspan) => {
-                        let a = *self.variables.get(name.as_str())
-                            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{name}'"), Some(*vspan)))?;
-                        let t = self.var_types.get(name.as_str()).cloned()
-                            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{name}'"), Some(*vspan)))?;
-                        (a, t)
-                    }
-                    _ => return Err(CodeGenError::new("field access requires a variable", Some(*span))),
-                };
+                let (alloca, var_type) = self.resolve_array_base(record, *span)?;
                 let resolved = self.resolve_type(&var_type);
                 match &resolved {
                     PascalType::Record { fields, variant } => {
