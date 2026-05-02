@@ -57,12 +57,14 @@ impl Language for MiniPascal {
 
         let context = Context::create();
         let mut codegen = CodeGen::new(&context, &source_path);
+        codegen.set_directives(parser.directives);
         codegen
             .compile(&program)
             .map_err(|e| format!("Codegen error: {e}"))?;
 
         let exe_path = "/tmp/bruto_pascal_out".to_string();
         codegen.emit_executable(&exe_path)?;
+        let _ = codegen.write_metadata(&exe_path);
 
         Ok(BuildResult {
             exe_path,
@@ -630,6 +632,296 @@ end.
         assert_eq!(lines[3], "abcdefghi");
         assert_eq!(lines[4], "42");
         assert_eq!(lines[5], "123");
+    }
+
+    #[test]
+    fn odd_builtin() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nbegin\n  writeln(odd(3));\n  writeln(odd(4))\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "true");
+        assert_eq!(lines[1], "false");
+    }
+
+    #[test]
+    fn maxint_constant() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nbegin\n  writeln(maxint)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "9223372036854775807");
+    }
+
+    #[test]
+    fn packed_keyword_noop() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar a: packed array[1..3] of integer;\nbegin\n  a[1] := 7;\n  writeln(a[1])\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "7");
+    }
+
+    #[test]
+    fn program_parameters_header() {
+        let (ok, out) = build_and_run_source(
+            "program T(input, output);\nbegin\n  writeln('hi')\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "hi");
+    }
+
+    #[test]
+    fn write_to_predefined_output() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nbegin\n  writeln(output, 'via output')\nend.\n",
+        );
+        assert!(ok);
+        // writes to stdout — capture file misses it, but stdout test would need direct capture.
+        // Just verify it built and ran successfully.
+        let _ = out;
+    }
+
+    #[test]
+    fn pack_unpack_basic() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar src: array[1..6] of integer;\n  dst: array[1..3] of integer;\n  i: integer;\nbegin\n  for i := 1 to 6 do src[i] := i * 10;\n  pack(src, 2, dst);\n  writeln(dst[1]);\n  writeln(dst[2]);\n  writeln(dst[3])\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "20");
+        assert_eq!(lines[1], "30");
+        assert_eq!(lines[2], "40");
+    }
+
+    #[test]
+    fn procedural_parameter() {
+        let (ok, out) = build_and_run_source(
+            r#"program T;
+
+function Square(x: integer): integer;
+begin
+  Square := x * x
+end;
+
+function ApplyTwice(function f(n: integer): integer; v: integer): integer;
+begin
+  ApplyTwice := f(f(v))
+end;
+
+begin
+  writeln(ApplyTwice(Square, 3))
+end.
+"#,
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "81");  // (3*3)*(3*3) = 9*9 = 81
+    }
+
+    #[test]
+    fn conformant_array_param() {
+        let (ok, out) = build_and_run_source(
+            r#"program T;
+
+var a: array[1..5] of integer;
+    i, total: integer;
+
+function SumArr(var arr: array[lo..hi: integer] of integer): integer;
+var k, s: integer;
+begin
+  s := 0;
+  for k := lo to hi do
+    s := s + arr[k];
+  SumArr := s
+end;
+
+begin
+  for i := 1 to 5 do a[i] := i;
+  total := SumArr(a);
+  writeln(total)
+end.
+"#,
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "15");
+    }
+
+    #[test]
+    fn fixed_length_string() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar s: string[20];\nbegin\n  s := 'hi';\n  writeln(s)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "hi");
+    }
+
+    #[test]
+    fn ioresult_default_zero() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar code: integer;\nbegin\n  code := ioresult;\n  writeln(code)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "0");
+    }
+
+    #[test]
+    fn file_filepos_filesize() {
+        let path = "/tmp/_bruto_test_pos.txt";
+        let _ = std::fs::remove_file(path);
+        let prog = format!(
+            "program T;\nvar f: text;\n  size: integer;\nbegin\n  assign(f, '{path}');\n  rewrite(f);\n  writeln(f, 'ABC');\n  close(f);\n  assign(f, '{path}');\n  reset(f);\n  size := filesize(f);\n  writeln(size);\n  close(f)\nend.\n"
+        );
+        let (ok, out) = build_and_run_source(&prog);
+        assert!(ok);
+        // 'ABC\n' = 4 bytes
+        assert_eq!(out.trim(), "4");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn range_check_directive() {
+        // {$R+} on; out-of-bounds index should abort the executable.
+        let path = "/tmp/_bruto_test_rng";
+        let lang = MiniPascal;
+        let result = lang.build(
+            "{$R+}\nprogram T;\nvar a: array[1..3] of integer;\n  i: integer;\nbegin\n  i := 5;\n  a[i] := 0\nend.\n",
+        ).expect("build failed");
+        let _ = std::fs::remove_file(path);
+        let status = std::process::Command::new(&result.exe_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run failed");
+        assert!(!status.success(), "expected non-zero exit from range check");
+        let _ = std::fs::remove_file(&result.exe_path);
+        let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
+        let _ = std::fs::remove_file(&result.source_path);
+    }
+
+    #[test]
+    fn overflow_check_directive() {
+        let lang = MiniPascal;
+        let result = lang.build(
+            "{$Q+}\nprogram T;\nvar x: integer;\nbegin\n  x := 9223372036854775807;\n  x := x + 1\nend.\n",
+        ).expect("build failed");
+        let status = std::process::Command::new(&result.exe_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run failed");
+        assert!(!status.success(), "expected non-zero exit from overflow check");
+        let _ = std::fs::remove_file(&result.exe_path);
+        let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
+        let _ = std::fs::remove_file(&result.source_path);
+    }
+
+    #[test]
+    fn nested_procedure() {
+        let (ok, out) = build_and_run_source(
+            r#"program T;
+var t: integer;
+
+procedure Outer(var total: integer);
+var n: integer;
+
+  procedure Inner;
+  begin
+    n := n + 10;
+    total := total + n
+  end;
+
+begin
+  n := 5;
+  Inner;
+  Inner
+end;
+
+begin
+  t := 0;
+  Outer(t);
+  writeln(t)
+end.
+"#,
+        );
+        assert!(ok);
+        // n=5 -> +10=15 (total=15) -> +10=25 (total=40)
+        assert_eq!(out.trim(), "40");
+    }
+
+    #[test]
+    fn typed_const() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nconst\n  x: integer = 42;\n  pi: real = 3.14;\nbegin\n  writeln(x);\n  writeln(pi)\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "42");
+        assert!(lines[1].starts_with("3.14"), "got {:?}", lines[1]);
+    }
+
+    #[test]
+    fn nil_constant() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar p: ^integer;\nbegin\n  p := nil;\n  if p = nil then\n    writeln('null')\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "null");
+    }
+
+    #[test]
+    fn type_cast_int_real() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar i: integer;\n  r: real;\nbegin\n  r := 3.7;\n  i := integer(r);\n  writeln(i);\n  r := real(42);\n  writeln(trunc(r))\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], "3");
+        assert_eq!(lines[1], "42");
+    }
+
+    #[test]
+    fn type_cast_char() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar c: char;\nbegin\n  c := char(65);\n  writeln(c)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "A");
+    }
+
+    #[test]
+    fn write_format_int() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nbegin\n  writeln(42:5);\n  writeln(7:3)\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "   42");
+        assert_eq!(lines[1], "  7");
+    }
+
+    #[test]
+    fn write_format_real() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nbegin\n  writeln(3.14:8:2);\n  writeln(1.5:6:1)\nend.\n",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "    3.14");
+        assert_eq!(lines[1], "   1.5");
+    }
+
+    #[test]
+    fn file_io_write_read() {
+        let path = "/tmp/_bruto_test_io.txt";
+        let _ = std::fs::remove_file(path);
+        let prog = format!(
+            "program T;\nvar f: text;\n  s: string;\nbegin\n  assign(f, '{path}');\n  rewrite(f);\n  writeln(f, 'hello world');\n  writeln(f, 42);\n  close(f);\n  assign(f, '{path}');\n  reset(f);\n  readln(f, s);\n  writeln(s);\n  close(f)\nend.\n"
+        );
+        let (ok, out) = build_and_run_source(&prog);
+        assert!(ok);
+        assert_eq!(out.trim(), "hello world");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

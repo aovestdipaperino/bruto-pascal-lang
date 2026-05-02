@@ -32,11 +32,12 @@ enum Tok {
     KwWrite, KwWriteLn, KwReadLn, KwRead,
     KwDiv, KwMod, KwAnd, KwOr, KwNot,
     KwTrue, KwFalse,
-    KwNew, KwDispose,
+    KwNew, KwDispose, KwNil,
     Const, KwType,
     KwProcedure, KwFunction, KwForward,
     KwSet, KwIn, KwCase, KwLabel, KwGoto, KwWith,
-    TyReal, TyChar,
+    KwFile, KwPacked,
+    TyReal, TyChar, TyText,
     // Type keywords
     TyInteger, TyString, TyBoolean,
     // Literals
@@ -79,6 +80,10 @@ impl fmt::Display for Tok {
             Tok::KwFalse => write!(f, "'false'"),
             Tok::KwNew => write!(f, "'new'"),
             Tok::KwDispose => write!(f, "'dispose'"),
+            Tok::KwNil => write!(f, "'nil'"),
+            Tok::KwFile => write!(f, "'file'"),
+            Tok::KwPacked => write!(f, "'packed'"),
+            Tok::TyText => write!(f, "'text'"),
             Tok::For => write!(f, "'for'"),
             Tok::To => write!(f, "'to'"),
             Tok::DownTo => write!(f, "'downto'"),
@@ -151,11 +156,21 @@ impl fmt::Display for ParseError {
 
 // ── Lexer ────────────────────────────────────────────────
 
+/// Compiler directives parsed from `{$X+/-}` or `(*$X+/-*)` comments.
+/// Directives are program-global in this implementation: the last value wins.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Directives {
+    pub range_check: bool,    // {$R+}
+    pub overflow_check: bool, // {$Q+}
+    pub io_check: bool,       // {$I+}  (default true in Turbo Pascal; we keep false to be lenient)
+}
+
 struct Lexer {
     chars: Vec<char>,
     pos: usize,
     line: u32,
     col: u32,
+    directives: Directives,
 }
 
 impl Lexer {
@@ -165,6 +180,7 @@ impl Lexer {
             pos: 0,
             line: 1,
             col: 1,
+            directives: Directives::default(),
         }
     }
 
@@ -190,6 +206,26 @@ impl Lexer {
         ch
     }
 
+    fn handle_directive(&mut self, body: &str) {
+        // A directive looks like `$R+`, `$Q-`, `$I+`, possibly with multiple
+        // entries separated by commas, e.g. `$R+,Q+`.
+        let body = body.trim();
+        if !body.starts_with('$') { return; }
+        for entry in body[1..].split(',') {
+            let e = entry.trim();
+            if e.len() < 2 { continue; }
+            let kind = e.as_bytes()[0].to_ascii_uppercase();
+            let sign = e.as_bytes()[1];
+            let on = sign == b'+';
+            match kind {
+                b'R' => self.directives.range_check = on,
+                b'Q' => self.directives.overflow_check = on,
+                b'I' => self.directives.io_check = on,
+                _ => {}
+            }
+        }
+    }
+
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             // Whitespace
@@ -206,27 +242,31 @@ impl Lexer {
                 continue;
             }
 
-            // Block comment: { }
+            // Block comment: { }   (also `{$X+/-}` directives)
             if self.peek() == '{' {
                 self.advance();
+                let mut body = String::new();
                 while self.pos < self.chars.len() && self.peek() != '}' {
-                    self.advance();
+                    body.push(self.advance());
                 }
                 if self.pos < self.chars.len() { self.advance(); }
+                self.handle_directive(&body);
                 continue;
             }
 
-            // Block comment: (* *)
+            // Block comment: (* *)   (also `(*$X+/-*)` directives)
             if self.peek() == '(' && self.chars.get(self.pos + 1) == Some(&'*') {
                 self.advance(); self.advance();
+                let mut body = String::new();
                 loop {
                     if self.pos >= self.chars.len() { break; }
                     if self.peek() == '*' && self.chars.get(self.pos + 1) == Some(&')') {
                         self.advance(); self.advance();
                         break;
                     }
-                    self.advance();
+                    body.push(self.advance());
                 }
+                self.handle_directive(&body);
                 continue;
             }
 
@@ -339,6 +379,10 @@ impl Lexer {
                 "false"    => Tok::KwFalse,
                 "new"      => Tok::KwNew,
                 "dispose"  => Tok::KwDispose,
+                "nil"      => Tok::KwNil,
+                "file"     => Tok::KwFile,
+                "packed"   => Tok::KwPacked,
+                "text"     => Tok::TyText,
                 "for"      => Tok::For,
                 "to"       => Tok::To,
                 "downto"   => Tok::DownTo,
@@ -424,6 +468,7 @@ impl Lexer {
 pub struct Parser {
     tokens: Vec<(Tok, Span)>,
     pos: usize,
+    pub directives: Directives,
 }
 
 impl Parser {
@@ -436,7 +481,7 @@ impl Parser {
             tokens.push((tok, span));
             if is_eof { break; }
         }
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, directives: lexer.directives }
     }
 
     fn peek(&self) -> &Tok {
@@ -487,6 +532,19 @@ impl Parser {
         let span = self.span();
         self.expect(&Tok::Program)?;
         let (name, _) = self.expect_ident()?;
+        // Optional program parameters: `program Foo(input, output, dataFile);`
+        // Parsed but ignored; predefined input/output already exist.
+        if *self.peek() == Tok::LParen {
+            self.advance();
+            if *self.peek() != Tok::RParen {
+                let _ = self.expect_ident()?;
+                while *self.peek() == Tok::Comma {
+                    self.advance();
+                    let _ = self.expect_ident()?;
+                }
+            }
+            self.expect(&Tok::RParen)?;
+        }
         self.expect(&Tok::Semi)?;
 
         let labels = if *self.peek() == Tok::KwLabel {
@@ -571,10 +629,17 @@ impl Parser {
         while matches!(self.peek(), Tok::Ident(_)) {
             let span = self.span();
             let (name, _) = self.expect_ident()?;
+            // Optional type annotation: `name : type = value`
+            let ty = if *self.peek() == Tok::Colon {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
             self.expect(&Tok::Eq)?;
             let value = self.parse_expr()?;
             self.expect(&Tok::Semi)?;
-            decls.push(ConstDecl { name, value, span });
+            decls.push(ConstDecl { name, ty, value, span });
         }
         if decls.is_empty() {
             return Err(ParseError {
@@ -620,6 +685,10 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<PascalType, ParseError> {
+        // `packed` is accepted but ignored (no special layout).
+        if *self.peek() == Tok::KwPacked {
+            self.advance();
+        }
         if *self.peek() == Tok::Caret {
             self.advance();
             let pointed = self.parse_type()?;
@@ -640,7 +709,37 @@ impl Parser {
             let elem = self.parse_type()?;
             return Ok(PascalType::Set { elem: Box::new(elem) });
         }
+        if *self.peek() == Tok::KwFile {
+            self.advance();
+            self.expect(&Tok::KwOf)?;
+            let elem = self.parse_type()?;
+            return Ok(PascalType::File { elem: Box::new(elem) });
+        }
+        if *self.peek() == Tok::TyText {
+            self.advance();
+            return Ok(PascalType::File { elem: Box::new(PascalType::Char) });
+        }
         if *self.peek() == Tok::KwArray {
+            // Look ahead: `array[ident .. ident : type ] of T` is a conformant
+            // array parameter; otherwise a regular fixed-size array.
+            if let Some((Tok::LBracket, _)) = self.tokens.get(self.pos + 1) {
+                let mut p = self.pos + 2;
+                let mut depth = 1;
+                let mut saw_colon = false;
+                while depth > 0 && p < self.tokens.len() {
+                    match &self.tokens[p].0 {
+                        Tok::LBracket => depth += 1,
+                        Tok::RBracket => depth -= 1,
+                        Tok::Colon if depth == 1 => { saw_colon = true; break; }
+                        Tok::Semi | Tok::Eof => break,
+                        _ => {}
+                    }
+                    p += 1;
+                }
+                if saw_colon {
+                    return self.parse_conformant_array_type();
+                }
+            }
             return self.parse_array_type();
         }
         if *self.peek() == Tok::KwRecord {
@@ -649,7 +748,16 @@ impl Parser {
         match self.peek() {
             Tok::TyInteger => { self.advance(); Ok(PascalType::Integer) }
             Tok::TyReal    => { self.advance(); Ok(PascalType::Real) }
-            Tok::TyString  => { self.advance(); Ok(PascalType::String) }
+            Tok::TyString  => {
+                self.advance();
+                // Optional length: `string[N]` — accepted but treated as plain string
+                if *self.peek() == Tok::LBracket {
+                    self.advance();
+                    let _n = self.parse_int_literal()?;
+                    self.expect(&Tok::RBracket)?;
+                }
+                Ok(PascalType::String)
+            }
             Tok::TyBoolean => { self.advance(); Ok(PascalType::Boolean) }
             Tok::TyChar    => { self.advance(); Ok(PascalType::Char) }
             Tok::Ident(name) => {
@@ -662,6 +770,20 @@ impl Parser {
                 span: self.span(),
             }),
         }
+    }
+
+    fn parse_conformant_array_type(&mut self) -> Result<PascalType, ParseError> {
+        self.expect(&Tok::KwArray)?;
+        self.expect(&Tok::LBracket)?;
+        let (lo_name, _) = self.expect_ident()?;
+        self.expect(&Tok::DotDot)?;
+        let (hi_name, _) = self.expect_ident()?;
+        self.expect(&Tok::Colon)?;
+        let _bound_ty = self.parse_type()?;
+        self.expect(&Tok::RBracket)?;
+        self.expect(&Tok::KwOf)?;
+        let elem = self.parse_type()?;
+        Ok(PascalType::ConformantArray { lo_name, hi_name, elem: Box::new(elem) })
     }
 
     fn parse_array_type(&mut self) -> Result<PascalType, ParseError> {
@@ -833,6 +955,7 @@ impl Parser {
             return Ok(ProcDecl {
                 name, params, return_type,
                 vars: Vec::new(),
+                nested_procs: Vec::new(),
                 body: Block { statements: Vec::new(), span, end_span: span },
                 span,
             });
@@ -844,10 +967,16 @@ impl Parser {
             Vec::new()
         };
 
+        // Nested procedures/functions
+        let mut nested_procs = Vec::new();
+        while *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
+            nested_procs.push(self.parse_proc_decl()?);
+        }
+
         let body = self.parse_block()?;
         self.expect(&Tok::Semi)?;
 
-        Ok(ProcDecl { name, params, return_type, vars, body, span })
+        Ok(ProcDecl { name, params, return_type, vars, nested_procs, body, span })
     }
 
     fn parse_param_list(&mut self) -> Result<Vec<ParamGroup>, ParseError> {
@@ -865,6 +994,40 @@ impl Parser {
     }
 
     fn parse_param_group(&mut self) -> Result<ParamGroup, ParseError> {
+        // Procedural/functional parameter:
+        //   `procedure p`                      → procedure with no params
+        //   `procedure p(args)`                → procedure with params
+        //   `function f(args): T`              → function returning T
+        //   `function f: T`                    → function with no params
+        if *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
+            let is_func = *self.peek() == Tok::KwFunction;
+            self.advance();
+            let (pname, _) = self.expect_ident()?;
+            let mut params: Vec<PascalType> = Vec::new();
+            if *self.peek() == Tok::LParen {
+                self.advance();
+                if *self.peek() != Tok::RParen {
+                    params.push(self.parse_proc_param_type()?);
+                    while *self.peek() == Tok::Semi {
+                        self.advance();
+                        params.push(self.parse_proc_param_type()?);
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+            }
+            let return_type = if is_func {
+                self.expect(&Tok::Colon)?;
+                Some(Box::new(self.parse_type()?))
+            } else {
+                None
+            };
+            return Ok(ParamGroup {
+                mode: ParamMode::Value,
+                names: vec![pname],
+                ty: PascalType::Proc { params, return_type },
+            });
+        }
+
         let mode = if *self.peek() == Tok::Var {
             self.advance();
             ParamMode::Var
@@ -882,6 +1045,20 @@ impl Parser {
         self.expect(&Tok::Colon)?;
         let ty = self.parse_type()?;
         Ok(ParamGroup { mode, names, ty })
+    }
+
+    /// Parse a parameter-of-procedural type: just the type, ignoring names.
+    /// Used inside the parens of `procedure p(name: T; ...)`.
+    fn parse_proc_param_type(&mut self) -> Result<PascalType, ParseError> {
+        // `var name: T` or `name: T` — we capture only the type.
+        if *self.peek() == Tok::Var { self.advance(); }
+        let _ = self.expect_ident()?;
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            let _ = self.expect_ident()?;
+        }
+        self.expect(&Tok::Colon)?;
+        self.parse_type()
     }
 
     // ── block ────────────────────────────────────────────
@@ -1212,10 +1389,10 @@ impl Parser {
         if *self.peek() == Tok::LParen {
             self.advance();
             if *self.peek() != Tok::RParen {
-                args.push(self.parse_expr()?);
+                args.push(self.parse_write_arg()?);
                 while *self.peek() == Tok::Comma {
                     self.advance();
-                    args.push(self.parse_expr()?);
+                    args.push(self.parse_write_arg()?);
                 }
             }
             self.expect(&Tok::RParen)?;
@@ -1227,13 +1404,39 @@ impl Parser {
         }
     }
 
+    fn parse_write_arg(&mut self) -> Result<WriteArg, ParseError> {
+        let expr = self.parse_expr()?;
+        let mut width = None;
+        let mut precision = None;
+        if *self.peek() == Tok::Colon {
+            self.advance();
+            width = Some(self.parse_expr()?);
+            if *self.peek() == Tok::Colon {
+                self.advance();
+                precision = Some(self.parse_expr()?);
+            }
+        }
+        Ok(WriteArg { expr, width, precision })
+    }
+
     fn parse_readln(&mut self) -> Result<Statement, ParseError> {
         let span = self.span();
         self.advance(); // consume 'readln'
-        self.expect(&Tok::LParen)?;
-        let (target, _) = self.expect_ident()?;
-        self.expect(&Tok::RParen)?;
-        Ok(Statement::ReadLn { target, span })
+        let mut targets = Vec::new();
+        if *self.peek() == Tok::LParen {
+            self.advance();
+            if *self.peek() != Tok::RParen {
+                let (t, _) = self.expect_ident()?;
+                targets.push(t);
+                while *self.peek() == Tok::Comma {
+                    self.advance();
+                    let (t, _) = self.expect_ident()?;
+                    targets.push(t);
+                }
+            }
+            self.expect(&Tok::RParen)?;
+        }
+        Ok(Statement::ReadLn { targets, span })
     }
 
     // ── expressions (precedence climbing) ────────────────
@@ -1359,6 +1562,28 @@ impl Parser {
                 let span = self.span();
                 self.advance();
                 Ok(Expr::BoolLit(false, span))
+            }
+            Tok::KwNil => {
+                let span = self.span();
+                self.advance();
+                Ok(Expr::Nil(span))
+            }
+            Tok::TyInteger | Tok::TyReal | Tok::TyChar | Tok::TyBoolean
+                if self.tokens.get(self.pos + 1).map(|(t, _)| t == &Tok::LParen).unwrap_or(false) =>
+            {
+                let span = self.span();
+                let name = match self.peek() {
+                    Tok::TyInteger => "integer",
+                    Tok::TyReal => "real",
+                    Tok::TyChar => "char",
+                    Tok::TyBoolean => "boolean",
+                    _ => unreachable!(),
+                }.to_string();
+                self.advance();
+                self.expect(&Tok::LParen)?;
+                let arg = self.parse_expr()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Expr::Call { name, args: vec![arg], span })
             }
             Tok::Ident(name) => {
                 let span = self.span();

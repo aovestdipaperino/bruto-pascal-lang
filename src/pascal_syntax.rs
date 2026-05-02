@@ -24,7 +24,11 @@ impl PascalHighlighter {
                 | "true" | "false" | "const" | "type" | "procedure" | "function"
                 | "array" | "of" | "record" | "nil" | "case" | "with"
                 | "new" | "dispose" | "forward" | "set" | "in"
-                | "label" | "goto"
+                | "label" | "goto" | "file" | "packed"
+                | "assign" | "reset" | "rewrite" | "close" | "append"
+                | "eof" | "eoln" | "seek" | "filepos" | "filesize" | "ioresult"
+                | "odd" | "page" | "pack" | "unpack" | "get" | "put"
+                | "input" | "output" | "maxint"
         )
     }
 

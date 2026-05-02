@@ -36,10 +36,11 @@ pub struct TypeDecl {
     pub span: Span,
 }
 
-/// Constant declaration: `name = value`
+/// Constant declaration: `name = value` or `name: type = value` (typed/mutable)
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
     pub name: String,
+    pub ty: Option<PascalType>,
     pub value: Expr,
     pub span: Span,
 }
@@ -66,6 +67,7 @@ pub struct ProcDecl {
     pub params: Vec<ParamGroup>,
     pub return_type: Option<PascalType>, // None = procedure, Some = function
     pub vars: Vec<VarDecl>,
+    pub nested_procs: Vec<ProcDecl>,
     pub body: Block,
     pub span: Span,
 }
@@ -107,6 +109,23 @@ pub enum PascalType {
     Subrange { lo: i64, hi: i64 },
     /// Set of ordinal type — stored as 256-bit bitmask (4 x i64)
     Set { elem: Box<PascalType> },
+    /// File of <type> — stored as opaque pointer to bruto_file struct.
+    /// `text` is `File { elem: Char }`.
+    File { elem: Box<PascalType> },
+    /// Procedural type — function pointer with a known signature.
+    /// `return_type = None` means procedure (void); Some => function.
+    Proc {
+        params: Vec<PascalType>,
+        return_type: Option<Box<PascalType>>,
+    },
+    /// Conformant array parameter (ISO 7185):
+    ///   `array[lo..hi: integer] of T`
+    /// `lo_name`/`hi_name` become integer locals inside the procedure body.
+    ConformantArray {
+        lo_name: String,
+        hi_name: String,
+        elem: Box<PascalType>,
+    },
     /// A named type alias (resolved to canonical type during compilation)
     Named(String),
 }
@@ -160,15 +179,15 @@ pub enum Statement {
         span: Span,
     },
     WriteLn {
-        args: Vec<Expr>,
+        args: Vec<WriteArg>,
         span: Span,
     },
     Write {
-        args: Vec<Expr>,
+        args: Vec<WriteArg>,
         span: Span,
     },
     ReadLn {
-        target: String,
+        targets: Vec<String>,
         span: Span,
     },
     Block(Block),
@@ -237,6 +256,14 @@ pub enum Statement {
         expr: Expr,
         span: Span,
     },
+}
+
+/// A single write/writeln argument with optional formatting: `expr[:width[:precision]]`.
+#[derive(Debug, Clone)]
+pub struct WriteArg {
+    pub expr: Expr,
+    pub width: Option<Expr>,
+    pub precision: Option<Expr>,
 }
 
 /// A single step in a chained LValue access path.
@@ -334,6 +361,8 @@ pub enum Expr {
         elements: Vec<SetElement>,
         span: Span,
     },
+    /// `nil` pointer literal
+    Nil(Span),
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +387,7 @@ impl Expr {
             | Self::Index { span, .. }
             | Self::FieldAccess { span, .. }
             | Self::SetConstructor { span, .. } => *span,
+            Self::Nil(s) => *s,
         }
     }
 }
