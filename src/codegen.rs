@@ -324,8 +324,20 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Link with -g to preserve debug info in the object file.
         // Redirect stdout/stderr so they don't corrupt the TUI.
+        // -no-pie on Linux: most distros default to building Position
+        // Independent Executables, but the LLVM TargetMachine is set to
+        // the static reloc model, so absolute relocations in our object
+        // file can't be folded into a PIE. Forcing a non-PIE binary
+        // sidesteps that until/unless we switch the codegen to emit PIC.
+        let link_args: Vec<&str> = {
+            #[allow(unused_mut)]
+            let mut a: Vec<&str> = vec![&obj_path, "-o", output_path, "-lm", "-g"];
+            #[cfg(target_os = "linux")]
+            a.push("-no-pie");
+            a
+        };
         let link_out = std::process::Command::new("cc")
-            .args([&obj_path, "-o", output_path, "-lm", "-g"])
+            .args(&link_args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -388,25 +400,16 @@ impl<'ctx> CodeGen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let make_fn = self.module.get_function("bruto_make_predef_file").unwrap();
 
-        // Lazily declare the libc stdin/stdout/stderr globals (macOS naming).
-        let get_or_decl = |name: &str| -> inkwell::values::GlobalValue<'ctx> {
-            self.module.get_global(name).unwrap_or_else(|| {
-                let g = self.module.add_global(ptr_ty, None, name);
-                g.set_externally_initialized(true);
-                g.set_linkage(inkwell::module::Linkage::External);
-                g
-            })
-        };
-
-        for (var_name, sym) in &[
-            ("input", bruto_lang::target::STDIN_SYM),
-            ("output", bruto_lang::target::STDOUT_SYM),
+        for (var_name, which) in &[
+            ("input", bruto_lang::target::Stdio::Stdin),
+            ("output", bruto_lang::target::Stdio::Stdout),
         ] {
-            let g = get_or_decl(sym);
-            let fp = self
-                .builder
-                .build_load(ptr_ty, g.as_pointer_value(), "predef_fp")
-                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let fp = bruto_lang::target::emit_load_stdio(
+                &self.builder,
+                &self.module,
+                self.context,
+                *which,
+            );
             let s = self
                 .builder
                 .build_call(make_fn, &[fp.into()], "predef_s")
@@ -5654,6 +5657,8 @@ mod tests {
     use super::*;
     use crate::parser::Parser;
 
+    // dSYM bundle + Apple-format DWARF: macOS-only.
+    #[cfg(target_os = "macos")]
     #[test]
     fn compile_and_run_simple_program() {
         let source = "program Test;\nvar\n  x: integer;\nbegin\n  x := 42;\n  writeln(x)\nend.\n";
@@ -5704,6 +5709,9 @@ mod tests {
         let _ = std::fs::remove_file(source_path);
     }
 
+    // lldb-script driven breakpoint stop check is wired against the
+    // macOS lldb output format; on Linux the equivalent flow is gdb.
+    #[cfg(target_os = "macos")]
     #[test]
     fn lldb_stops_at_breakpoint() {
         // Full integration: compile → set breakpoint → run → verify stop
