@@ -300,8 +300,9 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Write object file and link to executable.
-    pub fn emit_executable(&self, output_path: &str) -> Result<(), String> {
+    /// Write the LLVM module to a `.o` file and return its path.
+    /// Caller is responsible for linking + cleanup.
+    pub fn emit_object(&self, output_path: &str) -> Result<String, String> {
         Target::initialize_native(&InitializationConfig::default()).map_err(|e| e.to_string())?;
 
         let triple = TargetMachine::get_default_triple();
@@ -321,9 +322,13 @@ impl<'ctx> CodeGen<'ctx> {
         machine
             .write_to_file(&self.module, FileType::Object, Path::new(&obj_path))
             .map_err(|e| e.to_string())?;
+        Ok(obj_path)
+    }
 
-        // Link with -g to preserve debug info in the object file.
-        // Redirect stdout/stderr so they don't corrupt the TUI.
+    /// Spawn the platform linker on `obj_path → output_path` and return
+    /// the running child. The caller drives it via `try_wait` so the
+    /// IDE can surface progress / handle cancel.
+    pub fn spawn_linker(obj_path: &str, output_path: &str) -> Result<std::process::Child, String> {
         // Linker selection per platform:
         //   macOS:   `cc` resolves to Apple's clang; supports -lm/-g.
         //   Linux:   `cc` resolves to gcc/clang; need -no-pie because the
@@ -339,7 +344,7 @@ impl<'ctx> CodeGen<'ctx> {
         };
         let link_args: Vec<&str> = {
             #[allow(unused_mut)]
-            let mut a: Vec<&str> = vec![&obj_path, "-o", output_path, "-g"];
+            let mut a: Vec<&str> = vec![obj_path, "-o", output_path, "-g"];
             #[cfg(not(target_os = "windows"))]
             a.push("-lm");
             #[cfg(target_os = "linux")]
@@ -356,13 +361,43 @@ impl<'ctx> CodeGen<'ctx> {
             }
             a
         };
-        let link_out = std::process::Command::new(linker)
+        std::process::Command::new(linker)
             .args(&link_args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|e| e.to_string())?;
+            .spawn()
+            .map_err(|e| format!("failed to spawn linker: {e}"))
+    }
 
+    /// On macOS, spawn `dsymutil` to build the .dSYM bundle alongside
+    /// `output_path`. No-op (returns `Ok(None)`) on other platforms.
+    pub fn spawn_dsymutil(output_path: &str) -> Result<Option<std::process::Child>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("dsymutil")
+                .arg(output_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map(Some)
+                .map_err(|e| format!("failed to spawn dsymutil: {e}"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = output_path;
+            Ok(None)
+        }
+    }
+
+    /// One-shot synchronous build (used by callers that don't need
+    /// progress info). Drives object emit + linker + dsymutil to
+    /// completion blocking on each child.
+    pub fn emit_executable(&self, output_path: &str) -> Result<(), String> {
+        let obj_path = self.emit_object(output_path)?;
+        let linker = Self::spawn_linker(&obj_path, output_path)?;
+        let link_out = linker
+            .wait_with_output()
+            .map_err(|e| format!("waiting on linker: {e}"))?;
         if !link_out.status.success() {
             // Surface stdout too — link.exe writes "unresolved external"
             // diagnostics there rather than to stderr.
@@ -371,15 +406,10 @@ impl<'ctx> CodeGen<'ctx> {
             return Err(format!("linking failed: {stderr}{stdout}"));
         }
 
-        // On macOS, run dsymutil to create the .dSYM bundle that lldb needs.
-        #[cfg(target_os = "macos")]
-        {
-            let dsym_out = std::process::Command::new("dsymutil")
-                .arg(output_path)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .map_err(|e| e.to_string())?;
+        if let Some(dsym) = Self::spawn_dsymutil(output_path)? {
+            let dsym_out = dsym
+                .wait_with_output()
+                .map_err(|e| format!("waiting on dsymutil: {e}"))?;
             if !dsym_out.status.success() {
                 let stderr = String::from_utf8_lossy(&dsym_out.stderr);
                 return Err(format!("dsymutil failed: {stderr}"));

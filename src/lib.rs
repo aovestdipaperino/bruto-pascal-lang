@@ -7,7 +7,7 @@ mod pascal_syntax;
 
 use std::collections::HashSet;
 
-use bruto_lang::language::{BuildResult, Language};
+use bruto_lang::language::{BuildJob, BuildPhase, BuildResult, Language};
 use codegen::CodeGen;
 use inkwell::context::Context;
 use parser::Parser;
@@ -45,9 +45,100 @@ impl Language for MiniPascal {
         lines
     }
 
-    fn build(&self, source: &str) -> Result<BuildResult, String> {
-        // Use the OS-appropriate temp dir so the same code path works
-        // on /tmp (Unix) and %TEMP% (Windows).
+    fn build_job(&self, source: &str) -> Box<dyn BuildJob> {
+        Box::new(PascalBuildJob::new(source.to_string()))
+    }
+}
+
+/// Poll-driven build state machine. The first `poll` runs everything
+/// up through spawning the linker (parse + codegen + object emit +
+/// metadata + spawn cc); subsequent polls just `try_wait` on the
+/// linker / dsymutil children. Drop kills any live child so cancel
+/// from the IDE actually stops the linker.
+struct PascalBuildJob {
+    inner: JobInner,
+}
+
+enum JobInner {
+    /// First poll runs everything synchronously through cc spawn.
+    NotStarted { source: String },
+    /// cc/clang is running; poll its status.
+    Linking {
+        paths: JobPaths,
+        child: std::process::Child,
+    },
+    /// dsymutil is running (macOS only) after cc finished.
+    Dsymutil {
+        paths: JobPaths,
+        child: std::process::Child,
+    },
+    /// Job has produced its result; further polls are an error.
+    Drained,
+}
+
+struct JobPaths {
+    source_path: String,
+    exe_path: String,
+    obj_path: String,
+}
+
+impl PascalBuildJob {
+    fn new(source: String) -> Self {
+        Self {
+            inner: JobInner::NotStarted { source },
+        }
+    }
+}
+
+impl BuildJob for PascalBuildJob {
+    fn poll(&mut self) -> BuildPhase {
+        // Take the state to allow transitioning ownership through the
+        // match. On error/done we leave Drained behind.
+        let state = std::mem::replace(&mut self.inner, JobInner::Drained);
+        match state {
+            JobInner::NotStarted { source } => self.start(source),
+            JobInner::Linking { paths, mut child } => match child.try_wait() {
+                Ok(None) => {
+                    self.inner = JobInner::Linking { paths, child };
+                    BuildPhase::Pending("Linking…".into())
+                }
+                Ok(Some(status)) if status.success() => self.after_linker(paths),
+                Ok(Some(_)) => {
+                    let out = child.wait_with_output();
+                    let msg = match out {
+                        Ok(o) => format!(
+                            "linking failed: {}{}",
+                            String::from_utf8_lossy(&o.stderr),
+                            String::from_utf8_lossy(&o.stdout)
+                        ),
+                        Err(e) => format!("linking failed: {e}"),
+                    };
+                    BuildPhase::Failed(msg)
+                }
+                Err(e) => BuildPhase::Failed(format!("waiting on linker: {e}")),
+            },
+            JobInner::Dsymutil { paths, mut child } => match child.try_wait() {
+                Ok(None) => {
+                    self.inner = JobInner::Dsymutil { paths, child };
+                    BuildPhase::Pending("Generating debug info…".into())
+                }
+                Ok(Some(status)) if status.success() => self.finalize(paths),
+                Ok(Some(_)) => {
+                    let stderr = child
+                        .wait_with_output()
+                        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                        .unwrap_or_default();
+                    BuildPhase::Failed(format!("dsymutil failed: {stderr}"))
+                }
+                Err(e) => BuildPhase::Failed(format!("waiting on dsymutil: {e}")),
+            },
+            JobInner::Drained => BuildPhase::Failed("build polled after completion".into()),
+        }
+    }
+}
+
+impl PascalBuildJob {
+    fn start(&mut self, source: String) -> BuildPhase {
         let tmp = std::env::temp_dir();
         let source_path = tmp
             .join("bruto_pascal_src.pas")
@@ -62,28 +153,75 @@ impl Language for MiniPascal {
             .to_string_lossy()
             .into_owned();
 
-        std::fs::write(&source_path, source).map_err(|e| format!("Failed to write source: {e}"))?;
+        if let Err(e) = std::fs::write(&source_path, &source) {
+            return BuildPhase::Failed(format!("Failed to write source: {e}"));
+        }
 
-        let mut parser = Parser::new(source);
-        let program = parser
-            .parse_program()
-            .map_err(|e| format!("Parse error: {e}"))?;
+        let mut parser = Parser::new(&source);
+        let program = match parser.parse_program() {
+            Ok(p) => p,
+            Err(e) => return BuildPhase::Failed(format!("Parse error: {e}")),
+        };
 
         let context = Context::create();
         let mut codegen = CodeGen::new(&context, &source_path);
         codegen.set_directives(parser.directives);
-        codegen
-            .compile(&program)
-            .map_err(|e| format!("Codegen error: {e}"))?;
+        if let Err(e) = codegen.compile(&program) {
+            return BuildPhase::Failed(format!("Codegen error: {e}"));
+        }
 
-        codegen.emit_executable(&exe_path)?;
+        let obj_path = match codegen.emit_object(&exe_path) {
+            Ok(p) => p,
+            Err(e) => return BuildPhase::Failed(e),
+        };
         let _ = codegen.write_metadata(&exe_path);
 
-        Ok(BuildResult {
-            exe_path,
+        let child = match CodeGen::spawn_linker(&obj_path, &exe_path) {
+            Ok(c) => c,
+            Err(e) => return BuildPhase::Failed(e),
+        };
+
+        let paths = JobPaths {
             source_path,
+            exe_path,
+            obj_path,
+        };
+        self.inner = JobInner::Linking { paths, child };
+        BuildPhase::Pending("Linking…".into())
+    }
+
+    fn after_linker(&mut self, paths: JobPaths) -> BuildPhase {
+        match CodeGen::spawn_dsymutil(&paths.exe_path) {
+            Ok(Some(child)) => {
+                self.inner = JobInner::Dsymutil { paths, child };
+                BuildPhase::Pending("Generating debug info…".into())
+            }
+            Ok(None) => self.finalize(paths),
+            Err(e) => BuildPhase::Failed(e),
+        }
+    }
+
+    fn finalize(&mut self, paths: JobPaths) -> BuildPhase {
+        let _ = std::fs::remove_file(&paths.obj_path);
+        BuildPhase::Done(BuildResult {
+            exe_path: paths.exe_path,
+            source_path: paths.source_path,
             console_capture_path: bruto_lang::target::console_capture_path(),
         })
+    }
+}
+
+impl Drop for PascalBuildJob {
+    fn drop(&mut self) {
+        // Cancel = kill any live child so the linker / dsymutil
+        // doesn't keep running after the IDE moves on.
+        match &mut self.inner {
+            JobInner::Linking { child, .. } | JobInner::Dsymutil { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            _ => {}
+        }
     }
 }
 
