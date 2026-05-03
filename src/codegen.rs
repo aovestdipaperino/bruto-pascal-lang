@@ -324,19 +324,29 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Link with -g to preserve debug info in the object file.
         // Redirect stdout/stderr so they don't corrupt the TUI.
-        // -no-pie on Linux: most distros default to building Position
-        // Independent Executables, but the LLVM TargetMachine is set to
-        // the static reloc model, so absolute relocations in our object
-        // file can't be folded into a PIE. Forcing a non-PIE binary
-        // sidesteps that until/unless we switch the codegen to emit PIC.
+        // Linker selection per platform:
+        //   macOS:   `cc` resolves to Apple's clang; supports -lm/-g.
+        //   Linux:   `cc` resolves to gcc/clang; need -no-pie because the
+        //            LLVM TargetMachine is set to the static reloc model
+        //            and modern distros default to PIE binaries.
+        //   Windows: `cc` doesn't exist on PATH; LLVM ships `clang`. The
+        //            MSVC CRT provides math intrinsics so -lm is not
+        //            needed (and would error). PIE is a non-issue.
+        let linker = if cfg!(target_os = "windows") {
+            "clang"
+        } else {
+            "cc"
+        };
         let link_args: Vec<&str> = {
             #[allow(unused_mut)]
-            let mut a: Vec<&str> = vec![&obj_path, "-o", output_path, "-lm", "-g"];
+            let mut a: Vec<&str> = vec![&obj_path, "-o", output_path, "-g"];
+            #[cfg(not(target_os = "windows"))]
+            a.push("-lm");
             #[cfg(target_os = "linux")]
             a.push("-no-pie");
             a
         };
-        let link_out = std::process::Command::new("cc")
+        let link_out = std::process::Command::new(linker)
             .args(&link_args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
