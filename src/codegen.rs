@@ -398,7 +398,10 @@ impl<'ctx> CodeGen<'ctx> {
             })
         };
 
-        for (var_name, sym) in &[("input", "__stdinp"), ("output", "__stdoutp")] {
+        for (var_name, sym) in &[
+            ("input", bruto_lang::target::STDIN_SYM),
+            ("output", bruto_lang::target::STDOUT_SYM),
+        ] {
             let g = get_or_decl(sym);
             let fp = self
                 .builder
