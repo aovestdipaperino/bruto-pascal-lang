@@ -344,6 +344,16 @@ impl<'ctx> CodeGen<'ctx> {
             a.push("-lm");
             #[cfg(target_os = "linux")]
             a.push("-no-pie");
+            // On Windows-MSVC, force LLVM's lld-link as the linker so we
+            // don't depend on link.exe finding the right .lib paths from
+            // a GitHub-runner-shaped environment, and explicitly pull in
+            // the UCRT/legacy stdio libs the runtime helpers reference.
+            #[cfg(all(target_os = "windows", target_env = "msvc"))]
+            {
+                a.push("-fuse-ld=lld");
+                a.push("-lmsvcrt");
+                a.push("-llegacy_stdio_definitions");
+            }
             a
         };
         let link_out = std::process::Command::new(linker)
@@ -354,8 +364,11 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(|e| e.to_string())?;
 
         if !link_out.status.success() {
+            // Surface stdout too — link.exe writes "unresolved external"
+            // diagnostics there rather than to stderr.
             let stderr = String::from_utf8_lossy(&link_out.stderr);
-            return Err(format!("linking failed: {stderr}"));
+            let stdout = String::from_utf8_lossy(&link_out.stdout);
+            return Err(format!("linking failed: {stderr}{stdout}"));
         }
 
         // On macOS, run dsymutil to create the .dSYM bundle that lldb needs.
