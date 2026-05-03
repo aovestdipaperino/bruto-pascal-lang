@@ -49,9 +49,16 @@ impl Language for MiniPascal {
         // Use the OS-appropriate temp dir so the same code path works
         // on /tmp (Unix) and %TEMP% (Windows).
         let tmp = std::env::temp_dir();
-        let source_path = tmp.join("bruto_pascal_src.pas").to_string_lossy().into_owned();
+        let source_path = tmp
+            .join("bruto_pascal_src.pas")
+            .to_string_lossy()
+            .into_owned();
         let exe_path = tmp
-            .join(if cfg!(windows) { "bruto_pascal_out.exe" } else { "bruto_pascal_out" })
+            .join(if cfg!(windows) {
+                "bruto_pascal_out.exe"
+            } else {
+                "bruto_pascal_out"
+            })
             .to_string_lossy()
             .into_owned();
 
@@ -786,8 +793,13 @@ end.
 
     #[test]
     fn file_filepos_filesize() {
-        let path = "/tmp/_bruto_test_pos.txt";
-        let _ = std::fs::remove_file(path);
+        // Pascal accepts backslashes in single-quoted strings, but use
+        // forward slashes for portability — fopen on Windows handles them.
+        let path = std::env::temp_dir()
+            .join("_bruto_test_pos.txt")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let _ = std::fs::remove_file(&path);
         let prog = format!(
             "program T;\nvar f: text;\n  size: integer;\nbegin\n  assign(f, '{path}');\n  rewrite(f);\n  writeln(f, 'ABC');\n  close(f);\n  assign(f, '{path}');\n  reset(f);\n  size := filesize(f);\n  writeln(size);\n  close(f)\nend.\n"
         );
@@ -795,18 +807,16 @@ end.
         assert!(ok);
         // 'ABC\n' = 4 bytes
         assert_eq!(out.trim(), "4");
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn range_check_directive() {
         // {$R+} on; out-of-bounds index should abort the executable.
-        let path = "/tmp/_bruto_test_rng";
         let lang = MiniPascal;
         let result = lang.build(
             "{$R+}\nprogram T;\nvar a: array[1..3] of integer;\n  i: integer;\nbegin\n  i := 5;\n  a[i] := 0\nend.\n",
         ).expect("build failed");
-        let _ = std::fs::remove_file(path);
         let status = std::process::Command::new(&result.exe_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -934,15 +944,18 @@ end.
 
     #[test]
     fn file_io_write_read() {
-        let path = "/tmp/_bruto_test_io.txt";
-        let _ = std::fs::remove_file(path);
+        let path = std::env::temp_dir()
+            .join("_bruto_test_io.txt")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let _ = std::fs::remove_file(&path);
         let prog = format!(
             "program T;\nvar f: text;\n  s: string;\nbegin\n  assign(f, '{path}');\n  rewrite(f);\n  writeln(f, 'hello world');\n  writeln(f, 42);\n  close(f);\n  assign(f, '{path}');\n  reset(f);\n  readln(f, s);\n  writeln(s);\n  close(f)\nend.\n"
         );
         let (ok, out) = build_and_run_source(&prog);
         assert!(ok);
         assert_eq!(out.trim(), "hello world");
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

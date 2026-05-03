@@ -5706,8 +5706,8 @@ mod tests {
             .status()
             .expect("run failed");
         assert!(status.success(), "non-zero exit");
-        let captured =
-            std::fs::read_to_string(&bruto_lang::target::console_capture_path()).expect("capture file missing");
+        let captured = std::fs::read_to_string(&bruto_lang::target::console_capture_path())
+            .expect("capture file missing");
         assert_eq!(captured.trim(), "42", "expected 42, got: {captured:?}");
         let _ = std::fs::remove_file(&bruto_lang::target::console_capture_path());
 
@@ -5804,7 +5804,11 @@ mod tests {
         let mut codegen = CodeGen::new(&context, source_path.as_ref());
         codegen.compile(&program).unwrap();
 
-        let exe_path_buf = tmp.join(if cfg!(windows) { "test_capture_out.exe" } else { "test_capture_out" });
+        let exe_path_buf = tmp.join(if cfg!(windows) {
+            "test_capture_out.exe"
+        } else {
+            "test_capture_out"
+        });
         let exe_path = exe_path_buf.to_string_lossy();
         codegen.emit_executable(exe_path.as_ref()).unwrap();
 
@@ -5815,7 +5819,8 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let captured = std::fs::read_to_string(&bruto_lang::target::console_capture_path()).unwrap();
+        let captured =
+            std::fs::read_to_string(&bruto_lang::target::console_capture_path()).unwrap();
         assert_eq!(
             captured.trim(),
             "hello capture",
