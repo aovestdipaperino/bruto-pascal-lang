@@ -253,10 +253,15 @@ impl<'ctx> CodeGen<'ctx> {
             self.compile_var_decl(var_decl, di_main)?;
         }
 
-        // Compile body
+        // Compile body (compile_block emits a synthetic alloca on the `end.`
+        // line so users can drop a breakpoint there).
         self.compile_block(&program.body)?;
 
-        // Return 0 — use the end_span so `end.` is breakpointable
+        // Return 0 — debug-loc on `end.` so the ret instruction is associated
+        // with that source line. When the user steps past `end.`, lldb
+        // returns from main into dyld; debugger.rs detects the no-source
+        // stop frame and issues `continue`, so the process still exits
+        // cleanly without the user pressing F8 over and over.
         self.set_debug_loc(program.body.end_span);
         self.builder.build_return(Some(&self.context.i64_type().const_int(0, false)))
             .map_err(|e| CodeGenError::new(e.to_string(), None))?;
