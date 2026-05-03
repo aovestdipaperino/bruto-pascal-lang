@@ -67,6 +67,11 @@ enum Tok {
     KwWith,
     KwFile,
     KwPacked,
+    KwUnit,
+    KwInterface,
+    KwImplementation,
+    KwUses,
+    KwInitialization,
     TyReal,
     TyChar,
     TyText,
@@ -156,6 +161,11 @@ impl fmt::Display for Tok {
             Tok::KwLabel => write!(f, "'label'"),
             Tok::KwGoto => write!(f, "'goto'"),
             Tok::KwWith => write!(f, "'with'"),
+            Tok::KwUnit => write!(f, "'unit'"),
+            Tok::KwInterface => write!(f, "'interface'"),
+            Tok::KwImplementation => write!(f, "'implementation'"),
+            Tok::KwUses => write!(f, "'uses'"),
+            Tok::KwInitialization => write!(f, "'initialization'"),
             Tok::TyReal => write!(f, "'real'"),
             Tok::TyChar => write!(f, "'char'"),
             Tok::KwArray => write!(f, "'array'"),
@@ -473,6 +483,11 @@ impl Lexer {
                 "label" => Tok::KwLabel,
                 "goto" => Tok::KwGoto,
                 "with" => Tok::KwWith,
+                "unit" => Tok::KwUnit,
+                "interface" => Tok::KwInterface,
+                "implementation" => Tok::KwImplementation,
+                "uses" => Tok::KwUses,
+                "initialization" => Tok::KwInitialization,
                 "array" => Tok::KwArray,
                 "of" => Tok::KwOf,
                 "record" => Tok::KwRecord,
@@ -631,6 +646,12 @@ impl Parser {
         }
         self.expect(&Tok::Semi)?;
 
+        let uses = if *self.peek() == Tok::KwUses {
+            self.parse_uses_clause()?
+        } else {
+            Vec::new()
+        };
+
         let labels = if *self.peek() == Tok::KwLabel {
             self.parse_label_section()?
         } else {
@@ -665,12 +686,191 @@ impl Parser {
 
         Ok(Program {
             name,
+            uses,
             labels,
             consts,
             type_decls,
             vars,
             procedures,
             body,
+            span,
+        })
+    }
+
+    /// Parse `uses A, B, C;` (Borland/Delphi style). Unit names are
+    /// identifiers; resolution to .pas files is the build pipeline's
+    /// problem, not the parser's.
+    fn parse_uses_clause(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect(&Tok::KwUses)?;
+        let mut names = Vec::new();
+        let (first, _) = self.expect_ident()?;
+        names.push(first);
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            let (name, _) = self.expect_ident()?;
+            names.push(name);
+        }
+        self.expect(&Tok::Semi)?;
+        Ok(names)
+    }
+
+    /// Parse a unit file: `unit Name; interface ... implementation ... end.`
+    ///
+    /// Both the interface and implementation sections accept the same
+    /// const/type/var blocks as a program. Procedures in the interface
+    /// must be header-only (no body, no `forward`); their bodies live
+    /// in the implementation. A bare initialization block (`initialization
+    /// stmts end.`) or trailing `begin ... end.` is supported.
+    pub fn parse_unit(&mut self) -> Result<Unit, ParseError> {
+        let span = self.span();
+        self.expect(&Tok::KwUnit)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&Tok::Semi)?;
+
+        self.expect(&Tok::KwInterface)?;
+
+        let uses = if *self.peek() == Tok::KwUses {
+            self.parse_uses_clause()?
+        } else {
+            Vec::new()
+        };
+
+        let interface_consts = if *self.peek() == Tok::Const {
+            self.parse_const_section()?
+        } else {
+            Vec::new()
+        };
+        let interface_types = if *self.peek() == Tok::KwType {
+            self.parse_type_section()?
+        } else {
+            Vec::new()
+        };
+        let interface_vars = if *self.peek() == Tok::Var {
+            self.parse_var_section()?
+        } else {
+            Vec::new()
+        };
+
+        let mut interface_proc_headers = Vec::new();
+        while *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
+            interface_proc_headers.push(self.parse_proc_header()?);
+        }
+
+        self.expect(&Tok::KwImplementation)?;
+
+        // Implementation may have its own (private) uses clause.
+        // We accept it and merge it with the interface uses.
+        let mut all_uses = uses;
+        if *self.peek() == Tok::KwUses {
+            for u in self.parse_uses_clause()? {
+                if !all_uses.iter().any(|x| x.eq_ignore_ascii_case(&u)) {
+                    all_uses.push(u);
+                }
+            }
+        }
+
+        let impl_consts = if *self.peek() == Tok::Const {
+            self.parse_const_section()?
+        } else {
+            Vec::new()
+        };
+        let impl_types = if *self.peek() == Tok::KwType {
+            self.parse_type_section()?
+        } else {
+            Vec::new()
+        };
+        let impl_vars = if *self.peek() == Tok::Var {
+            self.parse_var_section()?
+        } else {
+            Vec::new()
+        };
+
+        let mut procedures = Vec::new();
+        while *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
+            procedures.push(self.parse_proc_decl()?);
+        }
+
+        // Optional unit initialization block. Accepts both Turbo Pascal
+        // (`begin ... end.`) and Delphi (`initialization ... end.`)
+        // styles. A bare `end.` is also valid (no init).
+        let init = if *self.peek() == Tok::Begin {
+            let body = self.parse_block()?;
+            Some(body)
+        } else if *self.peek() == Tok::KwInitialization {
+            self.advance();
+            let body_span = self.span();
+            let mut statements = Vec::new();
+            if *self.peek() != Tok::End {
+                statements.push(self.parse_statement()?);
+                while *self.peek() == Tok::Semi {
+                    self.advance();
+                    if *self.peek() == Tok::End {
+                        break;
+                    }
+                    statements.push(self.parse_statement()?);
+                }
+            }
+            let end_span = self.span();
+            self.expect(&Tok::End)?;
+            Some(Block {
+                statements,
+                span: body_span,
+                end_span,
+            })
+        } else {
+            self.expect(&Tok::End)?;
+            None
+        };
+        self.expect(&Tok::Dot)?;
+
+        Ok(Unit {
+            name,
+            uses: all_uses,
+            interface_consts,
+            interface_types,
+            interface_vars,
+            interface_proc_headers,
+            impl_consts,
+            impl_types,
+            impl_vars,
+            procedures,
+            init,
+            span,
+        })
+    }
+
+    /// Parse just the header of a procedure/function declaration —
+    /// `procedure Name(params); ` or `function Name(params): T;`. Used
+    /// for unit interface sections, where bodies are deferred to the
+    /// implementation block.
+    fn parse_proc_header(&mut self) -> Result<ProcDecl, ParseError> {
+        let span = self.span();
+        let is_function = *self.peek() == Tok::KwFunction;
+        self.advance();
+        let (name, _) = self.expect_ident()?;
+        let params = if *self.peek() == Tok::LParen {
+            self.parse_param_list()?
+        } else {
+            Vec::new()
+        };
+        let return_type = if is_function {
+            self.expect(&Tok::Colon)?;
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&Tok::Semi)?;
+        Ok(ProcDecl {
+            name,
+            params,
+            return_type,
+            vars: Vec::new(),
+            nested_procs: Vec::new(),
+            body: Block {
+                statements: Vec::new(),
+                span,
+                end_span: span,
+            },
             span,
         })
     }

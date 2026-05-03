@@ -81,6 +81,11 @@ impl PascalHighlighter {
                 | "input"
                 | "output"
                 | "maxint"
+                | "unit"
+                | "uses"
+                | "interface"
+                | "implementation"
+                | "initialization"
         )
     }
 

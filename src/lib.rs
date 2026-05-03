@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 
-mod ast;
+pub mod ast;
 pub mod codegen;
 pub mod parser;
 mod pascal_syntax;
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use bruto_lang::language::{BuildJob, BuildPhase, BuildResult, Language};
 use codegen::CodeGen;
@@ -46,7 +47,22 @@ impl Language for MiniPascal {
     }
 
     fn build_job(&self, source: &str) -> Box<dyn BuildJob> {
-        Box::new(PascalBuildJob::new(source.to_string()))
+        Box::new(PascalBuildJob::new(source.to_string(), Vec::new()))
+    }
+
+    fn build_job_at(&self, source: &str, source_path: Option<&Path>) -> Box<dyn BuildJob> {
+        let mut search_dirs = Vec::new();
+        if let Some(p) = source_path {
+            if let Some(dir) = p.parent() {
+                search_dirs.push(dir.to_path_buf());
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            if !search_dirs.iter().any(|d| d == &cwd) {
+                search_dirs.push(cwd);
+            }
+        }
+        Box::new(PascalBuildJob::new(source.to_string(), search_dirs))
     }
 }
 
@@ -57,6 +73,7 @@ impl Language for MiniPascal {
 /// from the IDE actually stops the linker.
 struct PascalBuildJob {
     inner: JobInner,
+    search_dirs: Vec<PathBuf>,
 }
 
 enum JobInner {
@@ -83,9 +100,10 @@ struct JobPaths {
 }
 
 impl PascalBuildJob {
-    fn new(source: String) -> Self {
+    fn new(source: String, search_dirs: Vec<PathBuf>) -> Self {
         Self {
             inner: JobInner::NotStarted { source },
+            search_dirs,
         }
     }
 }
@@ -158,10 +176,14 @@ impl PascalBuildJob {
         }
 
         let mut parser = Parser::new(&source);
-        let program = match parser.parse_program() {
+        let mut program = match parser.parse_program() {
             Ok(p) => p,
             Err(e) => return BuildPhase::Failed(format!("Parse error: {e}")),
         };
+
+        if let Err(e) = resolve_uses(&mut program, &self.search_dirs) {
+            return BuildPhase::Failed(e);
+        }
 
         let context = Context::create();
         let mut codegen = CodeGen::new(&context, &source_path);
@@ -222,6 +244,130 @@ impl Drop for PascalBuildJob {
             }
             _ => {}
         }
+    }
+}
+
+/// Resolve a program's `uses` clause: locate each unit on the search
+/// path, parse it, recurse into its own `uses`, and splice every
+/// imported declaration (interface + implementation) into the program
+/// in dependency order. Detects cycles and missing files.
+pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Result<(), String> {
+    if program.uses.is_empty() {
+        return Ok(());
+    }
+
+    let mut loaded: Vec<ast::Unit> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut on_stack: HashSet<String> = HashSet::new();
+
+    for unit_name in program.uses.clone() {
+        load_unit_recursive(
+            &unit_name,
+            search_dirs,
+            &mut loaded,
+            &mut visited,
+            &mut on_stack,
+        )?;
+    }
+
+    // `loaded` is in post-order (deepest dependency first). To
+    // preserve that ordering when prepending to the program, build
+    // a single combined batch then splice it once at the front. This
+    // way MathUtils (deepest) ends up listed before Shapes which
+    // ends up before the program's own procs — codegen registers
+    // each function prototype before any caller's body is compiled.
+    let mut consts = Vec::new();
+    let mut types = Vec::new();
+    let mut vars = Vec::new();
+    let mut procs = Vec::new();
+    let mut init_stmts = Vec::new();
+    for unit in loaded {
+        consts.extend(unit.interface_consts);
+        consts.extend(unit.impl_consts);
+        types.extend(unit.interface_types);
+        types.extend(unit.impl_types);
+        vars.extend(unit.interface_vars);
+        vars.extend(unit.impl_vars);
+        // Header-only interface declarations are dropped — the bodies
+        // in `unit.procedures` carry everything codegen needs.
+        procs.extend(unit.procedures);
+        if let Some(init) = unit.init {
+            init_stmts.extend(init.statements);
+        }
+    }
+    program.consts.splice(0..0, consts);
+    program.type_decls.splice(0..0, types);
+    program.vars.splice(0..0, vars);
+    program.procedures.splice(0..0, procs);
+    program.body.statements.splice(0..0, init_stmts);
+
+    Ok(())
+}
+
+fn load_unit_recursive(
+    name: &str,
+    search_dirs: &[PathBuf],
+    loaded: &mut Vec<ast::Unit>,
+    visited: &mut HashSet<String>,
+    on_stack: &mut HashSet<String>,
+) -> Result<(), String> {
+    let key = name.to_ascii_lowercase();
+    if visited.contains(&key) {
+        return Ok(());
+    }
+    if on_stack.contains(&key) {
+        return Err(format!("circular unit dependency: '{name}' uses itself"));
+    }
+    on_stack.insert(key.clone());
+
+    let path = find_unit_file(name, search_dirs)
+        .ok_or_else(|| format!("unit '{name}' not found on search path"))?;
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read unit '{name}' at {}: {e}", path.display()))?;
+    let mut parser = Parser::new(&source);
+    let unit = parser
+        .parse_unit()
+        .map_err(|e| format!("parse error in unit '{name}' ({}): {e}", path.display()))?;
+
+    if !unit.name.eq_ignore_ascii_case(name) {
+        return Err(format!(
+            "unit '{name}' at {} declares itself as '{}'",
+            path.display(),
+            unit.name
+        ));
+    }
+
+    for dep in unit.uses.clone() {
+        load_unit_recursive(&dep, search_dirs, loaded, visited, on_stack)?;
+    }
+
+    on_stack.remove(&key);
+    visited.insert(key);
+    loaded.push(unit);
+    Ok(())
+}
+
+fn find_unit_file(name: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in search_dirs {
+        let candidates = [
+            dir.join(format!("{name}.pas")),
+            dir.join(format!("{}.pas", name.to_ascii_lowercase())),
+            dir.join(format!("{}.pas", capitalize(name))),
+        ];
+        for c in candidates {
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn capitalize(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -1108,5 +1254,78 @@ end.
             out.contains("=== All features OK ==="),
             "missing final line: {out}"
         );
+    }
+
+    #[test]
+    fn uses_clause_imports_unit_const_and_function() {
+        // Build a small temp directory with a unit and a program that uses it.
+        let tmp = std::env::temp_dir().join("bruto_pascal_uses_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("MathUtils.pas"),
+            "unit MathUtils;\n\
+             interface\n\
+             const Pi = 3;\n\
+             function Square(x: integer): integer;\n\
+             implementation\n\
+             function Square(x: integer): integer;\n\
+             begin\n\
+               Square := x * x\n\
+             end;\n\
+             end.\n",
+        )
+        .unwrap();
+        let main_path = tmp.join("UsesMain.pas");
+        let main_source = "program UsesMain;\n\
+             uses MathUtils;\n\
+             var n: integer;\n\
+             begin\n\
+               n := Square(7);\n\
+               writeln('pi=', Pi, ' sq=', n)\n\
+             end.\n";
+        std::fs::write(&main_path, main_source).unwrap();
+
+        let lang = MiniPascal;
+        let result = lang
+            .build_job_at(main_source, Some(&main_path))
+            .as_mut()
+            .poll_to_done()
+            .expect("build failed");
+        let _ = std::fs::remove_file(&result.console_capture_path);
+        let status = std::process::Command::new(&result.exe_path)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run failed");
+        let captured = std::fs::read_to_string(&result.console_capture_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&result.exe_path);
+        let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
+        let _ = std::fs::remove_file(&result.console_capture_path);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(status.success(), "compiled program crashed");
+        assert!(
+            captured.contains("pi=3") && captured.contains("sq=49"),
+            "unexpected output: {captured}"
+        );
+    }
+}
+
+/// Test-only helper: drive a `BuildJob` to completion synchronously.
+#[cfg(test)]
+trait BuildJobExt {
+    fn poll_to_done(&mut self) -> Result<BuildResult, String>;
+}
+
+#[cfg(test)]
+impl BuildJobExt for dyn BuildJob {
+    fn poll_to_done(&mut self) -> Result<BuildResult, String> {
+        loop {
+            match self.poll() {
+                BuildPhase::Pending(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                BuildPhase::Done(r) => return Ok(r),
+                BuildPhase::Failed(e) => return Err(e),
+            }
+        }
     }
 }

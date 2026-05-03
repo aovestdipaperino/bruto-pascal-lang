@@ -15,16 +15,38 @@ impl Span {
     }
 }
 
-/// Top-level program: `program Name; [const ...] [type ...] [var ...] {proc|func} begin ... end.`
+/// Top-level program: `program Name; [uses ...;] [const ...] [type ...] [var ...] {proc|func} begin ... end.`
 #[derive(Debug, Clone)]
 pub struct Program {
     pub name: String,
+    pub uses: Vec<String>,
     pub labels: Vec<i64>,
     pub consts: Vec<ConstDecl>,
     pub type_decls: Vec<TypeDecl>,
     pub vars: Vec<VarDecl>,
     pub procedures: Vec<ProcDecl>,
     pub body: Block,
+    pub span: Span,
+}
+
+/// A unit module: `unit Name; interface ... implementation ... end.`
+///
+/// Interface decls are visible to anything that `uses` this unit;
+/// implementation decls are private to the unit's own bodies. We
+/// flatten both during compilation but keep the split for parsing.
+#[derive(Debug, Clone)]
+pub struct Unit {
+    pub name: String,
+    pub uses: Vec<String>,
+    pub interface_consts: Vec<ConstDecl>,
+    pub interface_types: Vec<TypeDecl>,
+    pub interface_vars: Vec<VarDecl>,
+    pub interface_proc_headers: Vec<ProcDecl>,
+    pub impl_consts: Vec<ConstDecl>,
+    pub impl_types: Vec<TypeDecl>,
+    pub impl_vars: Vec<VarDecl>,
+    pub procedures: Vec<ProcDecl>,
+    pub init: Option<Block>,
     pub span: Span,
 }
 

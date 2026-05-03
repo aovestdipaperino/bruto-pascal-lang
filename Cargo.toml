@@ -1,6 +1,6 @@
 [package]
 name = "bruto-pascal-lang"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["Enzo Lombardi <enzinol@gmail.com>"]
 repository = "https://github.com/aovestdipaperino/bruto-pascal-lang"
@@ -11,4 +11,4 @@ readme = "README.md"
 [dependencies]
 turbo-vision = { version = "1.2", git = "https://github.com/aovestdipaperino/turbo-vision-4-rust.git" }
 inkwell = { version = "0.8.0", features = ["llvm18-1"] }
-bruto-lang = { version = "1.0.0", git = "https://github.com/aovestdipaperino/bruto-lang.git" }
+bruto-lang = { version = "1.0.1", git = "https://github.com/aovestdipaperino/bruto-lang.git" }

@@ -4336,7 +4336,39 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn create_debug_type(&self, ty: &PascalType) -> Option<DIType<'ctx>> {
         match ty {
-            PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => self
+            PascalType::Enum { name, values } => {
+                // Emit DW_TAG_enumeration_type so lldb prints names rather
+                // than ordinals. Falls back to plain `long` if the inner
+                // basic type can't be created.
+                let inner = self
+                    .di_builder
+                    .create_basic_type("long", 64, 0x05, DIFlags::ZERO)
+                    .ok()?;
+                let enumerators: Vec<_> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        self.di_builder
+                            .create_enumerator(v, i as i64, false)
+                    })
+                    .collect();
+                let display_name = if name.is_empty() { "Enum" } else { name.as_str() };
+                Some(
+                    self.di_builder
+                        .create_enumeration_type(
+                            self.compile_unit.as_debug_info_scope(),
+                            display_name,
+                            self.compile_unit.get_file(),
+                            0,
+                            64,
+                            64,
+                            &enumerators,
+                            inner.as_type(),
+                        )
+                        .as_type(),
+                )
+            }
+            PascalType::Integer | PascalType::Subrange { .. } => self
                 .di_builder
                 .create_basic_type("long", 64, 0x05, DIFlags::ZERO)
                 .ok()
@@ -4382,13 +4414,146 @@ impl<'ctx> CodeGen<'ctx> {
                         .as_type(),
                 )
             }
+            PascalType::Record { fields, variant } => {
+                self.create_record_debug_type(fields, variant.as_deref())
+            }
             _ => {
-                // Arrays, records — use a generic opaque type
+                // Arrays, sets, etc. — opaque aggregate.
                 self.di_builder
                     .create_basic_type("aggregate", 64, 0x05, DIFlags::ZERO)
                     .ok()
                     .map(|t| t.as_type())
             }
+        }
+    }
+
+    /// Build a DICompositeType (struct) describing a record's layout. Fixed
+    /// fields go at sequential 8-byte offsets; the variant part — if any —
+    /// places every variant's fields starting at the same offset (the union
+    /// region). lldb will print all of them; the IDE's `format_with_meta`
+    /// then filters to the active variant based on the tag value.
+    fn create_record_debug_type(
+        &self,
+        fields: &[(String, PascalType)],
+        variant: Option<&RecordVariant>,
+    ) -> Option<DIType<'ctx>> {
+        let scope = self.compile_unit.as_debug_info_scope();
+        let file = self.compile_unit.get_file();
+        let mut members: Vec<DIType<'ctx>> = Vec::new();
+        let mut offset: u64 = 0;
+
+        for (name, ty) in fields {
+            let resolved = self.resolve_type(ty);
+            let mty = self.create_debug_type(&resolved)?;
+            let size = self.sizeof_type(&resolved) * 8;
+            members.push(
+                self.di_builder
+                    .create_member_type(
+                        scope, name, file, 0, size, 64, offset, DIFlags::ZERO, mty,
+                    )
+                    .as_type(),
+            );
+            offset += self.sizeof_type(&resolved) * 8;
+        }
+
+        if let Some(v) = variant {
+            // Tag field (named member, sequential).
+            let tag_resolved = self.resolve_type(&v.tag_type);
+            let tag_dt = self.create_debug_type(&tag_resolved)?;
+            let tag_size = self.sizeof_type(&tag_resolved) * 8;
+            members.push(
+                self.di_builder
+                    .create_member_type(
+                        scope,
+                        &v.tag_name,
+                        file,
+                        0,
+                        tag_size,
+                        64,
+                        offset,
+                        DIFlags::ZERO,
+                        tag_dt,
+                    )
+                    .as_type(),
+            );
+            offset += tag_size;
+
+            // Variant fields: all variants share the same starting offset
+            // (the union region). Sequential within a single variant.
+            for (_vals, vfields) in &v.variants {
+                let mut voffset = offset;
+                for (vname, vty) in vfields {
+                    let vresolved = self.resolve_type(vty);
+                    let vdt = self.create_debug_type(&vresolved)?;
+                    let vsize = self.sizeof_type(&vresolved) * 8;
+                    members.push(
+                        self.di_builder
+                            .create_member_type(
+                                scope,
+                                vname,
+                                file,
+                                0,
+                                vsize,
+                                64,
+                                voffset,
+                                DIFlags::ZERO,
+                                vdt,
+                            )
+                            .as_type(),
+                    );
+                    voffset += vsize;
+                }
+            }
+
+            // Total record size = fixed + tag + max variant size.
+            let max_variant_bits: u64 = v
+                .variants
+                .iter()
+                .map(|(_, vf)| {
+                    vf.iter()
+                        .map(|(_, t)| self.sizeof_type(&self.resolve_type(t)) * 8)
+                        .sum::<u64>()
+                })
+                .max()
+                .unwrap_or(0);
+            let total = offset + max_variant_bits;
+            Some(
+                self.di_builder
+                    .create_struct_type(
+                        scope,
+                        "record",
+                        file,
+                        0,
+                        total,
+                        64,
+                        DIFlags::ZERO,
+                        None,
+                        &members,
+                        0,
+                        None,
+                        "",
+                    )
+                    .as_type(),
+            )
+        } else {
+            Some(
+                self.di_builder
+                    .create_struct_type(
+                        scope,
+                        "record",
+                        file,
+                        0,
+                        offset,
+                        64,
+                        DIFlags::ZERO,
+                        None,
+                        &members,
+                        0,
+                        None,
+                        "",
+                    )
+                    .as_type(),
+            )
         }
     }
 
