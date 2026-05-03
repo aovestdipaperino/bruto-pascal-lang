@@ -46,7 +46,15 @@ impl Language for MiniPascal {
     }
 
     fn build(&self, source: &str) -> Result<BuildResult, String> {
-        let source_path = "/tmp/bruto_pascal_src.pas".to_string();
+        // Use the OS-appropriate temp dir so the same code path works
+        // on /tmp (Unix) and %TEMP% (Windows).
+        let tmp = std::env::temp_dir();
+        let source_path = tmp.join("bruto_pascal_src.pas").to_string_lossy().into_owned();
+        let exe_path = tmp
+            .join(if cfg!(windows) { "bruto_pascal_out.exe" } else { "bruto_pascal_out" })
+            .to_string_lossy()
+            .into_owned();
+
         std::fs::write(&source_path, source).map_err(|e| format!("Failed to write source: {e}"))?;
 
         let mut parser = Parser::new(source);
@@ -61,14 +69,13 @@ impl Language for MiniPascal {
             .compile(&program)
             .map_err(|e| format!("Codegen error: {e}"))?;
 
-        let exe_path = "/tmp/bruto_pascal_out".to_string();
         codegen.emit_executable(&exe_path)?;
         let _ = codegen.write_metadata(&exe_path);
 
         Ok(BuildResult {
             exe_path,
             source_path,
-            console_capture_path: "/tmp/turbo_pascal_console.txt".to_string(),
+            console_capture_path: bruto_lang::target::console_capture_path(),
         })
     }
 }
@@ -250,7 +257,7 @@ mod tests {
     fn build_and_run_source(source: &str) -> (bool, String) {
         let lang = MiniPascal;
         let result = lang.build(source).expect("build failed");
-        let _ = std::fs::remove_file("/tmp/turbo_pascal_console.txt");
+        let _ = std::fs::remove_file(&result.console_capture_path);
         let status = std::process::Command::new(&result.exe_path)
             .stdout(std::process::Stdio::null())
             .status()

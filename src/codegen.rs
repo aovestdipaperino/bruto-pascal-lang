@@ -394,9 +394,10 @@ impl<'ctx> CodeGen<'ctx> {
     fn emit_capture_file_init(&mut self, span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let func = self.module.get_function("bruto_capture_open").unwrap();
+        let capture = bruto_lang::target::console_capture_path();
         let path = self
             .builder
-            .build_global_string_ptr("/tmp/turbo_pascal_console.txt", "capture_path")
+            .build_global_string_ptr(&capture, "capture_path")
             .map_err(|e| CodeGenError::new(e.to_string(), None))?;
         self.builder
             .build_call(func, &[path.as_pointer_value().into()], "")
@@ -5686,16 +5687,16 @@ mod tests {
         codegen.emit_executable(exe_path).expect("emit failed");
 
         // Verify the executable runs and outputs 42 (to capture file)
-        let _ = std::fs::remove_file("/tmp/turbo_pascal_console.txt");
+        let _ = std::fs::remove_file(&bruto_lang::target::console_capture_path());
         let status = std::process::Command::new(exe_path)
             .stdout(std::process::Stdio::null())
             .status()
             .expect("run failed");
         assert!(status.success(), "non-zero exit");
         let captured =
-            std::fs::read_to_string("/tmp/turbo_pascal_console.txt").expect("capture file missing");
+            std::fs::read_to_string(&bruto_lang::target::console_capture_path()).expect("capture file missing");
         assert_eq!(captured.trim(), "42", "expected 42, got: {captured:?}");
-        let _ = std::fs::remove_file("/tmp/turbo_pascal_console.txt");
+        let _ = std::fs::remove_file(&bruto_lang::target::console_capture_path());
 
         // Verify debug info exists (dwarfdump should find compilation unit)
         let dwarf = std::process::Command::new("dwarfdump")
@@ -5779,35 +5780,38 @@ mod tests {
     #[test]
     fn program_output_goes_to_capture_file() {
         let source = "program Cap;\nbegin\n  writeln('hello capture')\nend.\n";
-        let source_path = "/tmp/test_capture.pas";
-        std::fs::write(source_path, source).unwrap();
+        let tmp = std::env::temp_dir();
+        let source_path_buf = tmp.join("test_capture.pas");
+        let source_path = source_path_buf.to_string_lossy();
+        std::fs::write(source_path.as_ref(), source).unwrap();
 
         let mut parser = Parser::new(source);
         let program = parser.parse_program().unwrap();
         let context = Context::create();
-        let mut codegen = CodeGen::new(&context, source_path);
+        let mut codegen = CodeGen::new(&context, source_path.as_ref());
         codegen.compile(&program).unwrap();
 
-        let exe_path = "/tmp/test_capture_out";
-        codegen.emit_executable(exe_path).unwrap();
+        let exe_path_buf = tmp.join(if cfg!(windows) { "test_capture_out.exe" } else { "test_capture_out" });
+        let exe_path = exe_path_buf.to_string_lossy();
+        codegen.emit_executable(exe_path.as_ref()).unwrap();
 
-        let _ = std::fs::remove_file("/tmp/turbo_pascal_console.txt");
-        let status = std::process::Command::new(exe_path)
+        let _ = std::fs::remove_file(&bruto_lang::target::console_capture_path());
+        let status = std::process::Command::new(exe_path.as_ref())
             .stdout(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(status.success());
 
-        let captured = std::fs::read_to_string("/tmp/turbo_pascal_console.txt").unwrap();
+        let captured = std::fs::read_to_string(&bruto_lang::target::console_capture_path()).unwrap();
         assert_eq!(
             captured.trim(),
             "hello capture",
             "capture file: {captured:?}"
         );
 
-        let _ = std::fs::remove_file(exe_path);
+        let _ = std::fs::remove_file(exe_path.as_ref());
         let _ = std::fs::remove_dir_all(format!("{exe_path}.dSYM"));
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file("/tmp/turbo_pascal_console.txt");
+        let _ = std::fs::remove_file(source_path.as_ref());
+        let _ = std::fs::remove_file(&bruto_lang::target::console_capture_path());
     }
 }
