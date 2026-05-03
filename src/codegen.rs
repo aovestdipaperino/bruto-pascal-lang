@@ -2,22 +2,21 @@
 ///
 /// Uses inkwell to generate LLVM IR, emit object files, and link with the system linker.
 /// Every statement is annotated with source locations for breakpoint support.
-
 use crate::ast::*;
+use inkwell::AddressSpace;
+use inkwell::OptimizationLevel;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
+use inkwell::debug_info::{
+    AsDIScope, DICompileUnit, DIFile, DIFlags, DIFlagsConstants, DIScope, DISubprogram, DIType,
+    DWARFEmissionKind, DWARFSourceLanguage, DebugInfoBuilder,
+};
 use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::BasicType;
 use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue};
-use inkwell::AddressSpace;
-use inkwell::OptimizationLevel;
-use inkwell::debug_info::{
-    AsDIScope, DICompileUnit, DIFile, DIFlags, DIFlagsConstants, DIScope, DISubprogram,
-    DIType, DWARFEmissionKind, DWARFSourceLanguage, DebugInfoBuilder,
-};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -40,7 +39,10 @@ impl fmt::Display for CodeGenError {
 
 impl CodeGenError {
     fn new(message: impl Into<String>, span: Option<Span>) -> Self {
-        Self { message: message.into(), span }
+        Self {
+            message: message.into(),
+            span,
+        }
     }
 }
 
@@ -59,7 +61,10 @@ pub struct CodeGen<'ctx> {
     var_types: HashMap<String, PascalType>,
 
     // Saved global scope (restored after compiling a procedure)
-    saved_scopes: Vec<(HashMap<String, PointerValue<'ctx>>, HashMap<String, PascalType>)>,
+    saved_scopes: Vec<(
+        HashMap<String, PointerValue<'ctx>>,
+        HashMap<String, PascalType>,
+    )>,
 
     // Type aliases (from `type` section)
     type_defs: HashMap<String, PascalType>,
@@ -100,7 +105,10 @@ impl<'ctx> CodeGen<'ctx> {
         let builder = context.create_builder();
 
         let path = Path::new(source_path);
-        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("untitled.pas");
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("untitled.pas");
         let directory = path.parent().and_then(|p| p.to_str()).unwrap_or(".");
 
         let (di_builder, compile_unit) = module.create_debug_info_builder(
@@ -169,10 +177,15 @@ impl<'ctx> CodeGen<'ctx> {
         let main_fn = self.module.add_function("main", main_fn_type, None);
 
         // Debug info for main
-        let di_i64 = self.di_builder.create_basic_type(
-            "integer", 64, 0x05, // DW_ATE_signed
-            DIFlags::ZERO,
-        ).unwrap();
+        let di_i64 = self
+            .di_builder
+            .create_basic_type(
+                "integer",
+                64,
+                0x05, // DW_ATE_signed
+                DIFlags::ZERO,
+            )
+            .unwrap();
 
         let di_main_type = self.di_builder.create_subroutine_type(
             self.di_file,
@@ -204,7 +217,9 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Pre-create basic blocks for all declared labels
         for &label in &program.labels {
-            let bb = self.context.append_basic_block(main_fn, &format!("label_{label}"));
+            let bb = self
+                .context
+                .append_basic_block(main_fn, &format!("label_{label}"));
             self.label_blocks.insert(label, bb);
         }
 
@@ -215,7 +230,8 @@ impl<'ctx> CodeGen<'ctx> {
                 for (i, val) in values.iter().enumerate() {
                     self.enum_values.insert(val.clone(), i as i64);
                 }
-                self.enum_type_values.insert(td.name.clone(), values.clone());
+                self.enum_type_values
+                    .insert(td.name.clone(), values.clone());
             }
         }
 
@@ -232,8 +248,12 @@ impl<'ctx> CodeGen<'ctx> {
         // Install signal handler to catch stack overflow / segfaults.
         self.set_debug_loc(program.span);
         {
-            let f = self.module.get_function("bruto_install_stack_guard").unwrap();
-            self.builder.build_call(f, &[], "")
+            let f = self
+                .module
+                .get_function("bruto_install_stack_guard")
+                .unwrap();
+            self.builder
+                .build_call(f, &[], "")
                 .map_err(|e| CodeGenError::new(e.to_string(), None))?;
         }
 
@@ -263,14 +283,18 @@ impl<'ctx> CodeGen<'ctx> {
         // stop frame and issues `continue`, so the process still exits
         // cleanly without the user pressing F8 over and over.
         self.set_debug_loc(program.body.end_span);
-        self.builder.build_return(Some(&self.context.i64_type().const_int(0, false)))
+        self.builder
+            .build_return(Some(&self.context.i64_type().const_int(0, false)))
             .map_err(|e| CodeGenError::new(e.to_string(), None))?;
 
         self.di_builder.finalize();
 
         // Verify module
         if let Err(msg) = self.module.verify() {
-            return Err(CodeGenError::new(format!("LLVM module verification failed: {}", msg.to_string()), None));
+            return Err(CodeGenError::new(
+                format!("LLVM module verification failed: {}", msg.to_string()),
+                None,
+            ));
         }
 
         Ok(())
@@ -278,8 +302,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Write object file and link to executable.
     pub fn emit_executable(&self, output_path: &str) -> Result<(), String> {
-        Target::initialize_native(&InitializationConfig::default())
-            .map_err(|e| e.to_string())?;
+        Target::initialize_native(&InitializationConfig::default()).map_err(|e| e.to_string())?;
 
         let triple = TargetMachine::get_default_triple();
         let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
@@ -349,10 +372,12 @@ impl<'ctx> CodeGen<'ctx> {
     fn emit_capture_file_init(&mut self, span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let func = self.module.get_function("bruto_capture_open").unwrap();
-        let path = self.builder.build_global_string_ptr(
-            "/tmp/turbo_pascal_console.txt", "capture_path",
-        ).map_err(|e| CodeGenError::new(e.to_string(), None))?;
-        self.builder.build_call(func, &[path.as_pointer_value().into()], "")
+        let path = self
+            .builder
+            .build_global_string_ptr("/tmp/turbo_pascal_console.txt", "capture_path")
+            .map_err(|e| CodeGenError::new(e.to_string(), None))?;
+        self.builder
+            .build_call(func, &[path.as_pointer_value().into()], "")
             .map_err(|e| CodeGenError::new(e.to_string(), None))?;
         Ok(())
     }
@@ -375,17 +400,31 @@ impl<'ctx> CodeGen<'ctx> {
 
         for (var_name, sym) in &[("input", "__stdinp"), ("output", "__stdoutp")] {
             let g = get_or_decl(sym);
-            let fp = self.builder.build_load(ptr_ty, g.as_pointer_value(), "predef_fp")
+            let fp = self
+                .builder
+                .build_load(ptr_ty, g.as_pointer_value(), "predef_fp")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            let s = self.builder.build_call(make_fn, &[fp.into()], "predef_s")
+            let s = self
+                .builder
+                .build_call(make_fn, &[fp.into()], "predef_s")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                .try_as_basic_value().basic().unwrap();
-            let alloca = self.builder.build_alloca(ptr_ty, var_name)
+                .try_as_basic_value()
+                .basic()
+                .unwrap();
+            let alloca = self
+                .builder
+                .build_alloca(ptr_ty, var_name)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            self.builder.build_store(alloca, s)
+            self.builder
+                .build_store(alloca, s)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             self.variables.insert(var_name.to_string(), alloca);
-            self.var_types.insert(var_name.to_string(), PascalType::File { elem: Box::new(PascalType::Char) });
+            self.var_types.insert(
+                var_name.to_string(),
+                PascalType::File {
+                    elem: Box::new(PascalType::Char),
+                },
+            );
         }
         Ok(())
     }
@@ -405,45 +444,63 @@ impl<'ctx> CodeGen<'ctx> {
 
     // ── variable declarations ────────────────────────────
 
-    fn compile_var_decl(&mut self, decl: &VarDecl, di_sub: DISubprogram<'ctx>) -> Result<(), CodeGenError> {
+    fn compile_var_decl(
+        &mut self,
+        decl: &VarDecl,
+        di_sub: DISubprogram<'ctx>,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(decl.span);
         let resolved_ty = self.resolve_type(&decl.ty);
 
         for name in &decl.names {
             let llvm_ty = self.llvm_type_for(&resolved_ty);
-            let alloca = self.builder.build_alloca(llvm_ty, name)
+            let alloca = self
+                .builder
+                .build_alloca(llvm_ty, name)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
 
             // Initialize scalar types to zero
             match &resolved_ty {
                 PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
-                    self.builder.build_store(alloca, self.context.i64_type().const_int(0, false))
+                    self.builder
+                        .build_store(alloca, self.context.i64_type().const_int(0, false))
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::Real => {
-                    self.builder.build_store(alloca, self.context.f64_type().const_float(0.0))
+                    self.builder
+                        .build_store(alloca, self.context.f64_type().const_float(0.0))
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::Boolean => {
-                    self.builder.build_store(alloca, self.context.bool_type().const_int(0, false))
+                    self.builder
+                        .build_store(alloca, self.context.bool_type().const_int(0, false))
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::Char => {
-                    self.builder.build_store(alloca, self.context.i8_type().const_int(0, false))
+                    self.builder
+                        .build_store(alloca, self.context.i8_type().const_int(0, false))
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::String => {
-                    let empty = self.builder.build_global_string_ptr("", "empty_str")
+                    let empty = self
+                        .builder
+                        .build_global_string_ptr("", "empty_str")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
-                    self.builder.build_store(alloca, empty.as_pointer_value())
+                    self.builder
+                        .build_store(alloca, empty.as_pointer_value())
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::Pointer(_) | PascalType::File { .. } | PascalType::Proc { .. } => {
                     let ptr_type = self.context.ptr_type(AddressSpace::default());
-                    self.builder.build_store(alloca, ptr_type.const_null())
+                    self.builder
+                        .build_store(alloca, ptr_type.const_null())
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
-                PascalType::Array { .. } | PascalType::Record { .. } | PascalType::Set { .. } | PascalType::Named(_) | PascalType::ConformantArray { .. } => {
+                PascalType::Array { .. }
+                | PascalType::Record { .. }
+                | PascalType::Set { .. }
+                | PascalType::Named(_)
+                | PascalType::ConformantArray { .. } => {
                     // Aggregate types: zero-initialized by alloca (no explicit store needed).
                 }
             }
@@ -497,16 +554,23 @@ impl<'ctx> CodeGen<'ctx> {
             }
             PascalType::Set { .. } => format!("{name}|set|"),
             PascalType::Record { fields, variant } => {
-                let mut parts: Vec<String> = fields.iter()
-                    .map(|(n, t)| format!("{n}={}", type_short(t))).collect();
+                let mut parts: Vec<String> = fields
+                    .iter()
+                    .map(|(n, t)| format!("{n}={}", type_short(t)))
+                    .collect();
                 if let Some(v) = variant {
                     parts.push(format!("__tag={}", v.tag_name));
                     for (vals, vfields) in &v.variants {
                         let val_str: Vec<String> = vals.iter().map(|v| v.to_string()).collect();
-                        let f_str: Vec<String> = vfields.iter().map(|(n, t)| format!("{n}={}", type_short(t))).collect();
+                        let f_str: Vec<String> = vfields
+                            .iter()
+                            .map(|(n, t)| format!("{n}={}", type_short(t)))
+                            .collect();
                         parts.push(format!("__case[{}]={}", val_str.join(","), f_str.join(",")));
                     }
-                    return self.metadata_lines.push(format!("{name}|vrec|{}", parts.join(";")));
+                    return self
+                        .metadata_lines
+                        .push(format!("{name}|vrec|{}", parts.join(";")));
                 }
                 format!("{name}|rec|{}", parts.join(";"))
             }
@@ -515,7 +579,11 @@ impl<'ctx> CodeGen<'ctx> {
         self.metadata_lines.push(line);
     }
 
-    fn compile_const_decl(&mut self, c: &ConstDecl, di_sub: DISubprogram<'ctx>) -> Result<(), CodeGenError> {
+    fn compile_const_decl(
+        &mut self,
+        c: &ConstDecl,
+        di_sub: DISubprogram<'ctx>,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(c.span);
         let val = self.compile_expr(&c.value)?;
         // Use declared type if provided, else infer from initializer.
@@ -525,16 +593,25 @@ impl<'ctx> CodeGen<'ctx> {
             self.infer_expr_type(&c.value)
         };
         let llvm_ty = self.llvm_type_for(&ty);
-        let alloca = self.builder.build_alloca(llvm_ty, &c.name)
+        let alloca = self
+            .builder
+            .build_alloca(llvm_ty, &c.name)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?;
         // If declared real but initializer is integer literal, promote.
         let store_val = if matches!(ty, PascalType::Real) && val.is_int_value() {
-            self.builder.build_signed_int_to_float(val.into_int_value(), self.context.f64_type(), "const_itof")
-                .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?.into()
+            self.builder
+                .build_signed_int_to_float(
+                    val.into_int_value(),
+                    self.context.f64_type(),
+                    "const_itof",
+                )
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?
+                .into()
         } else {
             val
         };
-        self.builder.build_store(alloca, store_val)
+        self.builder
+            .build_store(alloca, store_val)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?;
         self.variables.insert(c.name.clone(), alloca);
         self.var_types.insert(c.name.clone(), ty);
@@ -548,7 +625,11 @@ impl<'ctx> CodeGen<'ctx> {
         let mut param_info: Vec<(String, ParamMode, PascalType)> = Vec::new();
 
         // Captures (only set if this proc is currently registered as nested)
-        let captures = self.proc_captures.get(&proc.name).cloned().unwrap_or_default();
+        let captures = self
+            .proc_captures
+            .get(&proc.name)
+            .cloned()
+            .unwrap_or_default();
         for (cname, cty) in &captures {
             // Each capture is passed as a pointer (var-by-ref).
             param_llvm_types.push(self.context.ptr_type(AddressSpace::default()).into());
@@ -559,7 +640,10 @@ impl<'ctx> CodeGen<'ctx> {
             let resolved_group_ty = self.resolve_type(&group.ty);
             for name in &group.names {
                 // Conformant array parameter: emit ptr + i64 lo + i64 hi.
-                if let PascalType::ConformantArray { lo_name, hi_name, .. } = &resolved_group_ty {
+                if let PascalType::ConformantArray {
+                    lo_name, hi_name, ..
+                } = &resolved_group_ty
+                {
                     param_llvm_types.push(self.context.ptr_type(AddressSpace::default()).into());
                     param_llvm_types.push(self.context.i64_type().into());
                     param_llvm_types.push(self.context.i64_type().into());
@@ -593,8 +677,10 @@ impl<'ctx> CodeGen<'ctx> {
         };
 
         // Store metadata
-        self.proc_return_types.insert(proc.name.clone(), proc.return_type.clone());
-        self.proc_param_modes.insert(proc.name.clone(), param_info.clone());
+        self.proc_return_types
+            .insert(proc.name.clone(), proc.return_type.clone());
+        self.proc_param_modes
+            .insert(proc.name.clone(), param_info.clone());
 
         // Forward declaration: empty body means just register the prototype
         if proc.body.statements.is_empty() {
@@ -602,7 +688,10 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         // Debug info
-        let di_i64 = self.di_builder.create_basic_type("integer", 64, 0x05, DIFlags::ZERO).unwrap();
+        let di_i64 = self
+            .di_builder
+            .create_basic_type("integer", 64, 0x05, DIFlags::ZERO)
+            .unwrap();
         let di_fn_type = self.di_builder.create_subroutine_type(
             self.di_file,
             proc.return_type.as_ref().map(|_| di_i64.as_type()),
@@ -645,14 +734,18 @@ impl<'ctx> CodeGen<'ctx> {
             if *mode == ParamMode::Var {
                 // var param: the parameter IS a pointer to the caller's variable.
                 // Use it directly as the alloca — loads/stores go through to the caller.
-                self.variables.insert(name.clone(), param_val.into_pointer_value());
+                self.variables
+                    .insert(name.clone(), param_val.into_pointer_value());
                 self.var_types.insert(name.clone(), resolved_ty);
             } else {
                 // value param: copy into alloca
                 let llvm_ty = self.llvm_type_for(&resolved_ty);
-                let alloca = self.builder.build_alloca(llvm_ty, name)
+                let alloca = self
+                    .builder
+                    .build_alloca(llvm_ty, name)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
-                self.builder.build_store(alloca, param_val)
+                self.builder
+                    .build_store(alloca, param_val)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
                 self.variables.insert(name.clone(), alloca);
                 self.var_types.insert(name.clone(), resolved_ty);
@@ -662,17 +755,26 @@ impl<'ctx> CodeGen<'ctx> {
         // Function result variable (Pascal assigns to function name)
         if let Some(ref ret_ty) = proc.return_type {
             let llvm_ty = self.llvm_type_for(ret_ty);
-            let alloca = self.builder.build_alloca(llvm_ty, &proc.name)
+            let alloca = self
+                .builder
+                .build_alloca(llvm_ty, &proc.name)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
             // Initialize to zero
             let zero: BasicValueEnum = match ret_ty {
-                PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => self.context.i64_type().const_int(0, false).into(),
+                PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
+                    self.context.i64_type().const_int(0, false).into()
+                }
                 PascalType::Real => self.context.f64_type().const_float(0.0).into(),
                 PascalType::Boolean => self.context.bool_type().const_int(0, false).into(),
                 PascalType::Char => self.context.i8_type().const_int(0, false).into(),
-                _ => self.context.ptr_type(AddressSpace::default()).const_null().into(),
+                _ => self
+                    .context
+                    .ptr_type(AddressSpace::default())
+                    .const_null()
+                    .into(),
             };
-            self.builder.build_store(alloca, zero)
+            self.builder
+                .build_store(alloca, zero)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
             self.variables.insert(proc.name.clone(), alloca);
             self.var_types.insert(proc.name.clone(), ret_ty.clone());
@@ -689,19 +791,30 @@ impl<'ctx> CodeGen<'ctx> {
         // Save current builder position so we can restore after compiling nested procs.
         let saved_block = self.builder.get_insert_block();
         for nested in &proc.nested_procs {
-            let mut nested_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut nested_locals: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for grp in &nested.params {
-                for n in &grp.names { nested_locals.insert(n.clone()); }
+                for n in &grp.names {
+                    nested_locals.insert(n.clone());
+                }
             }
             for vd in &nested.vars {
-                for n in &vd.names { nested_locals.insert(n.clone()); }
+                for n in &vd.names {
+                    nested_locals.insert(n.clone());
+                }
             }
             // The nested proc's name is its own result variable (if function).
             nested_locals.insert(nested.name.clone());
 
             let mut found: Vec<(String, PascalType)> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            collect_captures(&nested.body, &nested_locals, &self.var_types, &mut found, &mut seen);
+            collect_captures(
+                &nested.body,
+                &nested_locals,
+                &self.var_types,
+                &mut found,
+                &mut seen,
+            );
             self.proc_captures.insert(nested.name.clone(), found);
         }
 
@@ -722,12 +835,16 @@ impl<'ctx> CodeGen<'ctx> {
         if let Some(ref ret_ty) = proc.return_type {
             let llvm_ty = self.llvm_type_for(ret_ty);
             let alloca = *self.variables.get(&proc.name).unwrap();
-            let ret_val = self.builder.build_load(llvm_ty, alloca, "retval")
+            let ret_val = self
+                .builder
+                .build_load(llvm_ty, alloca, "retval")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
-            self.builder.build_return(Some(&ret_val))
+            self.builder
+                .build_return(Some(&ret_val))
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
         } else {
-            self.builder.build_return(None)
+            self.builder
+                .build_return(None)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
         }
 
@@ -751,7 +868,9 @@ impl<'ctx> CodeGen<'ctx> {
         // set there. We use a trivial load of 0 that the optimizer can remove
         // but that gives lldb a line to stop on.
         self.set_debug_loc(block.end_span);
-        let _ = self.builder.build_alloca(self.context.i64_type(), "_end_bp")
+        let _ = self
+            .builder
+            .build_alloca(self.context.i64_type(), "_end_bp")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(block.end_span)))?;
         Ok(())
     }
@@ -761,19 +880,24 @@ impl<'ctx> CodeGen<'ctx> {
             Statement::Assignment { target, expr, span } => {
                 self.set_debug_loc(*span);
                 let val = self.compile_expr(expr)?;
-                let alloca = *self.variables.get(target.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(*span)))?;
-                self.builder.build_store(alloca, val)
+                let alloca = *self.variables.get(target.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
+                })?;
+                self.builder
+                    .build_store(alloca, val)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(())
             }
             Statement::DerefAssignment { target, expr, span } => {
                 self.set_debug_loc(*span);
                 let val = self.compile_expr(expr)?;
-                let alloca = *self.variables.get(target.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(*span)))?;
+                let alloca = *self.variables.get(target.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
+                })?;
                 let ptr_type = self.context.ptr_type(AddressSpace::default());
-                let ptr_val = self.builder.build_load(ptr_type, alloca, "ptr_val")
+                let ptr_val = self
+                    .builder
+                    .build_load(ptr_type, alloca, "ptr_val")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 // File buffer variable: `f^ := x`
                 if let Some(t) = self.var_types.get(target.as_str()).cloned() {
@@ -783,59 +907,101 @@ impl<'ctx> CodeGen<'ctx> {
                             if iv.get_type().get_bit_width() == 8 {
                                 iv
                             } else {
-                                self.builder.build_int_truncate(iv, self.context.i8_type(), "fbufc")
+                                self.builder
+                                    .build_int_truncate(iv, self.context.i8_type(), "fbufc")
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                             }
                         } else {
-                            return Err(CodeGenError::new("file buffer assignment expects char/int value", Some(*span)));
+                            return Err(CodeGenError::new(
+                                "file buffer assignment expects char/int value",
+                                Some(*span),
+                            ));
                         };
                         let f = self.module.get_function("bruto_file_buf_store").unwrap();
-                        self.builder.build_call(f, &[ptr_val.into(), ch.into()], "")
+                        self.builder
+                            .build_call(f, &[ptr_val.into(), ch.into()], "")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                         return Ok(());
                     }
                 }
-                self.builder.build_store(ptr_val.into_pointer_value(), val)
+                self.builder
+                    .build_store(ptr_val.into_pointer_value(), val)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(())
             }
-            Statement::If { condition, then_branch, else_branch, span } => {
-                self.compile_if(condition, then_branch, else_branch.as_ref(), *span)
-            }
-            Statement::While { condition, body, span } => {
-                self.compile_while(condition, body, *span)
-            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                span,
+            } => self.compile_if(condition, then_branch, else_branch.as_ref(), *span),
+            Statement::While {
+                condition,
+                body,
+                span,
+            } => self.compile_while(condition, body, *span),
             Statement::WriteLn { args, span } => self.compile_write(args, true, *span),
             Statement::Write { args, span } => self.compile_write(args, false, *span),
-            Statement::For { var, from, to, downto, body, span } => {
-                self.compile_for(var, from, to, *downto, body, *span)
-            }
-            Statement::RepeatUntil { body, condition, span } => {
-                self.compile_repeat_until(body, condition, *span)
-            }
+            Statement::For {
+                var,
+                from,
+                to,
+                downto,
+                body,
+                span,
+            } => self.compile_for(var, from, to, *downto, body, *span),
+            Statement::RepeatUntil {
+                body,
+                condition,
+                span,
+            } => self.compile_repeat_until(body, condition, *span),
             Statement::ReadLn { targets, span } => self.compile_readln(targets, *span),
             Statement::Block(block) => self.compile_block(block),
-            Statement::IndexAssignment { target, index, expr, span } => {
+            Statement::IndexAssignment {
+                target,
+                index,
+                expr,
+                span,
+            } => {
                 self.set_debug_loc(*span);
                 let idx_val = self.compile_expr(index)?;
                 let val = self.compile_expr(expr)?;
-                let alloca = *self.variables.get(target.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(*span)))?;
-                let var_type = self.var_types.get(target.as_str()).cloned()
-                    .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(*span)))?;
+                let alloca = *self.variables.get(target.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
+                })?;
+                let var_type = self
+                    .var_types
+                    .get(target.as_str())
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodeGenError::new(format!("unknown type for '{target}'"), Some(*span))
+                    })?;
                 let resolved = self.resolve_type(&var_type);
-                let (gep, _) = self.gep_array_elem(alloca, &resolved, idx_val.into_int_value(), *span)?;
-                self.builder.build_store(gep, val)
+                let (gep, _) =
+                    self.gep_array_elem(alloca, &resolved, idx_val.into_int_value(), *span)?;
+                self.builder
+                    .build_store(gep, val)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(())
             }
-            Statement::MultiIndexAssignment { target, indices, expr, span } => {
+            Statement::MultiIndexAssignment {
+                target,
+                indices,
+                expr,
+                span,
+            } => {
                 self.set_debug_loc(*span);
                 let val = self.compile_expr(expr)?;
-                let alloca = *self.variables.get(target.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(*span)))?;
-                let var_type = self.var_types.get(target.as_str()).cloned()
-                    .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(*span)))?;
+                let alloca = *self.variables.get(target.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
+                })?;
+                let var_type = self
+                    .var_types
+                    .get(target.as_str())
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodeGenError::new(format!("unknown type for '{target}'"), Some(*span))
+                    })?;
 
                 let mut current_ptr = alloca;
                 let mut current_type = var_type;
@@ -843,21 +1009,35 @@ impl<'ctx> CodeGen<'ctx> {
                     let idx_val = self.compile_expr(index_expr)?;
                     let (lo, hi, elem_ty) = match &current_type {
                         PascalType::Array { lo, hi, elem, .. } => (*lo, *hi, elem.as_ref().clone()),
-                        _ => return Err(CodeGenError::new(format!("too many indices for '{target}'"), Some(*span))),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                format!("too many indices for '{target}'"),
+                                Some(*span),
+                            ));
+                        }
                     };
                     self.emit_range_check(idx_val.into_int_value(), lo, hi, *span)?;
-                    let adj = self.builder.build_int_sub(
-                        idx_val.into_int_value(),
-                        self.context.i64_type().const_int(lo as u64, true), "adj_idx",
-                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let adj = self
+                        .builder
+                        .build_int_sub(
+                            idx_val.into_int_value(),
+                            self.context.i64_type().const_int(lo as u64, true),
+                            "adj_idx",
+                        )
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     let gep = unsafe {
-                        self.builder.build_in_bounds_gep(
-                            self.llvm_type_for(&current_type), current_ptr,
-                            &[self.context.i64_type().const_int(0, false), adj], "multi_gep",
-                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        self.builder
+                            .build_in_bounds_gep(
+                                self.llvm_type_for(&current_type),
+                                current_ptr,
+                                &[self.context.i64_type().const_int(0, false), adj],
+                                "multi_gep",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                     };
                     if dim == indices.len() - 1 {
-                        self.builder.build_store(gep, val)
+                        self.builder
+                            .build_store(gep, val)
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     } else {
                         current_ptr = gep;
@@ -866,65 +1046,108 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(())
             }
-            Statement::FieldAssignment { target, field, expr, span } => {
+            Statement::FieldAssignment {
+                target,
+                field,
+                expr,
+                span,
+            } => {
                 self.set_debug_loc(*span);
                 let val = self.compile_expr(expr)?;
-                let alloca = *self.variables.get(target.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(*span)))?;
-                let var_type = self.var_types.get(target.as_str()).cloned()
-                    .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(*span)))?;
+                let alloca = *self.variables.get(target.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
+                })?;
+                let var_type = self
+                    .var_types
+                    .get(target.as_str())
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodeGenError::new(format!("unknown type for '{target}'"), Some(*span))
+                    })?;
                 let resolved = self.resolve_type(&var_type);
                 match &resolved {
                     PascalType::Record { fields, variant } => {
                         // Check fixed fields first
                         if let Some(idx) = fields.iter().position(|(n, _)| n == field) {
-                            let gep = self.builder.build_struct_gep(
-                                self.llvm_type_for(&resolved),
-                                alloca,
-                                idx as u32,
-                                "field_gep",
-                            ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                            self.builder.build_store(gep, val)
+                            let gep = self
+                                .builder
+                                .build_struct_gep(
+                                    self.llvm_type_for(&resolved),
+                                    alloca,
+                                    idx as u32,
+                                    "field_gep",
+                                )
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                            self.builder
+                                .build_store(gep, val)
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                         } else if let Some(v) = variant {
                             if field == &v.tag_name {
                                 // Tag field: index = fields.len()
-                                let gep = self.builder.build_struct_gep(
-                                    self.llvm_type_for(&resolved),
-                                    alloca,
-                                    fields.len() as u32,
-                                    "tag_gep",
-                                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                                self.builder.build_store(gep, val)
+                                let gep = self
+                                    .builder
+                                    .build_struct_gep(
+                                        self.llvm_type_for(&resolved),
+                                        alloca,
+                                        fields.len() as u32,
+                                        "tag_gep",
+                                    )
+                                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                self.builder
+                                    .build_store(gep, val)
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                             } else {
                                 // Search variant fields
-                                let (byte_offset, _field_ty) = self.find_variant_field(v, field)
-                                    .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(*span)))?;
+                                let (byte_offset, _field_ty) =
+                                    self.find_variant_field(v, field).ok_or_else(|| {
+                                        CodeGenError::new(
+                                            format!("no field '{field}' in record"),
+                                            Some(*span),
+                                        )
+                                    })?;
                                 // GEP to union array (index = fields.len() + 1)
-                                let union_gep = self.builder.build_struct_gep(
-                                    self.llvm_type_for(&resolved),
-                                    alloca,
-                                    (fields.len() + 1) as u32,
-                                    "union_gep",
-                                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                let union_gep = self
+                                    .builder
+                                    .build_struct_gep(
+                                        self.llvm_type_for(&resolved),
+                                        alloca,
+                                        (fields.len() + 1) as u32,
+                                        "union_gep",
+                                    )
+                                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                                 // Byte-offset into the union array
                                 let byte_gep = unsafe {
-                                    self.builder.build_in_bounds_gep(
-                                        self.context.i8_type(),
-                                        union_gep,
-                                        &[self.context.i64_type().const_int(byte_offset, false)],
-                                        "vfield_ptr",
-                                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                                    self.builder
+                                        .build_in_bounds_gep(
+                                            self.context.i8_type(),
+                                            union_gep,
+                                            &[self
+                                                .context
+                                                .i64_type()
+                                                .const_int(byte_offset, false)],
+                                            "vfield_ptr",
+                                        )
+                                        .map_err(|e| {
+                                            CodeGenError::new(e.to_string(), Some(*span))
+                                        })?
                                 };
-                                self.builder.build_store(byte_gep, val)
+                                self.builder
+                                    .build_store(byte_gep, val)
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                             }
                         } else {
-                            return Err(CodeGenError::new(format!("no field '{field}' in record"), Some(*span)));
+                            return Err(CodeGenError::new(
+                                format!("no field '{field}' in record"),
+                                Some(*span),
+                            ));
                         }
                     }
-                    _ => return Err(CodeGenError::new(format!("'{target}' is not a record"), Some(*span))),
+                    _ => {
+                        return Err(CodeGenError::new(
+                            format!("'{target}' is not a record"),
+                            Some(*span),
+                        ));
+                    }
                 };
                 Ok(())
             }
@@ -986,16 +1209,31 @@ impl<'ctx> CodeGen<'ctx> {
                     self.set_debug_loc(*span);
                     let f_name = match &args[0] {
                         Expr::Var(n, _) => n.clone(),
-                        _ => return Err(CodeGenError::new("page requires a file variable", Some(*span))),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                "page requires a file variable",
+                                Some(*span),
+                            ));
+                        }
                     };
                     let alloca = *self.variables.get(f_name.as_str()).unwrap();
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let s = self.builder.build_load(ptr_ty, alloca, "fs")
+                    let s = self
+                        .builder
+                        .build_load(ptr_ty, alloca, "fs")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                         .into_pointer_value();
                     // Write form-feed (0x0C)
                     let f = self.module.get_function("bruto_file_write_char").unwrap();
-                    self.builder.build_call(f, &[s.into(), self.context.i8_type().const_int(0x0C, false).into()], "")
+                    self.builder
+                        .build_call(
+                            f,
+                            &[
+                                s.into(),
+                                self.context.i8_type().const_int(0x0C, false).into(),
+                            ],
+                            "",
+                        )
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(());
                 }
@@ -1003,16 +1241,24 @@ impl<'ctx> CodeGen<'ctx> {
                     self.set_debug_loc(*span);
                     let f_name = match &args[0] {
                         Expr::Var(n, _) => n.clone(),
-                        _ => return Err(CodeGenError::new("seek requires a file variable", Some(*span))),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                "seek requires a file variable",
+                                Some(*span),
+                            ));
+                        }
                     };
                     let alloca = *self.variables.get(f_name.as_str()).unwrap();
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let s = self.builder.build_load(ptr_ty, alloca, "fs")
+                    let s = self
+                        .builder
+                        .build_load(ptr_ty, alloca, "fs")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                         .into_pointer_value();
                     let pos = self.compile_expr(&args[1])?;
                     let f = self.module.get_function("bruto_file_seek").unwrap();
-                    self.builder.build_call(f, &[s.into(), pos.into()], "")
+                    self.builder
+                        .build_call(f, &[s.into(), pos.into()], "")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(());
                 }
@@ -1026,102 +1272,154 @@ impl<'ctx> CodeGen<'ctx> {
                     return self.compile_file_write_proc(args, true, *span);
                 }
                 if name == "readln" {
-                    let names: Vec<String> = args.iter().filter_map(|a| match a { Expr::Var(n, _) => Some(n.clone()), _ => None }).collect();
+                    let names: Vec<String> = args
+                        .iter()
+                        .filter_map(|a| match a {
+                            Expr::Var(n, _) => Some(n.clone()),
+                            _ => None,
+                        })
+                        .collect();
                     if names.len() == args.len() {
                         return self.compile_readln(&names, *span);
                     }
                 }
                 self.compile_proc_call(name, args, *span)
             }
-            Statement::Case { expr, branches, else_branch, span } => {
-                self.compile_case(expr, branches, else_branch.as_deref(), *span)
-            }
+            Statement::Case {
+                expr,
+                branches,
+                else_branch,
+                span,
+            } => self.compile_case(expr, branches, else_branch.as_deref(), *span),
             Statement::Label { label, span } => {
                 self.set_debug_loc(*span);
-                let bb = *self.label_blocks.get(label)
-                    .ok_or_else(|| CodeGenError::new(format!("undeclared label {label}"), Some(*span)))?;
-                self.builder.build_unconditional_branch(bb)
+                let bb = *self.label_blocks.get(label).ok_or_else(|| {
+                    CodeGenError::new(format!("undeclared label {label}"), Some(*span))
+                })?;
+                self.builder
+                    .build_unconditional_branch(bb)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 self.builder.position_at_end(bb);
                 Ok(())
             }
             Statement::Goto { label, span } => {
                 self.set_debug_loc(*span);
-                let bb = *self.label_blocks.get(label)
-                    .ok_or_else(|| CodeGenError::new(format!("undeclared label {label}"), Some(*span)))?;
-                self.builder.build_unconditional_branch(bb)
+                let bb = *self.label_blocks.get(label).ok_or_else(|| {
+                    CodeGenError::new(format!("undeclared label {label}"), Some(*span))
+                })?;
+                self.builder
+                    .build_unconditional_branch(bb)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 let func = self.current_fn.unwrap();
                 let dead_bb = self.context.append_basic_block(func, "after_goto");
                 self.builder.position_at_end(dead_bb);
                 Ok(())
             }
-            Statement::With { record_var, body, span } => {
-                self.compile_with(record_var, body, *span)
-            }
-            Statement::ChainedAssignment { target, chain, expr, span } => {
-                self.compile_chained_assignment(target, chain, expr, *span)
-            }
+            Statement::With {
+                record_var,
+                body,
+                span,
+            } => self.compile_with(record_var, body, *span),
+            Statement::ChainedAssignment {
+                target,
+                chain,
+                expr,
+                span,
+            } => self.compile_chained_assignment(target, chain, expr, *span),
         }
     }
 
     fn compile_new(&mut self, target: &str, span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let alloca = *self.variables.get(target)
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(span)))?;
-        let var_type = self.var_types.get(target)
+        let alloca = *self.variables.get(target).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{target}'"), Some(span))
+        })?;
+        let var_type = self
+            .var_types
+            .get(target)
             .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(span)))?;
 
         let PascalType::Pointer(pointed) = var_type else {
-            return Err(CodeGenError::new(format!("new() requires a pointer variable, got {target}"), Some(span)));
+            return Err(CodeGenError::new(
+                format!("new() requires a pointer variable, got {target}"),
+                Some(span),
+            ));
         };
 
         let size = self.sizeof_type(pointed);
         let bruto_alloc = self.module.get_function("bruto_alloc").unwrap();
-        let ptr = self.builder.build_call(
-            bruto_alloc,
-            &[self.context.i64_type().const_int(size, false).into()],
-            "heap_ptr",
-        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value().basic().unwrap();
-        self.builder.build_store(alloca, ptr)
+        let ptr = self
+            .builder
+            .build_call(
+                bruto_alloc,
+                &[self.context.i64_type().const_int(size, false).into()],
+                "heap_ptr",
+            )
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        self.builder
+            .build_store(alloca, ptr)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
 
     fn compile_dispose(&mut self, target: &str, span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let alloca = *self.variables.get(target)
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(span)))?;
-        let var_type = self.var_types.get(target)
+        let alloca = *self.variables.get(target).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{target}'"), Some(span))
+        })?;
+        let var_type = self
+            .var_types
+            .get(target)
             .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(span)))?;
 
         if !matches!(var_type, PascalType::Pointer(_)) {
-            return Err(CodeGenError::new(format!("dispose() requires a pointer variable, got {target}"), Some(span)));
+            return Err(CodeGenError::new(
+                format!("dispose() requires a pointer variable, got {target}"),
+                Some(span),
+            ));
         }
 
         let ptr_type = self.context.ptr_type(AddressSpace::default());
-        let ptr_val = self.builder.build_load(ptr_type, alloca, "ptr_val")
+        let ptr_val = self
+            .builder
+            .build_load(ptr_type, alloca, "ptr_val")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let bruto_free = self.module.get_function("bruto_free").unwrap();
-        self.builder.build_call(bruto_free, &[ptr_val.into()], "")
+        self.builder
+            .build_call(bruto_free, &[ptr_val.into()], "")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         // Null out the pointer
-        self.builder.build_store(alloca, ptr_type.const_null())
+        self.builder
+            .build_store(alloca, ptr_type.const_null())
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
 
-    fn compile_with(&mut self, record_var: &str, body: &Block, span: Span) -> Result<(), CodeGenError> {
+    fn compile_with(
+        &mut self,
+        record_var: &str,
+        body: &Block,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let alloca = *self.variables.get(record_var)
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{record_var}'"), Some(span)))?;
-        let var_type = self.var_types.get(record_var).cloned()
-            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{record_var}'"), Some(span)))?;
+        let alloca = *self.variables.get(record_var).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{record_var}'"), Some(span))
+        })?;
+        let var_type = self.var_types.get(record_var).cloned().ok_or_else(|| {
+            CodeGenError::new(format!("unknown type for '{record_var}'"), Some(span))
+        })?;
         let resolved = self.resolve_type(&var_type);
         let fields = match &resolved {
             PascalType::Record { fields, .. } => fields.clone(),
-            _ => return Err(CodeGenError::new(format!("'{record_var}' is not a record"), Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    format!("'{record_var}' is not a record"),
+                    Some(span),
+                ));
+            }
         };
 
         // Save any existing variables that would be shadowed
@@ -1131,12 +1429,15 @@ impl<'ctx> CodeGen<'ctx> {
             let old_type = self.var_types.remove(name);
             saved.push((name.clone(), old_var, old_type));
 
-            let gep = self.builder.build_struct_gep(
-                self.llvm_type_for(&resolved),
-                alloca,
-                i as u32,
-                &format!("with_{name}"),
-            ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let gep = self
+                .builder
+                .build_struct_gep(
+                    self.llvm_type_for(&resolved),
+                    alloca,
+                    i as u32,
+                    &format!("with_{name}"),
+                )
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             self.variables.insert(name.clone(), gep);
             self.var_types.insert(name.clone(), ty.clone());
         }
@@ -1158,14 +1459,23 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    fn compile_chained_assignment(&mut self, target: &str, chain: &[LValueAccess], expr: &Expr, span: Span) -> Result<(), CodeGenError> {
+    fn compile_chained_assignment(
+        &mut self,
+        target: &str,
+        chain: &[LValueAccess],
+        expr: &Expr,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let val = self.compile_expr(expr)?;
 
-        let mut ptr = *self.variables.get(target)
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(span)))?;
-        let mut cur_type = self.var_types.get(target).cloned()
-            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(span)))?;
+        let mut ptr = *self.variables.get(target).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{target}'"), Some(span))
+        })?;
+        let mut cur_type =
+            self.var_types.get(target).cloned().ok_or_else(|| {
+                CodeGenError::new(format!("unknown type for '{target}'"), Some(span))
+            })?;
         cur_type = self.resolve_type(&cur_type);
 
         for (i, access) in chain.iter().enumerate() {
@@ -1174,16 +1484,35 @@ impl<'ctx> CodeGen<'ctx> {
                 LValueAccess::Field(field) => {
                     let (field_idx, field_ty) = match &cur_type {
                         PascalType::Record { fields, .. } => {
-                            let idx = fields.iter().position(|(n, _)| n == field)
-                                .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(span)))?;
+                            let idx =
+                                fields.iter().position(|(n, _)| n == field).ok_or_else(|| {
+                                    CodeGenError::new(
+                                        format!("no field '{field}' in record"),
+                                        Some(span),
+                                    )
+                                })?;
                             (idx, fields[idx].1.clone())
                         }
-                        _ => return Err(CodeGenError::new("field access on non-record", Some(span))),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                "field access on non-record",
+                                Some(span),
+                            ));
+                        }
                     };
-                    let gep = self.builder.build_struct_gep(self.llvm_type_for(&cur_type), ptr, field_idx as u32, "chain_field")
+                    let gep = self
+                        .builder
+                        .build_struct_gep(
+                            self.llvm_type_for(&cur_type),
+                            ptr,
+                            field_idx as u32,
+                            "chain_field",
+                        )
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     if is_last {
-                        self.builder.build_store(gep, val).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        self.builder
+                            .build_store(gep, val)
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                         return Ok(());
                     }
                     ptr = gep;
@@ -1200,18 +1529,28 @@ impl<'ctx> CodeGen<'ctx> {
                         _ => unreachable!(),
                     };
                     self.emit_range_check(idx_val.into_int_value(), lo, hi, span)?;
-                    let adj = self.builder.build_int_sub(
-                        idx_val.into_int_value(),
-                        self.context.i64_type().const_int(lo as u64, true), "adj",
-                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let adj = self
+                        .builder
+                        .build_int_sub(
+                            idx_val.into_int_value(),
+                            self.context.i64_type().const_int(lo as u64, true),
+                            "adj",
+                        )
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     let gep = unsafe {
-                        self.builder.build_in_bounds_gep(
-                            self.llvm_type_for(&cur_type), ptr,
-                            &[self.context.i64_type().const_int(0, false), adj], "chain_idx",
-                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        self.builder
+                            .build_in_bounds_gep(
+                                self.llvm_type_for(&cur_type),
+                                ptr,
+                                &[self.context.i64_type().const_int(0, false), adj],
+                                "chain_idx",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     };
                     if is_last {
-                        self.builder.build_store(gep, val).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        self.builder
+                            .build_store(gep, val)
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                         return Ok(());
                     }
                     ptr = gep;
@@ -1219,14 +1558,24 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 LValueAccess::Deref => {
                     let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                    let loaded = self.builder.build_load(ptr_ty, ptr, "deref_ptr")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_pointer_value();
+                    let loaded = self
+                        .builder
+                        .build_load(ptr_ty, ptr, "deref_ptr")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        .into_pointer_value();
                     let pointed = match &cur_type {
                         PascalType::Pointer(inner) => inner.as_ref().clone(),
-                        _ => return Err(CodeGenError::new("dereference of non-pointer", Some(span))),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                "dereference of non-pointer",
+                                Some(span),
+                            ));
+                        }
                     };
                     if is_last {
-                        self.builder.build_store(loaded, val).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        self.builder
+                            .build_store(loaded, val)
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                         return Ok(());
                     }
                     ptr = loaded;
@@ -1238,8 +1587,11 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_case(
-        &mut self, expr: &Expr, branches: &[CaseBranch],
-        else_branch: Option<&[Statement]>, span: Span,
+        &mut self,
+        expr: &Expr,
+        branches: &[CaseBranch],
+        else_branch: Option<&[Statement]>,
+        span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let sel_val = self.compile_expr(expr)?;
@@ -1255,48 +1607,72 @@ impl<'ctx> CodeGen<'ctx> {
                 let cmp = match val {
                     CaseValue::Single(v) => {
                         let v_val = self.compile_expr(v)?;
-                        self.builder.build_int_compare(
-                            inkwell::IntPredicate::EQ,
-                            sel_val.into_int_value(), v_val.into_int_value(), "case_eq",
-                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        self.builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                sel_val.into_int_value(),
+                                v_val.into_int_value(),
+                                "case_eq",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                     CaseValue::Range(lo, hi) => {
                         let lo_val = self.compile_expr(lo)?;
                         let hi_val = self.compile_expr(hi)?;
-                        let ge = self.builder.build_int_compare(
-                            inkwell::IntPredicate::SGE,
-                            sel_val.into_int_value(), lo_val.into_int_value(), "case_ge",
-                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                        let le = self.builder.build_int_compare(
-                            inkwell::IntPredicate::SLE,
-                            sel_val.into_int_value(), hi_val.into_int_value(), "case_le",
-                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                        self.builder.build_and(ge, le, "case_range")
+                        let ge = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::SGE,
+                                sel_val.into_int_value(),
+                                lo_val.into_int_value(),
+                                "case_ge",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        let le = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::SLE,
+                                sel_val.into_int_value(),
+                                hi_val.into_int_value(),
+                                "case_le",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                        self.builder
+                            .build_and(ge, le, "case_range")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                 };
                 any_match = Some(match any_match {
                     None => cmp,
-                    Some(prev) => self.builder.build_or(prev, cmp, "case_or")
+                    Some(prev) => self
+                        .builder
+                        .build_or(prev, cmp, "case_or")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
                 });
             }
 
-            self.builder.build_conditional_branch(any_match.unwrap(), match_bb, next_bb)
+            self.builder
+                .build_conditional_branch(any_match.unwrap(), match_bb, next_bb)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
             self.builder.position_at_end(match_bb);
-            for stmt in &branch.body { self.compile_statement(stmt)?; }
-            self.builder.build_unconditional_branch(end_bb)
+            for stmt in &branch.body {
+                self.compile_statement(stmt)?;
+            }
+            self.builder
+                .build_unconditional_branch(end_bb)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
             self.builder.position_at_end(next_bb);
         }
 
         if let Some(stmts) = else_branch {
-            for stmt in stmts { self.compile_statement(stmt)?; }
+            for stmt in stmts {
+                self.compile_statement(stmt)?;
+            }
         }
-        self.builder.build_unconditional_branch(end_bb)
+        self.builder
+            .build_unconditional_branch(end_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         self.builder.position_at_end(end_bb);
@@ -1320,13 +1696,19 @@ impl<'ctx> CodeGen<'ctx> {
             }
             PascalType::Record { fields, variant } => {
                 let fixed: u64 = fields.iter().map(|(_, t)| self.sizeof_type(t)).sum();
-                let var_size = variant.as_ref().map(|v| {
-                    let tag_size = self.sizeof_type(&v.tag_type);
-                    let max_body = v.variants.iter()
-                        .map(|(_, vf)| vf.iter().map(|(_, t)| self.sizeof_type(t)).sum::<u64>())
-                        .max().unwrap_or(0);
-                    tag_size + max_body
-                }).unwrap_or(0);
+                let var_size = variant
+                    .as_ref()
+                    .map(|v| {
+                        let tag_size = self.sizeof_type(&v.tag_type);
+                        let max_body = v
+                            .variants
+                            .iter()
+                            .map(|(_, vf)| vf.iter().map(|(_, t)| self.sizeof_type(t)).sum::<u64>())
+                            .max()
+                            .unwrap_or(0);
+                        tag_size + max_body
+                    })
+                    .unwrap_or(0);
                 fixed + var_size
             }
             PascalType::Named(_) => {
@@ -1368,15 +1750,20 @@ impl<'ctx> CodeGen<'ctx> {
             if iv.get_type().get_bit_width() == 1 {
                 iv
             } else {
-                self.builder.build_int_compare(
-                    inkwell::IntPredicate::NE,
-                    iv,
-                    iv.get_type().const_int(0, false),
-                    "tobool",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                self.builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        iv,
+                        iv.get_type().const_int(0, false),
+                        "tobool",
+                    )
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             }
         } else {
-            return Err(CodeGenError::new("condition must be boolean or integer", Some(span)));
+            return Err(CodeGenError::new(
+                "condition must be boolean or integer",
+                Some(span),
+            ));
         };
 
         let func = self.current_fn.unwrap();
@@ -1384,13 +1771,15 @@ impl<'ctx> CodeGen<'ctx> {
         let else_bb = self.context.append_basic_block(func, "else");
         let merge_bb = self.context.append_basic_block(func, "ifcont");
 
-        self.builder.build_conditional_branch(cond_bool, then_bb, else_bb)
+        self.builder
+            .build_conditional_branch(cond_bool, then_bb, else_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         // Then branch
         self.builder.position_at_end(then_bb);
         self.compile_block(then_branch)?;
-        self.builder.build_unconditional_branch(merge_bb)
+        self.builder
+            .build_unconditional_branch(merge_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         // Else branch
@@ -1398,7 +1787,8 @@ impl<'ctx> CodeGen<'ctx> {
         if let Some(else_block) = else_branch {
             self.compile_block(else_block)?;
         }
-        self.builder.build_unconditional_branch(merge_bb)
+        self.builder
+            .build_unconditional_branch(merge_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         self.builder.position_at_end(merge_bb);
@@ -1416,7 +1806,8 @@ impl<'ctx> CodeGen<'ctx> {
         let body_bb = self.context.append_basic_block(func, "whilebody");
         let after_bb = self.context.append_basic_block(func, "whileend");
 
-        self.builder.build_unconditional_branch(cond_bb)
+        self.builder
+            .build_unconditional_branch(cond_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         // Condition
@@ -1429,24 +1820,31 @@ impl<'ctx> CodeGen<'ctx> {
             if iv.get_type().get_bit_width() == 1 {
                 iv
             } else {
-                self.builder.build_int_compare(
-                    inkwell::IntPredicate::NE,
-                    iv,
-                    iv.get_type().const_int(0, false),
-                    "tobool",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                self.builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        iv,
+                        iv.get_type().const_int(0, false),
+                        "tobool",
+                    )
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             }
         } else {
-            return Err(CodeGenError::new("while condition must be boolean or integer", Some(span)));
+            return Err(CodeGenError::new(
+                "while condition must be boolean or integer",
+                Some(span),
+            ));
         };
 
-        self.builder.build_conditional_branch(cond_bool, body_bb, after_bb)
+        self.builder
+            .build_conditional_branch(cond_bool, body_bb, after_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         // Body
         self.builder.position_at_end(body_bb);
         self.compile_block(body)?;
-        self.builder.build_unconditional_branch(cond_bb)
+        self.builder
+            .build_unconditional_branch(cond_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         self.builder.position_at_end(after_bb);
@@ -1464,12 +1862,15 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let func = self.current_fn.unwrap();
-        let alloca = *self.variables.get(var)
+        let alloca = *self
+            .variables
+            .get(var)
             .ok_or_else(|| CodeGenError::new(format!("undefined variable '{var}'"), Some(span)))?;
 
         // Initialize loop variable
         let from_val = self.compile_expr(from)?;
-        self.builder.build_store(alloca, from_val)
+        self.builder
+            .build_store(alloca, from_val)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         let to_val = self.compile_expr(to)?;
@@ -1478,22 +1879,33 @@ impl<'ctx> CodeGen<'ctx> {
         let body_bb = self.context.append_basic_block(func, "forbody");
         let after_bb = self.context.append_basic_block(func, "forend");
 
-        self.builder.build_unconditional_branch(cond_bb)
+        self.builder
+            .build_unconditional_branch(cond_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         // Condition: var <= to (or var >= to for downto)
         self.builder.position_at_end(cond_bb);
         self.set_debug_loc(span);
-        let cur = self.builder.build_load(self.context.i64_type(), alloca, "for_cur")
+        let cur = self
+            .builder
+            .build_load(self.context.i64_type(), alloca, "for_cur")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let pred = if downto {
             inkwell::IntPredicate::SGE
         } else {
             inkwell::IntPredicate::SLE
         };
-        let cond = self.builder.build_int_compare(pred, cur.into_int_value(), to_val.into_int_value(), "for_cmp")
+        let cond = self
+            .builder
+            .build_int_compare(
+                pred,
+                cur.into_int_value(),
+                to_val.into_int_value(),
+                "for_cmp",
+            )
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        self.builder.build_conditional_branch(cond, body_bb, after_bb)
+        self.builder
+            .build_conditional_branch(cond, body_bb, after_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         // Body
@@ -1501,18 +1913,32 @@ impl<'ctx> CodeGen<'ctx> {
         self.compile_block(body)?;
 
         // Increment/decrement
-        let cur2 = self.builder.build_load(self.context.i64_type(), alloca, "for_cur2")
+        let cur2 = self
+            .builder
+            .build_load(self.context.i64_type(), alloca, "for_cur2")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let step = if downto {
-            self.builder.build_int_sub(cur2.into_int_value(), self.context.i64_type().const_int(1, false), "dec")
+            self.builder
+                .build_int_sub(
+                    cur2.into_int_value(),
+                    self.context.i64_type().const_int(1, false),
+                    "dec",
+                )
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
         } else {
-            self.builder.build_int_add(cur2.into_int_value(), self.context.i64_type().const_int(1, false), "inc")
+            self.builder
+                .build_int_add(
+                    cur2.into_int_value(),
+                    self.context.i64_type().const_int(1, false),
+                    "inc",
+                )
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
         };
-        self.builder.build_store(alloca, step)
+        self.builder
+            .build_store(alloca, step)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        self.builder.build_unconditional_branch(cond_bb)
+        self.builder
+            .build_unconditional_branch(cond_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         self.builder.position_at_end(after_bb);
@@ -1529,7 +1955,8 @@ impl<'ctx> CodeGen<'ctx> {
         let body_bb = self.context.append_basic_block(func, "repeat");
         let after_bb = self.context.append_basic_block(func, "repeatend");
 
-        self.builder.build_unconditional_branch(body_bb)
+        self.builder
+            .build_unconditional_branch(body_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         self.builder.position_at_end(body_bb);
@@ -1545,29 +1972,48 @@ impl<'ctx> CodeGen<'ctx> {
             if iv.get_type().get_bit_width() == 1 {
                 iv
             } else {
-                self.builder.build_int_compare(
-                    inkwell::IntPredicate::NE, iv,
-                    iv.get_type().const_int(0, false), "tobool",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                self.builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        iv,
+                        iv.get_type().const_int(0, false),
+                        "tobool",
+                    )
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             }
         } else {
-            return Err(CodeGenError::new("repeat-until condition must be boolean or integer", Some(span)));
+            return Err(CodeGenError::new(
+                "repeat-until condition must be boolean or integer",
+                Some(span),
+            ));
         };
         // If condition true, exit; if false, loop back
-        self.builder.build_conditional_branch(cond_bool, after_bb, body_bb)
+        self.builder
+            .build_conditional_branch(cond_bool, after_bb, body_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         self.builder.position_at_end(after_bb);
         Ok(())
     }
 
-    fn compile_proc_call(&mut self, name: &str, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
+    fn compile_proc_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         // Indirect call through a procedural parameter
-        if let Some(PascalType::Proc { params: ptypes, return_type }) = self.var_types.get(name).cloned() {
+        if let Some(PascalType::Proc {
+            params: ptypes,
+            return_type,
+        }) = self.var_types.get(name).cloned()
+        {
             let alloca = *self.variables.get(name).unwrap();
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            let fp = self.builder.build_load(ptr_ty, alloca, "fp")
+            let fp = self
+                .builder
+                .build_load(ptr_ty, alloca, "fp")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 .into_pointer_value();
             let mut llvm_params: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
@@ -1584,32 +2030,49 @@ impl<'ctx> CodeGen<'ctx> {
                 let v = self.compile_expr(arg)?;
                 call_args.push(v.into());
             }
-            self.builder.build_indirect_call(fn_type, fp, &call_args, "")
+            self.builder
+                .build_indirect_call(fn_type, fp, &call_args, "")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return Ok(());
         }
-        let func = self.module.get_function(name)
-            .ok_or_else(|| CodeGenError::new(format!("undefined procedure '{name}'"), Some(span)))?;
+        let func = self.module.get_function(name).ok_or_else(|| {
+            CodeGenError::new(format!("undefined procedure '{name}'"), Some(span))
+        })?;
         let call_args = self.compile_call_args(name, args, span)?;
-        self.builder.build_call(func, &call_args, "")
+        self.builder
+            .build_call(func, &call_args, "")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
 
-    fn compile_inc_dec(&mut self, args: &[Expr], is_inc: bool, span: Span) -> Result<(), CodeGenError> {
+    fn compile_inc_dec(
+        &mut self,
+        args: &[Expr],
+        is_inc: bool,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let var_name = match &args[0] {
             Expr::Var(name, _) => name.clone(),
             _ => return Err(CodeGenError::new("inc/dec requires a variable", Some(span))),
         };
-        let alloca = *self.variables.get(var_name.as_str())
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{var_name}'"), Some(span)))?;
-        let var_type = self.var_types.get(var_name.as_str()).cloned()
-            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{var_name}'"), Some(span)))?;
+        let alloca = *self.variables.get(var_name.as_str()).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{var_name}'"), Some(span))
+        })?;
+        let var_type = self
+            .var_types
+            .get(var_name.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                CodeGenError::new(format!("unknown type for '{var_name}'"), Some(span))
+            })?;
         let llvm_ty = self.llvm_type_for(&var_type);
 
-        let cur = self.builder.build_load(llvm_ty, alloca, "cur")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+        let cur = self
+            .builder
+            .build_load(llvm_ty, alloca, "cur")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            .into_int_value();
 
         let step = if args.len() == 2 {
             self.compile_expr(&args[1])?.into_int_value()
@@ -1618,14 +2081,17 @@ impl<'ctx> CodeGen<'ctx> {
         };
 
         let result = if is_inc {
-            self.builder.build_int_add(cur, step, "inc")
+            self.builder
+                .build_int_add(cur, step, "inc")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
         } else {
-            self.builder.build_int_sub(cur, step, "dec")
+            self.builder
+                .build_int_sub(cur, step, "dec")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
         };
 
-        self.builder.build_store(alloca, result)
+        self.builder
+            .build_store(alloca, result)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
@@ -1634,20 +2100,33 @@ impl<'ctx> CodeGen<'ctx> {
         self.set_debug_loc(span);
         let s_name = match &args[0] {
             Expr::Var(name, _) => name.clone(),
-            _ => return Err(CodeGenError::new("delete requires a string variable", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "delete requires a string variable",
+                    Some(span),
+                ));
+            }
         };
-        let alloca = *self.variables.get(s_name.as_str())
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span)))?;
+        let alloca = *self.variables.get(s_name.as_str()).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span))
+        })?;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let s_val = self.builder.build_load(ptr_ty, alloca, "s")
+        let s_val = self
+            .builder
+            .build_load(ptr_ty, alloca, "s")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let idx = self.compile_expr(&args[1])?;
         let cnt = self.compile_expr(&args[2])?;
         let f = self.module.get_function("bruto_str_delete").unwrap();
-        let result = self.builder.build_call(f, &[s_val.into(), idx.into(), cnt.into()], "deleted")
+        let result = self
+            .builder
+            .build_call(f, &[s_val.into(), idx.into(), cnt.into()], "deleted")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value().basic().unwrap();
-        self.builder.build_store(alloca, result)
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        self.builder
+            .build_store(alloca, result)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
@@ -1657,19 +2136,32 @@ impl<'ctx> CodeGen<'ctx> {
         let source = self.compile_expr(&args[0])?;
         let s_name = match &args[1] {
             Expr::Var(name, _) => name.clone(),
-            _ => return Err(CodeGenError::new("insert requires a string variable as 2nd arg", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "insert requires a string variable as 2nd arg",
+                    Some(span),
+                ));
+            }
         };
-        let alloca = *self.variables.get(s_name.as_str())
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span)))?;
+        let alloca = *self.variables.get(s_name.as_str()).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span))
+        })?;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let s_val = self.builder.build_load(ptr_ty, alloca, "s")
+        let s_val = self
+            .builder
+            .build_load(ptr_ty, alloca, "s")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let idx = self.compile_expr(&args[2])?;
         let f = self.module.get_function("bruto_str_insert").unwrap();
-        let result = self.builder.build_call(f, &[source.into(), s_val.into(), idx.into()], "inserted")
+        let result = self
+            .builder
+            .build_call(f, &[source.into(), s_val.into(), idx.into()], "inserted")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value().basic().unwrap();
-        self.builder.build_store(alloca, result)
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        self.builder
+            .build_store(alloca, result)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
@@ -1679,16 +2171,31 @@ impl<'ctx> CodeGen<'ctx> {
         let val = self.compile_expr(&args[0])?;
         let s_name = match &args[1] {
             Expr::Var(name, _) => name.clone(),
-            _ => return Err(CodeGenError::new("str requires a string variable as 2nd arg", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "str requires a string variable as 2nd arg",
+                    Some(span),
+                ));
+            }
         };
-        let alloca = *self.variables.get(s_name.as_str())
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span)))?;
-        let fn_name = if val.is_float_value() { "bruto_real_to_str" } else { "bruto_int_to_str" };
+        let alloca = *self.variables.get(s_name.as_str()).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span))
+        })?;
+        let fn_name = if val.is_float_value() {
+            "bruto_real_to_str"
+        } else {
+            "bruto_int_to_str"
+        };
         let f = self.module.get_function(fn_name).unwrap();
-        let result = self.builder.build_call(f, &[val.into()], "str_result")
+        let result = self
+            .builder
+            .build_call(f, &[val.into()], "str_result")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value().basic().unwrap();
-        self.builder.build_store(alloca, result)
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        self.builder
+            .build_store(alloca, result)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
@@ -1698,24 +2205,42 @@ impl<'ctx> CodeGen<'ctx> {
         let s_val = self.compile_expr(&args[0])?;
         let x_name = match &args[1] {
             Expr::Var(name, _) => name.clone(),
-            _ => return Err(CodeGenError::new("val requires a variable as 2nd arg", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "val requires a variable as 2nd arg",
+                    Some(span),
+                ));
+            }
         };
-        let alloca = *self.variables.get(x_name.as_str())
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{x_name}'"), Some(span)))?;
+        let alloca = *self.variables.get(x_name.as_str()).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{x_name}'"), Some(span))
+        })?;
         let f = self.module.get_function("bruto_str_to_int").unwrap();
-        let result = self.builder.build_call(f, &[s_val.into()], "val_result")
+        let result = self
+            .builder
+            .build_call(f, &[s_val.into()], "val_result")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value().basic().unwrap();
-        self.builder.build_store(alloca, result)
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        self.builder
+            .build_store(alloca, result)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         // Set code to 0 (success)
         let code_name = match &args[2] {
             Expr::Var(name, _) => name.clone(),
-            _ => return Err(CodeGenError::new("val requires a variable as 3rd arg", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "val requires a variable as 3rd arg",
+                    Some(span),
+                ));
+            }
         };
-        let code_alloca = *self.variables.get(code_name.as_str())
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{code_name}'"), Some(span)))?;
-        self.builder.build_store(code_alloca, self.context.i64_type().const_int(0, false))
+        let code_alloca = *self.variables.get(code_name.as_str()).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{code_name}'"), Some(span))
+        })?;
+        self.builder
+            .build_store(code_alloca, self.context.i64_type().const_int(0, false))
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
@@ -1724,36 +2249,59 @@ impl<'ctx> CodeGen<'ctx> {
         self.set_debug_loc(span);
         let f_name = match &args[0] {
             Expr::Var(name, _) => name.clone(),
-            _ => return Err(CodeGenError::new("assign requires a file variable", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "assign requires a file variable",
+                    Some(span),
+                ));
+            }
         };
-        let alloca = *self.variables.get(f_name.as_str())
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{f_name}'"), Some(span)))?;
+        let alloca = *self.variables.get(f_name.as_str()).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{f_name}'"), Some(span))
+        })?;
         let path_val = self.compile_expr(&args[1])?;
         let new_fn = self.module.get_function("bruto_file_new").unwrap();
-        let new_struct = self.builder.build_call(new_fn, &[path_val.into()], "fnew")
+        let new_struct = self
+            .builder
+            .build_call(new_fn, &[path_val.into()], "fnew")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value().basic().unwrap();
-        self.builder.build_store(alloca, new_struct)
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        self.builder
+            .build_store(alloca, new_struct)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
 
-    fn compile_file_open(&mut self, arg: &Expr, mode: &str, span: Span) -> Result<(), CodeGenError> {
+    fn compile_file_open(
+        &mut self,
+        arg: &Expr,
+        mode: &str,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let name = match arg {
             Expr::Var(n, _) => n.clone(),
             _ => return Err(CodeGenError::new("file op requires a variable", Some(span))),
         };
-        let alloca = *self.variables.get(name.as_str())
+        let alloca = *self
+            .variables
+            .get(name.as_str())
             .ok_or_else(|| CodeGenError::new(format!("undefined variable '{name}'"), Some(span)))?;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let s = self.builder.build_load(ptr_ty, alloca, "fs")
+        let s = self
+            .builder
+            .build_load(ptr_ty, alloca, "fs")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             .into_pointer_value();
-        let mode_str = self.builder.build_global_string_ptr(mode, "mode")
+        let mode_str = self
+            .builder
+            .build_global_string_ptr(mode, "mode")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let f = self.module.get_function("bruto_file_open").unwrap();
-        self.builder.build_call(f, &[s.into(), mode_str.as_pointer_value().into()], "")
+        self.builder
+            .build_call(f, &[s.into(), mode_str.as_pointer_value().into()], "")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
@@ -1764,14 +2312,19 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Var(n, _) => n.clone(),
             _ => return Err(CodeGenError::new("close requires a variable", Some(span))),
         };
-        let alloca = *self.variables.get(name.as_str())
+        let alloca = *self
+            .variables
+            .get(name.as_str())
             .ok_or_else(|| CodeGenError::new(format!("undefined variable '{name}'"), Some(span)))?;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let s = self.builder.build_load(ptr_ty, alloca, "fs")
+        let s = self
+            .builder
+            .build_load(ptr_ty, alloca, "fs")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             .into_pointer_value();
         let f = self.module.get_function("bruto_file_close").unwrap();
-        self.builder.build_call(f, &[s.into()], "")
+        self.builder
+            .build_call(f, &[s.into()], "")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
@@ -1789,9 +2342,21 @@ impl<'ctx> CodeGen<'ctx> {
         self.compile_readln(&names, span)
     }
 
-    fn compile_file_write_proc(&mut self, args: &[Expr], newline: bool, span: Span) -> Result<(), CodeGenError> {
+    fn compile_file_write_proc(
+        &mut self,
+        args: &[Expr],
+        newline: bool,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         // Wrap each Expr in a WriteArg with no formatting and forward.
-        let wargs: Vec<WriteArg> = args.iter().map(|e| WriteArg { expr: e.clone(), width: None, precision: None }).collect();
+        let wargs: Vec<WriteArg> = args
+            .iter()
+            .map(|e| WriteArg {
+                expr: e.clone(),
+                width: None,
+                precision: None,
+            })
+            .collect();
         self.compile_write(&wargs, newline, span)
     }
 
@@ -1802,15 +2367,23 @@ impl<'ctx> CodeGen<'ctx> {
         self.set_debug_loc(span);
         let name = match arg {
             Expr::Var(n, _) => n.clone(),
-            _ => return Err(CodeGenError::new("get requires a file variable", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "get requires a file variable",
+                    Some(span),
+                ));
+            }
         };
         let alloca = *self.variables.get(name.as_str()).unwrap();
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let s = self.builder.build_load(ptr_ty, alloca, "fs")
+        let s = self
+            .builder
+            .build_load(ptr_ty, alloca, "fs")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             .into_pointer_value();
         let f = self.module.get_function("bruto_file_get").unwrap();
-        self.builder.build_call(f, &[s.into()], "")
+        self.builder
+            .build_call(f, &[s.into()], "")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
@@ -1819,20 +2392,33 @@ impl<'ctx> CodeGen<'ctx> {
         self.set_debug_loc(span);
         let name = match arg {
             Expr::Var(n, _) => n.clone(),
-            _ => return Err(CodeGenError::new("put requires a file variable", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "put requires a file variable",
+                    Some(span),
+                ));
+            }
         };
         let alloca = *self.variables.get(name.as_str()).unwrap();
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let s = self.builder.build_load(ptr_ty, alloca, "fs")
+        let s = self
+            .builder
+            .build_load(ptr_ty, alloca, "fs")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             .into_pointer_value();
         let f = self.module.get_function("bruto_file_put").unwrap();
-        self.builder.build_call(f, &[s.into()], "")
+        self.builder
+            .build_call(f, &[s.into()], "")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
 
-    fn compile_pack_unpack(&mut self, args: &[Expr], is_pack: bool, span: Span) -> Result<(), CodeGenError> {
+    fn compile_pack_unpack(
+        &mut self,
+        args: &[Expr],
+        is_pack: bool,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let (src_idx, dst_idx, idx_arg) = if is_pack {
             (0usize, 2usize, &args[1])
@@ -1841,11 +2427,21 @@ impl<'ctx> CodeGen<'ctx> {
         };
         let src_name = match &args[src_idx] {
             Expr::Var(n, _) => n.clone(),
-            _ => return Err(CodeGenError::new("pack/unpack expects array variables", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "pack/unpack expects array variables",
+                    Some(span),
+                ));
+            }
         };
         let dst_name = match &args[dst_idx] {
             Expr::Var(n, _) => n.clone(),
-            _ => return Err(CodeGenError::new("pack/unpack expects array variables", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "pack/unpack expects array variables",
+                    Some(span),
+                ));
+            }
         };
         let src_ptr = *self.variables.get(src_name.as_str()).unwrap();
         let dst_ptr = *self.variables.get(dst_name.as_str()).unwrap();
@@ -1856,11 +2452,21 @@ impl<'ctx> CodeGen<'ctx> {
 
         let (src_lo, src_hi, src_elem) = match &src_resolved {
             PascalType::Array { lo, hi, elem } => (*lo, *hi, elem.as_ref().clone()),
-            _ => return Err(CodeGenError::new("pack/unpack source not an array", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "pack/unpack source not an array",
+                    Some(span),
+                ));
+            }
         };
         let (dst_lo, dst_hi, _dst_elem) = match &dst_resolved {
             PascalType::Array { lo, hi, elem } => (*lo, *hi, elem.as_ref().clone()),
-            _ => return Err(CodeGenError::new("pack/unpack dest not an array", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "pack/unpack dest not an array",
+                    Some(span),
+                ));
+            }
         };
         let _ = (src_lo, src_hi);
 
@@ -1872,9 +2478,12 @@ impl<'ctx> CodeGen<'ctx> {
         let i_val = self.compile_expr(idx_arg)?.into_int_value();
         let i64_ty = self.context.i64_type();
         let i_val = if i_val.get_type().get_bit_width() < 64 {
-            self.builder.build_int_s_extend(i_val, i64_ty, "ix")
+            self.builder
+                .build_int_s_extend(i_val, i64_ty, "ix")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-        } else { i_val };
+        } else {
+            i_val
+        };
 
         // For pack: copy src[i .. i+count-1] -> dst[0 .. count-1].
         // For unpack: copy src[0 .. count-1] -> dst[i .. i+count-1].
@@ -1882,27 +2491,44 @@ impl<'ctx> CodeGen<'ctx> {
         if is_pack {
             // src offset = (i - src_lo) * elem_size
             let src_lo_v = i64_ty.const_int(src_lo as u64, true);
-            let off_idx = self.builder.build_int_sub(i_val, src_lo_v, "soff")
+            let off_idx = self
+                .builder
+                .build_int_sub(i_val, src_lo_v, "soff")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            let off = self.builder.build_int_mul(off_idx, i64_ty.const_int(elem_size, false), "soffb")
+            let off = self
+                .builder
+                .build_int_mul(off_idx, i64_ty.const_int(elem_size, false), "soffb")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             let src_gep = unsafe {
-                self.builder.build_in_bounds_gep(self.context.i8_type(), src_ptr, &[off], "sgep")
+                self.builder
+                    .build_in_bounds_gep(self.context.i8_type(), src_ptr, &[off], "sgep")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             };
-            self.builder.build_call(memcpy, &[
-                dst_ptr.into(), src_gep.into(),
-                i64_ty.const_int(total_bytes, false).into(),
-            ], "").map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.builder
+                .build_call(
+                    memcpy,
+                    &[
+                        dst_ptr.into(),
+                        src_gep.into(),
+                        i64_ty.const_int(total_bytes, false).into(),
+                    ],
+                    "",
+                )
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         } else {
             // dst offset = (i - dst_lo) * elem_size; src is at offset 0
             let dst_lo_v = i64_ty.const_int(dst_lo as u64, true);
-            let off_idx = self.builder.build_int_sub(i_val, dst_lo_v, "doff")
+            let off_idx = self
+                .builder
+                .build_int_sub(i_val, dst_lo_v, "doff")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            let off = self.builder.build_int_mul(off_idx, i64_ty.const_int(elem_size, false), "doffb")
+            let off = self
+                .builder
+                .build_int_mul(off_idx, i64_ty.const_int(elem_size, false), "doffb")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             let dst_gep = unsafe {
-                self.builder.build_in_bounds_gep(self.context.i8_type(), dst_ptr, &[off], "dgep")
+                self.builder
+                    .build_in_bounds_gep(self.context.i8_type(), dst_ptr, &[off], "dgep")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             };
             // count = src array length
@@ -1912,60 +2538,104 @@ impl<'ctx> CodeGen<'ctx> {
             };
             let src_count = (_shi - _slo + 1).max(0) as u64;
             let src_total = src_count * elem_size;
-            self.builder.build_call(memcpy, &[
-                dst_gep.into(), src_ptr.into(),
-                i64_ty.const_int(src_total, false).into(),
-            ], "").map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.builder
+                .build_call(
+                    memcpy,
+                    &[
+                        dst_gep.into(),
+                        src_ptr.into(),
+                        i64_ty.const_int(src_total, false).into(),
+                    ],
+                    "",
+                )
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         }
         Ok(())
     }
 
-    fn compile_set_include_exclude(&mut self, args: &[Expr], is_include: bool, span: Span) -> Result<(), CodeGenError> {
+    fn compile_set_include_exclude(
+        &mut self,
+        args: &[Expr],
+        is_include: bool,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let s_name = match &args[0] {
             Expr::Var(name, _) => name.clone(),
-            _ => return Err(CodeGenError::new("include/exclude requires a set variable", Some(span))),
+            _ => {
+                return Err(CodeGenError::new(
+                    "include/exclude requires a set variable",
+                    Some(span),
+                ));
+            }
         };
-        let alloca = *self.variables.get(s_name.as_str())
-            .ok_or_else(|| CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span)))?;
+        let alloca = *self.variables.get(s_name.as_str()).ok_or_else(|| {
+            CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span))
+        })?;
         let elem_val = self.compile_expr(&args[1])?.into_int_value();
 
         let i64_ty = self.context.i64_type();
         let set_ty = i64_ty.array_type(4);
         let elem_val = if elem_val.get_type().get_bit_width() < 64 {
-            self.builder.build_int_z_extend(elem_val, i64_ty, "elem_ext")
+            self.builder
+                .build_int_z_extend(elem_val, i64_ty, "elem_ext")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
         } else {
             elem_val
         };
-        let word_idx = self.builder.build_int_unsigned_div(elem_val, i64_ty.const_int(64, false), "word_idx")
+        let word_idx = self
+            .builder
+            .build_int_unsigned_div(elem_val, i64_ty.const_int(64, false), "word_idx")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        let bit_idx = self.builder.build_int_unsigned_rem(elem_val, i64_ty.const_int(64, false), "bit_idx")
+        let bit_idx = self
+            .builder
+            .build_int_unsigned_rem(elem_val, i64_ty.const_int(64, false), "bit_idx")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        let bit = self.builder.build_left_shift(i64_ty.const_int(1, false), bit_idx, "bit")
+        let bit = self
+            .builder
+            .build_left_shift(i64_ty.const_int(1, false), bit_idx, "bit")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let gep = unsafe {
-            self.builder.build_in_bounds_gep(set_ty, alloca, &[i64_ty.const_int(0, false), word_idx], "set_gep")
+            self.builder
+                .build_in_bounds_gep(
+                    set_ty,
+                    alloca,
+                    &[i64_ty.const_int(0, false), word_idx],
+                    "set_gep",
+                )
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
         };
-        let cur = self.builder.build_load(i64_ty, gep, "cur_word")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+        let cur = self
+            .builder
+            .build_load(i64_ty, gep, "cur_word")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            .into_int_value();
 
         let new_word = if is_include {
-            self.builder.build_or(cur, bit, "include")
+            self.builder
+                .build_or(cur, bit, "include")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
         } else {
-            let not_bit = self.builder.build_not(bit, "not_bit")
+            let not_bit = self
+                .builder
+                .build_not(bit, "not_bit")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            self.builder.build_and(cur, not_bit, "exclude")
+            self.builder
+                .build_and(cur, not_bit, "exclude")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
         };
-        self.builder.build_store(gep, new_word)
+        self.builder
+            .build_store(gep, new_word)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
 
-    fn compile_call_args(&mut self, name: &str, args: &[Expr], span: Span) -> Result<Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>, CodeGenError> {
+    fn compile_call_args(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>, CodeGenError> {
         let param_modes = self.proc_param_modes.get(name).cloned();
         let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
 
@@ -1973,8 +2643,12 @@ impl<'ctx> CodeGen<'ctx> {
         let captures = self.proc_captures.get(name).cloned().unwrap_or_default();
         let cap_count = captures.len();
         for (cname, _) in &captures {
-            let alloca = *self.variables.get(cname.as_str())
-                .ok_or_else(|| CodeGenError::new(format!("nested proc '{name}' captures '{cname}' which is not in scope"), Some(span)))?;
+            let alloca = *self.variables.get(cname.as_str()).ok_or_else(|| {
+                CodeGenError::new(
+                    format!("nested proc '{name}' captures '{cname}' which is not in scope"),
+                    Some(span),
+                )
+            })?;
             call_args.push(alloca.into());
         }
 
@@ -1983,18 +2657,29 @@ impl<'ctx> CodeGen<'ctx> {
         let mut pi = cap_count;
         for arg in args.iter() {
             let pinfo = param_modes.as_ref().and_then(|p| p.get(pi));
-            let is_var_param = pinfo.map(|(_, mode, _)| *mode == ParamMode::Var).unwrap_or(false);
+            let is_var_param = pinfo
+                .map(|(_, mode, _)| *mode == ParamMode::Var)
+                .unwrap_or(false);
             let is_proc_param = matches!(pinfo.map(|(_, _, t)| t), Some(PascalType::Proc { .. }));
-            let is_conformant = matches!(pinfo.map(|(_, _, t)| t), Some(PascalType::ConformantArray { .. }));
+            let is_conformant = matches!(
+                pinfo.map(|(_, _, t)| t),
+                Some(PascalType::ConformantArray { .. })
+            );
 
             if is_conformant {
                 // Expect an array variable; pass &arr, lo, hi.
                 let vname = match arg {
                     Expr::Var(n, _) => n.clone(),
-                    _ => return Err(CodeGenError::new("conformant array arg requires a variable", Some(span))),
+                    _ => {
+                        return Err(CodeGenError::new(
+                            "conformant array arg requires a variable",
+                            Some(span),
+                        ));
+                    }
                 };
-                let alloca = *self.variables.get(vname.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{vname}'"), Some(span)))?;
+                let alloca = *self.variables.get(vname.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{vname}'"), Some(span))
+                })?;
                 let var_ty = self.var_types.get(vname.as_str()).cloned().unwrap();
                 let resolved = self.resolve_type(&var_ty);
                 let (lo, hi) = match resolved {
@@ -2003,9 +2688,17 @@ impl<'ctx> CodeGen<'ctx> {
                         // forwarding: load runtime lo/hi from sibling allocas
                         // For simplicity we don't support pass-through of conformant arrays
                         // (rare), so reject.
-                        return Err(CodeGenError::new("forwarding a conformant array is not supported", Some(span)));
+                        return Err(CodeGenError::new(
+                            "forwarding a conformant array is not supported",
+                            Some(span),
+                        ));
                     }
-                    _ => return Err(CodeGenError::new(format!("'{vname}' is not an array"), Some(span))),
+                    _ => {
+                        return Err(CodeGenError::new(
+                            format!("'{vname}' is not an array"),
+                            Some(span),
+                        ));
+                    }
                 };
                 let i64_ty = self.context.i64_type();
                 call_args.push(alloca.into());
@@ -2020,16 +2713,24 @@ impl<'ctx> CodeGen<'ctx> {
                     if let Some(PascalType::Proc { .. }) = self.var_types.get(vname.as_str()) {
                         let alloca = *self.variables.get(vname.as_str()).unwrap();
                         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                        let fp = self.builder.build_load(ptr_ty, alloca, "argfp")
+                        let fp = self
+                            .builder
+                            .build_load(ptr_ty, alloca, "argfp")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                         call_args.push(fp.into());
                     } else if let Some(target_fn) = self.module.get_function(vname) {
                         call_args.push(target_fn.as_global_value().as_pointer_value().into());
                     } else {
-                        return Err(CodeGenError::new(format!("'{vname}' is not a procedure or function"), Some(span)));
+                        return Err(CodeGenError::new(
+                            format!("'{vname}' is not a procedure or function"),
+                            Some(span),
+                        ));
                     }
                 } else {
-                    return Err(CodeGenError::new("procedural parameter requires a procedure or function name", Some(span)));
+                    return Err(CodeGenError::new(
+                        "procedural parameter requires a procedure or function name",
+                        Some(span),
+                    ));
                 }
                 pi += 1;
                 continue;
@@ -2037,11 +2738,15 @@ impl<'ctx> CodeGen<'ctx> {
 
             if is_var_param {
                 if let Expr::Var(vname, vspan) = arg {
-                    let alloca = *self.variables.get(vname.as_str())
-                        .ok_or_else(|| CodeGenError::new(format!("undefined variable '{vname}'"), Some(*vspan)))?;
+                    let alloca = *self.variables.get(vname.as_str()).ok_or_else(|| {
+                        CodeGenError::new(format!("undefined variable '{vname}'"), Some(*vspan))
+                    })?;
                     call_args.push(alloca.into());
                 } else {
-                    return Err(CodeGenError::new("var parameter requires a variable", Some(span)));
+                    return Err(CodeGenError::new(
+                        "var parameter requires a variable",
+                        Some(span),
+                    ));
                 }
             } else {
                 let val = self.compile_expr(arg)?;
@@ -2052,7 +2757,12 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(call_args)
     }
 
-    fn compile_write(&mut self, args: &[WriteArg], newline: bool, span: Span) -> Result<(), CodeGenError> {
+    fn compile_write(
+        &mut self,
+        args: &[WriteArg],
+        newline: bool,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
 
         // If first arg is a file variable, switch to file-write mode
@@ -2065,7 +2775,9 @@ impl<'ctx> CodeGen<'ctx> {
                         if matches!(self.resolve_type(t), PascalType::File { .. }) {
                             let alloca = *self.variables.get(name.as_str()).unwrap();
                             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                            let fp = self.builder.build_load(ptr_ty, alloca, "fileptr")
+                            let fp = self
+                                .builder
+                                .build_load(ptr_ty, alloca, "fileptr")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                                 .into_pointer_value();
                             file_target = Some(fp);
@@ -2083,21 +2795,32 @@ impl<'ctx> CodeGen<'ctx> {
             // File output path
             if let Some(fp) = file_target {
                 let fname = match arg_type {
-                    PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => "bruto_file_write_int",
+                    PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
+                        "bruto_file_write_int"
+                    }
                     PascalType::Real => "bruto_file_write_real",
                     PascalType::Boolean => "bruto_file_write_int",
                     PascalType::Char => "bruto_file_write_char",
                     PascalType::String | PascalType::Pointer(_) => "bruto_file_write_str",
-                    _ => return Err(CodeGenError::new("cannot write this type to file", Some(span))),
+                    _ => {
+                        return Err(CodeGenError::new(
+                            "cannot write this type to file",
+                            Some(span),
+                        ));
+                    }
                 };
                 let mut call_val = val;
                 if matches!(arg_type, PascalType::Boolean) {
                     let iv = val.into_int_value();
-                    call_val = self.builder.build_int_z_extend(iv, self.context.i64_type(), "z")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into();
+                    call_val = self
+                        .builder
+                        .build_int_z_extend(iv, self.context.i64_type(), "z")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        .into();
                 }
                 let f = self.module.get_function(fname).unwrap();
-                self.builder.build_call(f, &[fp.into(), call_val.into()], "")
+                self.builder
+                    .build_call(f, &[fp.into(), call_val.into()], "")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 continue;
             }
@@ -2106,85 +2829,136 @@ impl<'ctx> CodeGen<'ctx> {
             let has_fmt = arg.width.is_some();
             if has_fmt {
                 let width = self.compile_expr(arg.width.as_ref().unwrap())?;
-                let width_i = if width.is_int_value() { width.into_int_value() } else { return Err(CodeGenError::new("width must be integer", Some(span))); };
+                let width_i = if width.is_int_value() {
+                    width.into_int_value()
+                } else {
+                    return Err(CodeGenError::new("width must be integer", Some(span)));
+                };
                 let width_i = if width_i.get_type().get_bit_width() < 64 {
-                    self.builder.build_int_s_extend(width_i, self.context.i64_type(), "we")
+                    self.builder
+                        .build_int_s_extend(width_i, self.context.i64_type(), "we")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                } else { width_i };
+                } else {
+                    width_i
+                };
 
                 match arg_type {
                     PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
                         let f = self.module.get_function("bruto_write_int_fmt").unwrap();
-                        self.builder.build_call(f, &[val.into(), width_i.into()], "")
+                        self.builder
+                            .build_call(f, &[val.into(), width_i.into()], "")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                        let cf = self.module.get_function("bruto_capture_write_int_fmt").unwrap();
-                        self.builder.build_call(cf, &[val.into(), width_i.into()], "")
+                        let cf = self
+                            .module
+                            .get_function("bruto_capture_write_int_fmt")
+                            .unwrap();
+                        self.builder
+                            .build_call(cf, &[val.into(), width_i.into()], "")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     }
                     PascalType::Real => {
                         if let Some(prec_expr) = &arg.precision {
                             let p = self.compile_expr(prec_expr)?;
-                            let p_i = if p.is_int_value() { p.into_int_value() } else { return Err(CodeGenError::new("precision must be integer", Some(span))); };
+                            let p_i = if p.is_int_value() {
+                                p.into_int_value()
+                            } else {
+                                return Err(CodeGenError::new(
+                                    "precision must be integer",
+                                    Some(span),
+                                ));
+                            };
                             let p_i = if p_i.get_type().get_bit_width() < 64 {
-                                self.builder.build_int_s_extend(p_i, self.context.i64_type(), "pe")
+                                self.builder
+                                    .build_int_s_extend(p_i, self.context.i64_type(), "pe")
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                            } else { p_i };
+                            } else {
+                                p_i
+                            };
                             let f = self.module.get_function("bruto_write_real_fmt").unwrap();
-                            self.builder.build_call(f, &[val.into(), width_i.into(), p_i.into()], "")
+                            self.builder
+                                .build_call(f, &[val.into(), width_i.into(), p_i.into()], "")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                            let cf = self.module.get_function("bruto_capture_write_real_fmt").unwrap();
-                            self.builder.build_call(cf, &[val.into(), width_i.into(), p_i.into()], "")
+                            let cf = self
+                                .module
+                                .get_function("bruto_capture_write_real_fmt")
+                                .unwrap();
+                            self.builder
+                                .build_call(cf, &[val.into(), width_i.into(), p_i.into()], "")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                         } else {
                             let f = self.module.get_function("bruto_write_real_fmt_w").unwrap();
-                            self.builder.build_call(f, &[val.into(), width_i.into()], "")
+                            self.builder
+                                .build_call(f, &[val.into(), width_i.into()], "")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                            let cf = self.module.get_function("bruto_capture_write_real_fmt_w").unwrap();
-                            self.builder.build_call(cf, &[val.into(), width_i.into()], "")
+                            let cf = self
+                                .module
+                                .get_function("bruto_capture_write_real_fmt_w")
+                                .unwrap();
+                            self.builder
+                                .build_call(cf, &[val.into(), width_i.into()], "")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                         }
                     }
                     PascalType::String | PascalType::Pointer(_) => {
                         let f = self.module.get_function("bruto_write_str_fmt").unwrap();
-                        self.builder.build_call(f, &[val.into(), width_i.into()], "")
+                        self.builder
+                            .build_call(f, &[val.into(), width_i.into()], "")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                        let cf = self.module.get_function("bruto_capture_write_str_fmt").unwrap();
-                        self.builder.build_call(cf, &[val.into(), width_i.into()], "")
+                        let cf = self
+                            .module
+                            .get_function("bruto_capture_write_str_fmt")
+                            .unwrap();
+                        self.builder
+                            .build_call(cf, &[val.into(), width_i.into()], "")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     }
-                    _ => return Err(CodeGenError::new("formatted write not supported for this type", Some(span))),
+                    _ => {
+                        return Err(CodeGenError::new(
+                            "formatted write not supported for this type",
+                            Some(span),
+                        ));
+                    }
                 }
                 continue;
             }
 
             let (write_fn, capture_fn) = match arg_type {
-                PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => ("bruto_write_int", "bruto_capture_write_int"),
+                PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
+                    ("bruto_write_int", "bruto_capture_write_int")
+                }
                 PascalType::Real => ("bruto_write_real", "bruto_capture_write_real"),
                 PascalType::Boolean => ("bruto_write_bool", "bruto_capture_write_bool"),
                 PascalType::Char => ("bruto_write_char", "bruto_capture_write_char"),
-                PascalType::String | PascalType::Pointer(_) => ("bruto_write_str", "bruto_capture_write_str"),
+                PascalType::String | PascalType::Pointer(_) => {
+                    ("bruto_write_str", "bruto_capture_write_str")
+                }
                 _ => return Err(CodeGenError::new("cannot write this type", Some(span))),
             };
 
             let f = self.module.get_function(write_fn).unwrap();
-            self.builder.build_call(f, &[val.into()], "")
+            self.builder
+                .build_call(f, &[val.into()], "")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             let cf = self.module.get_function(capture_fn).unwrap();
-            self.builder.build_call(cf, &[val.into()], "")
+            self.builder
+                .build_call(cf, &[val.into()], "")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         }
 
         if newline {
             if let Some(fp) = file_target {
                 let f = self.module.get_function("bruto_file_writeln").unwrap();
-                self.builder.build_call(f, &[fp.into()], "")
+                self.builder
+                    .build_call(f, &[fp.into()], "")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             } else {
                 let f = self.module.get_function("bruto_writeln").unwrap();
-                self.builder.build_call(f, &[], "")
+                self.builder
+                    .build_call(f, &[], "")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 let cf = self.module.get_function("bruto_capture_writeln").unwrap();
-                self.builder.build_call(cf, &[], "")
+                self.builder
+                    .build_call(cf, &[], "")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             }
         }
@@ -2197,21 +2971,29 @@ impl<'ctx> CodeGen<'ctx> {
         if targets.is_empty() {
             // Skip a line on stdin
             let f = self.module.get_function("bruto_read_str").unwrap();
-            self.builder.build_call(f, &[], "")
+            self.builder
+                .build_call(f, &[], "")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return Ok(());
         }
 
         // Check whether first target is a file variable
-        let first_var_type = self.var_types.get(targets[0].as_str()).cloned()
-            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{}'", targets[0]), Some(span)))?;
+        let first_var_type = self
+            .var_types
+            .get(targets[0].as_str())
+            .cloned()
+            .ok_or_else(|| {
+                CodeGenError::new(format!("unknown type for '{}'", targets[0]), Some(span))
+            })?;
         let resolved_first = self.resolve_type(&first_var_type);
         let mut start_idx = 0;
         let mut file_target: Option<PointerValue<'ctx>> = None;
         if matches!(resolved_first, PascalType::File { .. }) {
             let alloca = *self.variables.get(targets[0].as_str()).unwrap();
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            let fp = self.builder.build_load(ptr_ty, alloca, "fileptr")
+            let fp = self
+                .builder
+                .build_load(ptr_ty, alloca, "fileptr")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 .into_pointer_value();
             file_target = Some(fp);
@@ -2219,41 +3001,68 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         for target in &targets[start_idx..] {
-            let alloca = *self.variables.get(target.as_str())
-                .ok_or_else(|| CodeGenError::new(format!("undefined variable '{target}'"), Some(span)))?;
-            let var_type = self.var_types.get(target.as_str()).cloned()
-                .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(span)))?;
+            let alloca = *self.variables.get(target.as_str()).ok_or_else(|| {
+                CodeGenError::new(format!("undefined variable '{target}'"), Some(span))
+            })?;
+            let var_type = self
+                .var_types
+                .get(target.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    CodeGenError::new(format!("unknown type for '{target}'"), Some(span))
+                })?;
             let resolved = self.resolve_type(&var_type);
 
             let (read_fn, _is_file) = if let Some(_) = file_target {
                 match resolved {
-                    PascalType::Integer | PascalType::Subrange { .. } | PascalType::Enum { .. } => ("bruto_file_read_int", true),
+                    PascalType::Integer | PascalType::Subrange { .. } | PascalType::Enum { .. } => {
+                        ("bruto_file_read_int", true)
+                    }
                     PascalType::Real => ("bruto_file_read_real", true),
                     PascalType::Char => ("bruto_file_read_char", true),
                     PascalType::String => ("bruto_file_read_str", true),
-                    _ => return Err(CodeGenError::new(format!("readln from file for {resolved:?} not supported"), Some(span))),
+                    _ => {
+                        return Err(CodeGenError::new(
+                            format!("readln from file for {resolved:?} not supported"),
+                            Some(span),
+                        ));
+                    }
                 }
             } else {
                 match resolved {
-                    PascalType::Integer | PascalType::Subrange { .. } | PascalType::Enum { .. } => ("bruto_read_int", false),
+                    PascalType::Integer | PascalType::Subrange { .. } | PascalType::Enum { .. } => {
+                        ("bruto_read_int", false)
+                    }
                     PascalType::Real => ("bruto_read_real", false),
                     PascalType::Char => ("bruto_read_char", false),
                     PascalType::String => ("bruto_read_str", false),
-                    _ => return Err(CodeGenError::new(format!("readln for {resolved:?} not supported"), Some(span))),
+                    _ => {
+                        return Err(CodeGenError::new(
+                            format!("readln for {resolved:?} not supported"),
+                            Some(span),
+                        ));
+                    }
                 }
             };
 
             let f = self.module.get_function(read_fn).unwrap();
             let val = if let Some(fp) = file_target {
-                self.builder.build_call(f, &[fp.into()], "rval")
+                self.builder
+                    .build_call(f, &[fp.into()], "rval")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                    .try_as_basic_value().basic().unwrap()
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap()
             } else {
-                self.builder.build_call(f, &[], "rval")
+                self.builder
+                    .build_call(f, &[], "rval")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                    .try_as_basic_value().basic().unwrap()
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap()
             };
-            self.builder.build_store(alloca, val)
+            self.builder
+                .build_store(alloca, val)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         }
 
@@ -2262,16 +3071,26 @@ impl<'ctx> CodeGen<'ctx> {
 
     // ── array base resolution (for multi-dimensional indexing) ──
 
-    fn resolve_array_base(&mut self, expr: &Expr, span: Span) -> Result<(PointerValue<'ctx>, PascalType), CodeGenError> {
+    fn resolve_array_base(
+        &mut self,
+        expr: &Expr,
+        span: Span,
+    ) -> Result<(PointerValue<'ctx>, PascalType), CodeGenError> {
         match expr {
             Expr::Var(name, vspan) => {
-                let a = *self.variables.get(name.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{name}'"), Some(*vspan)))?;
-                let t = self.var_types.get(name.as_str()).cloned()
-                    .ok_or_else(|| CodeGenError::new(format!("unknown type for '{name}'"), Some(*vspan)))?;
+                let a = *self.variables.get(name.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{name}'"), Some(*vspan))
+                })?;
+                let t = self.var_types.get(name.as_str()).cloned().ok_or_else(|| {
+                    CodeGenError::new(format!("unknown type for '{name}'"), Some(*vspan))
+                })?;
                 Ok((a, t))
             }
-            Expr::Index { array, index, span: idx_span } => {
+            Expr::Index {
+                array,
+                index,
+                span: idx_span,
+            } => {
                 let (base_ptr, base_type) = self.resolve_array_base(array, *idx_span)?;
                 let idx_val = self.compile_expr(index)?;
                 let (lo, hi) = match &base_type {
@@ -2283,30 +3102,50 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => unreachable!(),
                 };
                 self.emit_range_check(idx_val.into_int_value(), lo, hi, span)?;
-                let adj = self.builder.build_int_sub(
-                    idx_val.into_int_value(),
-                    self.context.i64_type().const_int(lo as u64, true), "adj_idx",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                let adj = self
+                    .builder
+                    .build_int_sub(
+                        idx_val.into_int_value(),
+                        self.context.i64_type().const_int(lo as u64, true),
+                        "adj_idx",
+                    )
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 let gep = unsafe {
-                    self.builder.build_in_bounds_gep(
-                        self.llvm_type_for(&base_type), base_ptr,
-                        &[self.context.i64_type().const_int(0, false), adj], "arr_gep",
-                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    self.builder
+                        .build_in_bounds_gep(
+                            self.llvm_type_for(&base_type),
+                            base_ptr,
+                            &[self.context.i64_type().const_int(0, false), adj],
+                            "arr_gep",
+                        )
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 };
                 Ok((gep, elem_ty))
             }
-            Expr::FieldAccess { record, field, span: fa_span } => {
+            Expr::FieldAccess {
+                record,
+                field,
+                span: fa_span,
+            } => {
                 let (rec_ptr, rec_type) = self.resolve_array_base(record, *fa_span)?;
                 let resolved = self.resolve_type(&rec_type);
                 let (field_idx, field_ty) = match &resolved {
                     PascalType::Record { fields, .. } => {
-                        let idx = fields.iter().position(|(n, _)| n == field)
-                            .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(span)))?;
+                        let idx = fields.iter().position(|(n, _)| n == field).ok_or_else(|| {
+                            CodeGenError::new(format!("no field '{field}' in record"), Some(span))
+                        })?;
                         (idx, fields[idx].1.clone())
                     }
                     _ => return Err(CodeGenError::new("field access on non-record", Some(span))),
                 };
-                let gep = self.builder.build_struct_gep(self.llvm_type_for(&resolved), rec_ptr, field_idx as u32, "fa_gep")
+                let gep = self
+                    .builder
+                    .build_struct_gep(
+                        self.llvm_type_for(&resolved),
+                        rec_ptr,
+                        field_idx as u32,
+                        "fa_gep",
+                    )
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 Ok((gep, field_ty))
             }
@@ -2318,11 +3157,17 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => return Err(CodeGenError::new("dereference of non-pointer", Some(span))),
                 };
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                let loaded = self.builder.build_load(ptr_ty, ptr, "deref_base")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_pointer_value();
+                let loaded = self
+                    .builder
+                    .build_load(ptr_ty, ptr, "deref_base")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into_pointer_value();
                 Ok((loaded, pointed))
             }
-            _ => Err(CodeGenError::new("array indexing requires a variable", Some(span))),
+            _ => Err(CodeGenError::new(
+                "array indexing requires a variable",
+                Some(span),
+            )),
         }
     }
 
@@ -2330,46 +3175,62 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         match expr {
-            Expr::IntLit(n, _) => {
-                Ok(self.context.i64_type().const_int(*n as u64, true).into())
-            }
-            Expr::RealLit(r, _) => {
-                Ok(self.context.f64_type().const_float(*r).into())
-            }
-            Expr::CharLit(c, _) => {
-                Ok(self.context.i8_type().const_int(*c as u64, false).into())
-            }
+            Expr::IntLit(n, _) => Ok(self.context.i64_type().const_int(*n as u64, true).into()),
+            Expr::RealLit(r, _) => Ok(self.context.f64_type().const_float(*r).into()),
+            Expr::CharLit(c, _) => Ok(self.context.i8_type().const_int(*c as u64, false).into()),
             Expr::StrLit(s, span) => {
-                let gs = self.builder.build_global_string_ptr(s, "str_lit")
+                let gs = self
+                    .builder
+                    .build_global_string_ptr(s, "str_lit")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(gs.as_pointer_value().into())
             }
-            Expr::BoolLit(b, _) => {
-                Ok(self.context.bool_type().const_int(if *b { 1 } else { 0 }, false).into())
-            }
-            Expr::Nil(_) => {
-                Ok(self.context.ptr_type(AddressSpace::default()).const_null().into())
-            }
+            Expr::BoolLit(b, _) => Ok(self
+                .context
+                .bool_type()
+                .const_int(if *b { 1 } else { 0 }, false)
+                .into()),
+            Expr::Nil(_) => Ok(self
+                .context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into()),
             Expr::Var(name, span) => {
                 // Check if this is an enum constant before looking up variables
                 if let Some(&ordinal) = self.enum_values.get(name.as_str()) {
-                    return Ok(self.context.i64_type().const_int(ordinal as u64, true).into());
+                    return Ok(self
+                        .context
+                        .i64_type()
+                        .const_int(ordinal as u64, true)
+                        .into());
                 }
                 // Pascal allows calling no-arg functions by bare name.
                 if name == "ioresult" {
-                    return self.compile_expr(&Expr::Call { name: name.clone(), args: Vec::new(), span: *span });
+                    return self.compile_expr(&Expr::Call {
+                        name: name.clone(),
+                        args: Vec::new(),
+                        span: *span,
+                    });
                 }
                 // Predefined constants
                 if name == "maxint" {
-                    return Ok(self.context.i64_type().const_int(i64::MAX as u64, true).into());
+                    return Ok(self
+                        .context
+                        .i64_type()
+                        .const_int(i64::MAX as u64, true)
+                        .into());
                 }
-                let alloca = *self.variables.get(name.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("undefined variable '{name}'"), Some(*span)))?;
-                let var_type = self.var_types.get(name.as_str()).cloned()
-                    .ok_or_else(|| CodeGenError::new(format!("unknown type for '{name}'"), Some(*span)))?;
+                let alloca = *self.variables.get(name.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{name}'"), Some(*span))
+                })?;
+                let var_type = self.var_types.get(name.as_str()).cloned().ok_or_else(|| {
+                    CodeGenError::new(format!("unknown type for '{name}'"), Some(*span))
+                })?;
 
                 let ty = self.llvm_type_for(&var_type);
-                let val = self.builder.build_load(ty, alloca, name)
+                let val = self
+                    .builder
+                    .build_load(ty, alloca, name)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(val)
             }
@@ -2379,18 +3240,27 @@ impl<'ctx> CodeGen<'ctx> {
                 if matches!(self.resolve_type(&inner_type), PascalType::File { .. }) {
                     let ptr_val = self.compile_expr(inner)?;
                     let f = self.module.get_function("bruto_file_buf_load").unwrap();
-                    let r = self.builder.build_call(f, &[ptr_val.into()], "fbuf")
+                    let r = self
+                        .builder
+                        .build_call(f, &[ptr_val.into()], "fbuf")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 // inner must evaluate to a pointer; load the pointed-to value
                 let ptr_val = self.compile_expr(inner)?;
                 let PascalType::Pointer(pointed) = inner_type else {
-                    return Err(CodeGenError::new("cannot dereference non-pointer", Some(*span)));
+                    return Err(CodeGenError::new(
+                        "cannot dereference non-pointer",
+                        Some(*span),
+                    ));
                 };
                 let ty = self.llvm_type_for(&pointed);
-                let val = self.builder.build_load(ty, ptr_val.into_pointer_value(), "deref")
+                let val = self
+                    .builder
+                    .build_load(ty, ptr_val.into_pointer_value(), "deref")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(val)
             }
@@ -2398,13 +3268,20 @@ impl<'ctx> CodeGen<'ctx> {
                 let (base_ptr, base_type) = self.resolve_array_base(array, *span)?;
                 let idx_val = self.compile_expr(index)?;
                 let resolved = self.resolve_type(&base_type);
-                let (gep, elem_ty) = self.gep_array_elem(base_ptr, &resolved, idx_val.into_int_value(), *span)?;
+                let (gep, elem_ty) =
+                    self.gep_array_elem(base_ptr, &resolved, idx_val.into_int_value(), *span)?;
                 let elem_llvm_ty = self.llvm_type_for(&elem_ty);
-                let val = self.builder.build_load(elem_llvm_ty, gep, "arr_load")
+                let val = self
+                    .builder
+                    .build_load(elem_llvm_ty, gep, "arr_load")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 Ok(val)
             }
-            Expr::FieldAccess { record, field, span } => {
+            Expr::FieldAccess {
+                record,
+                field,
+                span,
+            } => {
                 let (alloca, var_type) = self.resolve_array_base(record, *span)?;
                 let resolved = self.resolve_type(&var_type);
                 match &resolved {
@@ -2412,51 +3289,85 @@ impl<'ctx> CodeGen<'ctx> {
                         // Check fixed fields first
                         if let Some(idx) = fields.iter().position(|(n, _)| n == field) {
                             let field_ty = &fields[idx].1;
-                            let gep = self.builder.build_struct_gep(
-                                self.llvm_type_for(&resolved),
-                                alloca,
-                                idx as u32,
-                                "field_gep",
-                            ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                            let val = self.builder.build_load(self.llvm_type_for(field_ty), gep, "field_load")
+                            let gep = self
+                                .builder
+                                .build_struct_gep(
+                                    self.llvm_type_for(&resolved),
+                                    alloca,
+                                    idx as u32,
+                                    "field_gep",
+                                )
+                                .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                            let val = self
+                                .builder
+                                .build_load(self.llvm_type_for(field_ty), gep, "field_load")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                             Ok(val)
                         } else if let Some(v) = variant {
                             if field == &v.tag_name {
                                 // Tag field: index = fields.len()
-                                let gep = self.builder.build_struct_gep(
-                                    self.llvm_type_for(&resolved),
-                                    alloca,
-                                    fields.len() as u32,
-                                    "tag_gep",
-                                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                                let val = self.builder.build_load(self.llvm_type_for(&v.tag_type), gep, "tag_load")
+                                let gep = self
+                                    .builder
+                                    .build_struct_gep(
+                                        self.llvm_type_for(&resolved),
+                                        alloca,
+                                        fields.len() as u32,
+                                        "tag_gep",
+                                    )
+                                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                let val = self
+                                    .builder
+                                    .build_load(self.llvm_type_for(&v.tag_type), gep, "tag_load")
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                                 Ok(val)
                             } else {
                                 // Variant field in union
-                                let (byte_offset, field_ty) = self.find_variant_field(v, field)
-                                    .ok_or_else(|| CodeGenError::new(format!("no field '{field}' in record"), Some(*span)))?;
-                                let union_gep = self.builder.build_struct_gep(
-                                    self.llvm_type_for(&resolved),
-                                    alloca,
-                                    (fields.len() + 1) as u32,
-                                    "union_gep",
-                                ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                                let (byte_offset, field_ty) =
+                                    self.find_variant_field(v, field).ok_or_else(|| {
+                                        CodeGenError::new(
+                                            format!("no field '{field}' in record"),
+                                            Some(*span),
+                                        )
+                                    })?;
+                                let union_gep = self
+                                    .builder
+                                    .build_struct_gep(
+                                        self.llvm_type_for(&resolved),
+                                        alloca,
+                                        (fields.len() + 1) as u32,
+                                        "union_gep",
+                                    )
+                                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                                 let byte_gep = unsafe {
-                                    self.builder.build_in_bounds_gep(
-                                        self.context.i8_type(),
-                                        union_gep,
-                                        &[self.context.i64_type().const_int(byte_offset, false)],
-                                        "vfield_ptr",
-                                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                                    self.builder
+                                        .build_in_bounds_gep(
+                                            self.context.i8_type(),
+                                            union_gep,
+                                            &[self
+                                                .context
+                                                .i64_type()
+                                                .const_int(byte_offset, false)],
+                                            "vfield_ptr",
+                                        )
+                                        .map_err(|e| {
+                                            CodeGenError::new(e.to_string(), Some(*span))
+                                        })?
                                 };
-                                let val = self.builder.build_load(self.llvm_type_for(&field_ty), byte_gep, "vfield_load")
+                                let val = self
+                                    .builder
+                                    .build_load(
+                                        self.llvm_type_for(&field_ty),
+                                        byte_gep,
+                                        "vfield_load",
+                                    )
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                                 Ok(val)
                             }
                         } else {
-                            Err(CodeGenError::new(format!("no field '{field}' in record"), Some(*span)))
+                            Err(CodeGenError::new(
+                                format!("no field '{field}' in record"),
+                                Some(*span),
+                            ))
                         }
                     }
                     _ => Err(CodeGenError::new("field access on non-record", Some(*span))),
@@ -2464,7 +3375,9 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Expr::Call { name, args, span } => {
                 // Type casts: integer(x), real(x), char(x), boolean(x)
-                if matches!(name.as_str(), "integer" | "real" | "char" | "boolean") && args.len() == 1 {
+                if matches!(name.as_str(), "integer" | "real" | "char" | "boolean")
+                    && args.len() == 1
+                {
                     let val = self.compile_expr(&args[0])?;
                     return self.compile_type_cast(name, val, *span);
                 }
@@ -2472,28 +3385,48 @@ impl<'ctx> CodeGen<'ctx> {
                 if name == "length" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let f = self.module.get_function("bruto_str_length").unwrap();
-                    let r = self.builder.build_call(f, &[val.into()], "len")
+                    let r = self
+                        .builder
+                        .build_call(f, &[val.into()], "len")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "ord" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     if val.is_pointer_value() {
                         // String: load first byte
-                        let byte = self.builder.build_load(self.context.i8_type(), val.into_pointer_value(), "ord_byte")
+                        let byte = self
+                            .builder
+                            .build_load(
+                                self.context.i8_type(),
+                                val.into_pointer_value(),
+                                "ord_byte",
+                            )
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                        let ext = self.builder.build_int_z_extend(byte.into_int_value(), self.context.i64_type(), "ord")
+                        let ext = self
+                            .builder
+                            .build_int_z_extend(
+                                byte.into_int_value(),
+                                self.context.i64_type(),
+                                "ord",
+                            )
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                         return Ok(ext.into());
                     }
-                    let ext = self.builder.build_int_z_extend(val.into_int_value(), self.context.i64_type(), "ord")
+                    let ext = self
+                        .builder
+                        .build_int_z_extend(val.into_int_value(), self.context.i64_type(), "ord")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(ext.into());
                 }
                 if name == "chr" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
-                    let trunc = self.builder.build_int_truncate(val.into_int_value(), self.context.i8_type(), "chr")
+                    let trunc = self
+                        .builder
+                        .build_int_truncate(val.into_int_value(), self.context.i8_type(), "chr")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(trunc.into());
                 }
@@ -2501,17 +3434,32 @@ impl<'ctx> CodeGen<'ctx> {
                     let val = self.compile_expr(&args[0])?;
                     if val.is_float_value() {
                         let intrinsic = self.get_or_declare_f64_intrinsic("llvm.fabs.f64");
-                        let r = self.builder.build_call(intrinsic, &[val.into()], "fabs")
+                        let r = self
+                            .builder
+                            .build_call(intrinsic, &[val.into()], "fabs")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                            .try_as_basic_value().basic().unwrap();
+                            .try_as_basic_value()
+                            .basic()
+                            .unwrap();
                         return Ok(r);
                     }
                     let iv = val.into_int_value();
-                    let is_neg = self.builder.build_int_compare(inkwell::IntPredicate::SLT, iv, self.context.i64_type().const_int(0, false), "is_neg")
+                    let is_neg = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::SLT,
+                            iv,
+                            self.context.i64_type().const_int(0, false),
+                            "is_neg",
+                        )
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let neg = self.builder.build_int_neg(iv, "neg")
+                    let neg = self
+                        .builder
+                        .build_int_neg(iv, "neg")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let r = self.builder.build_select(is_neg, neg, iv, "abs")
+                    let r = self
+                        .builder
+                        .build_select(is_neg, neg, iv, "abs")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r);
                 }
@@ -2519,12 +3467,16 @@ impl<'ctx> CodeGen<'ctx> {
                     let val = self.compile_expr(&args[0])?;
                     if val.is_float_value() {
                         let fv = val.into_float_value();
-                        let r = self.builder.build_float_mul(fv, fv, "sqr")
+                        let r = self
+                            .builder
+                            .build_float_mul(fv, fv, "sqr")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                         return Ok(r.into());
                     }
                     let iv = val.into_int_value();
-                    let r = self.builder.build_int_mul(iv, iv, "sqr")
+                    let r = self
+                        .builder
+                        .build_int_mul(iv, iv, "sqr")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r.into());
                 }
@@ -2532,63 +3484,92 @@ impl<'ctx> CodeGen<'ctx> {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
                     let intrinsic = self.get_or_declare_f64_intrinsic("llvm.sqrt.f64");
-                    let r = self.builder.build_call(intrinsic, &[fval.into()], "sqrt")
+                    let r = self
+                        .builder
+                        .build_call(intrinsic, &[fval.into()], "sqrt")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "sin" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
                     let intrinsic = self.get_or_declare_f64_intrinsic("llvm.sin.f64");
-                    let r = self.builder.build_call(intrinsic, &[fval.into()], "sin")
+                    let r = self
+                        .builder
+                        .build_call(intrinsic, &[fval.into()], "sin")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "cos" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
                     let intrinsic = self.get_or_declare_f64_intrinsic("llvm.cos.f64");
-                    let r = self.builder.build_call(intrinsic, &[fval.into()], "cos")
+                    let r = self
+                        .builder
+                        .build_call(intrinsic, &[fval.into()], "cos")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "exp" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
                     let intrinsic = self.get_or_declare_f64_intrinsic("llvm.exp.f64");
-                    let r = self.builder.build_call(intrinsic, &[fval.into()], "exp")
+                    let r = self
+                        .builder
+                        .build_call(intrinsic, &[fval.into()], "exp")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "ln" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
                     let intrinsic = self.get_or_declare_f64_intrinsic("llvm.log.f64");
-                    let r = self.builder.build_call(intrinsic, &[fval.into()], "ln")
+                    let r = self
+                        .builder
+                        .build_call(intrinsic, &[fval.into()], "ln")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "arctan" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
                     let atan_fn = self.module.get_function("atan").unwrap_or_else(|| {
-                        let ft = self.context.f64_type().fn_type(&[self.context.f64_type().into()], false);
+                        let ft = self
+                            .context
+                            .f64_type()
+                            .fn_type(&[self.context.f64_type().into()], false);
                         self.module.add_function("atan", ft, None)
                     });
-                    let r = self.builder.build_call(atan_fn, &[fval.into()], "arctan")
+                    let r = self
+                        .builder
+                        .build_call(atan_fn, &[fval.into()], "arctan")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "trunc" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
-                    let r = self.builder.build_float_to_signed_int(fval, self.context.i64_type(), "trunc")
+                    let r = self
+                        .builder
+                        .build_float_to_signed_int(fval, self.context.i64_type(), "trunc")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r.into());
                 }
@@ -2596,10 +3577,20 @@ impl<'ctx> CodeGen<'ctx> {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
                     let round_fn = self.get_or_declare_f64_intrinsic("llvm.round.f64");
-                    let rounded = self.builder.build_call(round_fn, &[fval.into()], "rounded")
+                    let rounded = self
+                        .builder
+                        .build_call(round_fn, &[fval.into()], "rounded")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
-                    let r = self.builder.build_float_to_signed_int(rounded.into_float_value(), self.context.i64_type(), "round")
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
+                    let r = self
+                        .builder
+                        .build_float_to_signed_int(
+                            rounded.into_float_value(),
+                            self.context.i64_type(),
+                            "round",
+                        )
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r.into());
                 }
@@ -2608,167 +3599,323 @@ impl<'ctx> CodeGen<'ctx> {
                     let iv = val.into_int_value();
                     let i64_ty = self.context.i64_type();
                     let iv = if iv.get_type().get_bit_width() < 64 {
-                        self.builder.build_int_s_extend(iv, i64_ty, "ze")
+                        self.builder
+                            .build_int_s_extend(iv, i64_ty, "ze")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                    } else { iv };
+                    } else {
+                        iv
+                    };
                     let one = i64_ty.const_int(1, false);
-                    let masked = self.builder.build_and(iv, one, "odd_mask")
+                    let masked = self
+                        .builder
+                        .build_and(iv, one, "odd_mask")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let r = self.builder.build_int_compare(
-                        inkwell::IntPredicate::EQ, masked, one, "odd",
-                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let r = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::EQ, masked, one, "odd")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r.into());
                 }
                 if name == "succ" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let iv = val.into_int_value();
-                    let r = self.builder.build_int_add(iv, iv.get_type().const_int(1, false), "succ")
+                    let r = self
+                        .builder
+                        .build_int_add(iv, iv.get_type().const_int(1, false), "succ")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r.into());
                 }
                 if name == "pred" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let iv = val.into_int_value();
-                    let r = self.builder.build_int_sub(iv, iv.get_type().const_int(1, false), "pred")
+                    let r = self
+                        .builder
+                        .build_int_sub(iv, iv.get_type().const_int(1, false), "pred")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r.into());
                 }
                 if name == "low" && args.len() == 1 {
                     if let Expr::Var(vname, _) = &args[0] {
-                        let var_type = self.var_types.get(vname.as_str()).cloned()
+                        let var_type = self
+                            .var_types
+                            .get(vname.as_str())
+                            .cloned()
                             .or_else(|| self.type_defs.get(vname.as_str()).cloned());
                         if let Some(ty) = var_type {
                             let resolved = self.resolve_type(&ty);
                             match &resolved {
-                                PascalType::Array { lo, .. } => return Ok(self.context.i64_type().const_int(*lo as u64, true).into()),
-                                PascalType::Subrange { lo, .. } => return Ok(self.context.i64_type().const_int(*lo as u64, true).into()),
-                                PascalType::Enum { .. } => return Ok(self.context.i64_type().const_int(0, false).into()),
-                                PascalType::Char => return Ok(self.context.i64_type().const_int(0, false).into()),
-                                PascalType::Boolean => return Ok(self.context.i64_type().const_int(0, false).into()),
-                                PascalType::Integer => return Ok(self.context.i64_type().const_int(i64::MIN as u64, true).into()),
+                                PascalType::Array { lo, .. } => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(*lo as u64, true)
+                                        .into());
+                                }
+                                PascalType::Subrange { lo, .. } => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(*lo as u64, true)
+                                        .into());
+                                }
+                                PascalType::Enum { .. } => {
+                                    return Ok(self.context.i64_type().const_int(0, false).into());
+                                }
+                                PascalType::Char => {
+                                    return Ok(self.context.i64_type().const_int(0, false).into());
+                                }
+                                PascalType::Boolean => {
+                                    return Ok(self.context.i64_type().const_int(0, false).into());
+                                }
+                                PascalType::Integer => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(i64::MIN as u64, true)
+                                        .into());
+                                }
                                 _ => {}
                             }
                         }
                     }
-                    return Err(CodeGenError::new("low() requires an array, subrange, or enum variable", Some(*span)));
+                    return Err(CodeGenError::new(
+                        "low() requires an array, subrange, or enum variable",
+                        Some(*span),
+                    ));
                 }
                 if name == "high" && args.len() == 1 {
                     if let Expr::Var(vname, _) = &args[0] {
-                        let var_type = self.var_types.get(vname.as_str()).cloned()
+                        let var_type = self
+                            .var_types
+                            .get(vname.as_str())
+                            .cloned()
                             .or_else(|| self.type_defs.get(vname.as_str()).cloned());
                         if let Some(ty) = var_type {
                             let resolved = self.resolve_type(&ty);
                             match &resolved {
-                                PascalType::Array { hi, .. } => return Ok(self.context.i64_type().const_int(*hi as u64, true).into()),
-                                PascalType::Subrange { hi, .. } => return Ok(self.context.i64_type().const_int(*hi as u64, true).into()),
-                                PascalType::Enum { values, .. } => return Ok(self.context.i64_type().const_int((values.len() - 1) as u64, false).into()),
-                                PascalType::Char => return Ok(self.context.i64_type().const_int(255, false).into()),
-                                PascalType::Boolean => return Ok(self.context.i64_type().const_int(1, false).into()),
-                                PascalType::Integer => return Ok(self.context.i64_type().const_int(i64::MAX as u64, true).into()),
+                                PascalType::Array { hi, .. } => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(*hi as u64, true)
+                                        .into());
+                                }
+                                PascalType::Subrange { hi, .. } => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(*hi as u64, true)
+                                        .into());
+                                }
+                                PascalType::Enum { values, .. } => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int((values.len() - 1) as u64, false)
+                                        .into());
+                                }
+                                PascalType::Char => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(255, false)
+                                        .into());
+                                }
+                                PascalType::Boolean => {
+                                    return Ok(self.context.i64_type().const_int(1, false).into());
+                                }
+                                PascalType::Integer => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(i64::MAX as u64, true)
+                                        .into());
+                                }
                                 _ => {}
                             }
                         }
                     }
-                    return Err(CodeGenError::new("high() requires an array, subrange, or enum variable", Some(*span)));
+                    return Err(CodeGenError::new(
+                        "high() requires an array, subrange, or enum variable",
+                        Some(*span),
+                    ));
                 }
                 if name == "copy" && args.len() == 3 {
                     let s = self.compile_expr(&args[0])?;
                     let idx = self.compile_expr(&args[1])?;
                     let cnt = self.compile_expr(&args[2])?;
                     let f = self.module.get_function("bruto_str_copy").unwrap();
-                    let r = self.builder.build_call(f, &[s.into(), idx.into(), cnt.into()], "copy")
+                    let r = self
+                        .builder
+                        .build_call(f, &[s.into(), idx.into(), cnt.into()], "copy")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "pos" && args.len() == 2 {
                     let substr = self.compile_expr(&args[0])?;
                     let s = self.compile_expr(&args[1])?;
                     let f = self.module.get_function("bruto_str_pos").unwrap();
-                    let r = self.builder.build_call(f, &[substr.into(), s.into()], "pos")
+                    let r = self
+                        .builder
+                        .build_call(f, &[substr.into(), s.into()], "pos")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "upcase" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     // Handle both char (i8) and string (ptr) — for strings, load first byte
                     let ch = if val.is_pointer_value() {
-                        self.builder.build_load(self.context.i8_type(), val.into_pointer_value(), "first_ch")
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?.into_int_value()
+                        self.builder
+                            .build_load(
+                                self.context.i8_type(),
+                                val.into_pointer_value(),
+                                "first_ch",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                            .into_int_value()
                     } else {
                         val.into_int_value()
                     };
-                    let is_lower_a = self.builder.build_int_compare(inkwell::IntPredicate::UGE, ch, self.context.i8_type().const_int(b'a' as u64, false), "ge_a")
+                    let is_lower_a = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::UGE,
+                            ch,
+                            self.context.i8_type().const_int(b'a' as u64, false),
+                            "ge_a",
+                        )
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let is_lower_z = self.builder.build_int_compare(inkwell::IntPredicate::ULE, ch, self.context.i8_type().const_int(b'z' as u64, false), "le_z")
+                    let is_lower_z = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::ULE,
+                            ch,
+                            self.context.i8_type().const_int(b'z' as u64, false),
+                            "le_z",
+                        )
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let is_lower = self.builder.build_and(is_lower_a, is_lower_z, "is_lower")
+                    let is_lower = self
+                        .builder
+                        .build_and(is_lower_a, is_lower_z, "is_lower")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let upper = self.builder.build_int_sub(ch, self.context.i8_type().const_int(32, false), "upper")
+                    let upper = self
+                        .builder
+                        .build_int_sub(ch, self.context.i8_type().const_int(32, false), "upper")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let r = self.builder.build_select(is_lower, upper, ch, "upcase")
+                    let r = self
+                        .builder
+                        .build_select(is_lower, upper, ch, "upcase")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r);
                 }
                 if (name == "eof" || name == "eoln") && args.len() == 1 {
                     let f_name = match &args[0] {
                         Expr::Var(n, _) => n.clone(),
-                        _ => return Err(CodeGenError::new(format!("{name} requires a file variable"), Some(*span))),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                format!("{name} requires a file variable"),
+                                Some(*span),
+                            ));
+                        }
                     };
-                    let alloca = *self.variables.get(f_name.as_str())
-                        .ok_or_else(|| CodeGenError::new(format!("undefined variable '{f_name}'"), Some(*span)))?;
+                    let alloca = *self.variables.get(f_name.as_str()).ok_or_else(|| {
+                        CodeGenError::new(format!("undefined variable '{f_name}'"), Some(*span))
+                    })?;
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let s = self.builder.build_load(ptr_ty, alloca, "fs")
+                    let s = self
+                        .builder
+                        .build_load(ptr_ty, alloca, "fs")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                         .into_pointer_value();
-                    let fname = if name == "eof" { "bruto_file_eof" } else { "bruto_file_eoln" };
+                    let fname = if name == "eof" {
+                        "bruto_file_eof"
+                    } else {
+                        "bruto_file_eoln"
+                    };
                     let f = self.module.get_function(fname).unwrap();
-                    let r = self.builder.build_call(f, &[s.into()], name.as_str())
+                    let r = self
+                        .builder
+                        .build_call(f, &[s.into()], name.as_str())
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "ioresult" && args.is_empty() {
                     let f = self.module.get_function("bruto_ioresult").unwrap();
-                    let r = self.builder.build_call(f, &[], "ior")
+                    let r = self
+                        .builder
+                        .build_call(f, &[], "ior")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     // i32 → i64
-                    let ext = self.builder.build_int_z_extend(r.into_int_value(), self.context.i64_type(), "iorx")
+                    let ext = self
+                        .builder
+                        .build_int_z_extend(r.into_int_value(), self.context.i64_type(), "iorx")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(ext.into());
                 }
                 if name == "filepos" && args.len() == 1 {
                     let f_name = match &args[0] {
                         Expr::Var(n, _) => n.clone(),
-                        _ => return Err(CodeGenError::new("filepos requires a file variable", Some(*span))),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                "filepos requires a file variable",
+                                Some(*span),
+                            ));
+                        }
                     };
                     let alloca = *self.variables.get(f_name.as_str()).unwrap();
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let s = self.builder.build_load(ptr_ty, alloca, "fs")
+                    let s = self
+                        .builder
+                        .build_load(ptr_ty, alloca, "fs")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                         .into_pointer_value();
                     let f = self.module.get_function("bruto_file_filepos").unwrap();
-                    let r = self.builder.build_call(f, &[s.into()], "fp")
+                    let r = self
+                        .builder
+                        .build_call(f, &[s.into()], "fp")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "filesize" && args.len() == 1 {
                     let f_name = match &args[0] {
                         Expr::Var(n, _) => n.clone(),
-                        _ => return Err(CodeGenError::new("filesize requires a file variable", Some(*span))),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                "filesize requires a file variable",
+                                Some(*span),
+                            ));
+                        }
                     };
                     let alloca = *self.variables.get(f_name.as_str()).unwrap();
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let s = self.builder.build_load(ptr_ty, alloca, "fs")
+                    let s = self
+                        .builder
+                        .build_load(ptr_ty, alloca, "fs")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                         .into_pointer_value();
                     let f = self.module.get_function("bruto_file_filesize").unwrap();
-                    let r = self.builder.build_call(f, &[s.into()], "fs2")
+                    let r = self
+                        .builder
+                        .build_call(f, &[s.into()], "fs2")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(r);
                 }
                 if name == "concat" && args.len() >= 2 {
@@ -2776,17 +3923,27 @@ impl<'ctx> CodeGen<'ctx> {
                     let mut result = self.compile_expr(&args[0])?;
                     for arg in &args[1..] {
                         let next = self.compile_expr(arg)?;
-                        result = self.builder.build_call(concat_fn, &[result.into(), next.into()], "concat")
+                        result = self
+                            .builder
+                            .build_call(concat_fn, &[result.into(), next.into()], "concat")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                            .try_as_basic_value().basic().unwrap();
+                            .try_as_basic_value()
+                            .basic()
+                            .unwrap();
                     }
                     return Ok(result);
                 }
                 // Indirect call through a procedural parameter.
-                if let Some(PascalType::Proc { params: ptypes, return_type }) = self.var_types.get(name.as_str()).cloned() {
+                if let Some(PascalType::Proc {
+                    params: ptypes,
+                    return_type,
+                }) = self.var_types.get(name.as_str()).cloned()
+                {
                     let alloca = *self.variables.get(name.as_str()).unwrap();
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let fp = self.builder.build_load(ptr_ty, alloca, "fp")
+                    let fp = self
+                        .builder
+                        .build_load(ptr_ty, alloca, "fp")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                         .into_pointer_value();
                     // Build the function type from the procedural signature.
@@ -2806,28 +3963,42 @@ impl<'ctx> CodeGen<'ctx> {
                         let v = self.compile_expr(arg)?;
                         call_args.push(v.into());
                     }
-                    let ret = self.builder.build_indirect_call(fn_type, fp, &call_args, "icall")
+                    let ret = self
+                        .builder
+                        .build_indirect_call(fn_type, fp, &call_args, "icall")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    return ret.try_as_basic_value().basic()
-                        .ok_or_else(|| CodeGenError::new(format!("procedural variable '{name}' does not return a value"), Some(*span)));
+                    return ret.try_as_basic_value().basic().ok_or_else(|| {
+                        CodeGenError::new(
+                            format!("procedural variable '{name}' does not return a value"),
+                            Some(*span),
+                        )
+                    });
                 }
-                let func = self.module.get_function(name)
-                    .ok_or_else(|| CodeGenError::new(format!("undefined function '{name}'"), Some(*span)))?;
+                let func = self.module.get_function(name).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined function '{name}'"), Some(*span))
+                })?;
                 let call_args = self.compile_call_args(name, args, *span)?;
-                let ret = self.builder.build_call(func, &call_args, "call")
+                let ret = self
+                    .builder
+                    .build_call(func, &call_args, "call")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                ret.try_as_basic_value().basic()
-                    .ok_or_else(|| CodeGenError::new(format!("function '{name}' does not return a value"), Some(*span)))
+                ret.try_as_basic_value().basic().ok_or_else(|| {
+                    CodeGenError::new(
+                        format!("function '{name}' does not return a value"),
+                        Some(*span),
+                    )
+                })
             }
             Expr::SetConstructor { elements, span } => {
                 self.compile_set_constructor(elements, *span)
             }
-            Expr::BinOp { op, left, right, span } => {
-                self.compile_binop(*op, left, right, *span)
-            }
-            Expr::UnaryOp { op, operand, span } => {
-                self.compile_unaryop(*op, operand, *span)
-            }
+            Expr::BinOp {
+                op,
+                left,
+                right,
+                span,
+            } => self.compile_binop(*op, left, right, *span),
+            Expr::UnaryOp { op, operand, span } => self.compile_unaryop(*op, operand, *span),
         }
     }
 
@@ -2837,33 +4008,41 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let set_ty = self.context.i64_type().array_type(4);
-        let alloca = self.builder.build_alloca(set_ty, "set_tmp")
+        let alloca = self
+            .builder
+            .build_alloca(set_ty, "set_tmp")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         // Zero-initialize with memset
         let i8_ptr = self.context.ptr_type(AddressSpace::default());
-        let memset_fn = self.module.get_function("llvm.memset.p0.i64").unwrap_or_else(|| {
-            let fn_type = self.context.void_type().fn_type(
+        let memset_fn = self
+            .module
+            .get_function("llvm.memset.p0.i64")
+            .unwrap_or_else(|| {
+                let fn_type = self.context.void_type().fn_type(
+                    &[
+                        i8_ptr.into(),
+                        self.context.i8_type().into(),
+                        self.context.i64_type().into(),
+                        self.context.bool_type().into(),
+                    ],
+                    false,
+                );
+                self.module
+                    .add_function("llvm.memset.p0.i64", fn_type, None)
+            });
+        self.builder
+            .build_call(
+                memset_fn,
                 &[
-                    i8_ptr.into(),
-                    self.context.i8_type().into(),
-                    self.context.i64_type().into(),
-                    self.context.bool_type().into(),
+                    alloca.into(),
+                    self.context.i8_type().const_int(0, false).into(),
+                    self.context.i64_type().const_int(32, false).into(),
+                    self.context.bool_type().const_int(0, false).into(),
                 ],
-                false,
-            );
-            self.module.add_function("llvm.memset.p0.i64", fn_type, None)
-        });
-        self.builder.build_call(
-            memset_fn,
-            &[
-                alloca.into(),
-                self.context.i8_type().const_int(0, false).into(),
-                self.context.i64_type().const_int(32, false).into(),
-                self.context.bool_type().const_int(0, false).into(),
-            ],
-            "",
-        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                "",
+            )
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
         let i64_ty = self.context.i64_type();
         let zero = i64_ty.const_int(0, false);
@@ -2877,101 +4056,145 @@ impl<'ctx> CodeGen<'ctx> {
                     let ord = ord_val.into_int_value();
                     // Extend to i64 if needed (e.g., from i8 for char)
                     let ord = if ord.get_type().get_bit_width() < 64 {
-                        self.builder.build_int_z_extend(ord, i64_ty, "ord_ext")
+                        self.builder
+                            .build_int_z_extend(ord, i64_ty, "ord_ext")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     } else {
                         ord
                     };
                     // word_idx = ord / 64, bit_idx = ord % 64
-                    let word_idx = self.builder.build_int_unsigned_div(ord, sixty_four, "word_idx")
+                    let word_idx = self
+                        .builder
+                        .build_int_unsigned_div(ord, sixty_four, "word_idx")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    let bit_idx = self.builder.build_int_unsigned_rem(ord, sixty_four, "bit_idx")
+                    let bit_idx = self
+                        .builder
+                        .build_int_unsigned_rem(ord, sixty_four, "bit_idx")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    let mask = self.builder.build_left_shift(one_i64, bit_idx, "mask")
+                    let mask = self
+                        .builder
+                        .build_left_shift(one_i64, bit_idx, "mask")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     // GEP into the word
                     let gep = unsafe {
-                        self.builder.build_in_bounds_gep(
-                            set_ty, alloca,
-                            &[zero, word_idx],
-                            "set_word_ptr",
-                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        self.builder
+                            .build_in_bounds_gep(set_ty, alloca, &[zero, word_idx], "set_word_ptr")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     };
-                    let cur = self.builder.build_load(i64_ty, gep, "cur_word")
+                    let cur = self
+                        .builder
+                        .build_load(i64_ty, gep, "cur_word")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    let new = self.builder.build_or(cur.into_int_value(), mask, "new_word")
+                    let new = self
+                        .builder
+                        .build_or(cur.into_int_value(), mask, "new_word")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    self.builder.build_store(gep, new)
+                    self.builder
+                        .build_store(gep, new)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 }
                 SetElement::Range(lo_expr, hi_expr) => {
                     let lo_val = self.compile_expr(lo_expr)?.into_int_value();
                     let hi_val = self.compile_expr(hi_expr)?.into_int_value();
                     let lo_val = if lo_val.get_type().get_bit_width() < 64 {
-                        self.builder.build_int_z_extend(lo_val, i64_ty, "lo_ext")
+                        self.builder
+                            .build_int_z_extend(lo_val, i64_ty, "lo_ext")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     } else {
                         lo_val
                     };
                     let hi_val = if hi_val.get_type().get_bit_width() < 64 {
-                        self.builder.build_int_z_extend(hi_val, i64_ty, "hi_ext")
+                        self.builder
+                            .build_int_z_extend(hi_val, i64_ty, "hi_ext")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     } else {
                         hi_val
                     };
 
                     let current_fn = self.current_fn.unwrap();
-                    let loop_bb = self.context.append_basic_block(current_fn, "set_range_loop");
-                    let body_bb = self.context.append_basic_block(current_fn, "set_range_body");
-                    let done_bb = self.context.append_basic_block(current_fn, "set_range_done");
+                    let loop_bb = self
+                        .context
+                        .append_basic_block(current_fn, "set_range_loop");
+                    let body_bb = self
+                        .context
+                        .append_basic_block(current_fn, "set_range_body");
+                    let done_bb = self
+                        .context
+                        .append_basic_block(current_fn, "set_range_done");
 
                     // Store loop variable
-                    let iter_alloca = self.builder.build_alloca(i64_ty, "set_iter")
+                    let iter_alloca = self
+                        .builder
+                        .build_alloca(i64_ty, "set_iter")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    self.builder.build_store(iter_alloca, lo_val)
+                    self.builder
+                        .build_store(iter_alloca, lo_val)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    self.builder.build_unconditional_branch(loop_bb)
+                    self.builder
+                        .build_unconditional_branch(loop_bb)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
                     // Loop header: check iter <= hi
                     self.builder.position_at_end(loop_bb);
-                    let iter_val = self.builder.build_load(i64_ty, iter_alloca, "iter")
+                    let iter_val = self
+                        .builder
+                        .build_load(i64_ty, iter_alloca, "iter")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                         .into_int_value();
-                    let cond = self.builder.build_int_compare(
-                        inkwell::IntPredicate::SLE, iter_val, hi_val, "range_cond",
-                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    self.builder.build_conditional_branch(cond, body_bb, done_bb)
+                    let cond = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::SLE,
+                            iter_val,
+                            hi_val,
+                            "range_cond",
+                        )
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder
+                        .build_conditional_branch(cond, body_bb, done_bb)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
                     // Loop body: set bit for iter_val
                     self.builder.position_at_end(body_bb);
-                    let word_idx = self.builder.build_int_unsigned_div(iter_val, sixty_four, "word_idx")
+                    let word_idx = self
+                        .builder
+                        .build_int_unsigned_div(iter_val, sixty_four, "word_idx")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    let bit_idx = self.builder.build_int_unsigned_rem(iter_val, sixty_four, "bit_idx")
+                    let bit_idx = self
+                        .builder
+                        .build_int_unsigned_rem(iter_val, sixty_four, "bit_idx")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    let mask = self.builder.build_left_shift(one_i64, bit_idx, "mask")
+                    let mask = self
+                        .builder
+                        .build_left_shift(one_i64, bit_idx, "mask")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     let gep = unsafe {
-                        self.builder.build_in_bounds_gep(
-                            set_ty, alloca,
-                            &[zero, word_idx],
-                            "set_word_ptr",
-                        ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        self.builder
+                            .build_in_bounds_gep(set_ty, alloca, &[zero, word_idx], "set_word_ptr")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     };
-                    let cur = self.builder.build_load(i64_ty, gep, "cur_word")
+                    let cur = self
+                        .builder
+                        .build_load(i64_ty, gep, "cur_word")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    let new = self.builder.build_or(cur.into_int_value(), mask, "new_word")
+                    let new = self
+                        .builder
+                        .build_or(cur.into_int_value(), mask, "new_word")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    self.builder.build_store(gep, new)
+                    self.builder
+                        .build_store(gep, new)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
                     // Increment
-                    let next = self.builder.build_int_add(iter_val, one_i64, "next_iter")
+                    let next = self
+                        .builder
+                        .build_int_add(iter_val, one_i64, "next_iter")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    self.builder.build_store(iter_alloca, next)
+                    self.builder
+                        .build_store(iter_alloca, next)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    self.builder.build_unconditional_branch(loop_bb)
+                    self.builder
+                        .build_unconditional_branch(loop_bb)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
                     self.builder.position_at_end(done_bb);
@@ -2980,38 +4203,70 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         // Load and return the set value
-        let result = self.builder.build_load(set_ty, alloca, "set_val")
+        let result = self
+            .builder
+            .build_load(set_ty, alloca, "set_val")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(result)
     }
 
     fn resolve_type(&self, ty: &PascalType) -> PascalType {
         match ty {
-            PascalType::Named(name) => {
-                self.type_defs.get(name).map(|t| self.resolve_type(t)).unwrap_or(PascalType::Integer)
-            }
+            PascalType::Named(name) => self
+                .type_defs
+                .get(name)
+                .map(|t| self.resolve_type(t))
+                .unwrap_or(PascalType::Integer),
             PascalType::Pointer(inner) => PascalType::Pointer(Box::new(self.resolve_type(inner))),
             PascalType::Array { lo, hi, elem } => PascalType::Array {
-                lo: *lo, hi: *hi, elem: Box::new(self.resolve_type(elem)),
+                lo: *lo,
+                hi: *hi,
+                elem: Box::new(self.resolve_type(elem)),
             },
             PascalType::Record { fields, variant } => PascalType::Record {
-                fields: fields.iter().map(|(n, t)| (n.clone(), self.resolve_type(t))).collect(),
-                variant: variant.as_ref().map(|v| Box::new(RecordVariant {
-                    tag_name: v.tag_name.clone(),
-                    tag_type: self.resolve_type(&v.tag_type),
-                    variants: v.variants.iter().map(|(vals, vf)| {
-                        (vals.clone(), vf.iter().map(|(n, t)| (n.clone(), self.resolve_type(t))).collect())
-                    }).collect(),
-                })),
+                fields: fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), self.resolve_type(t)))
+                    .collect(),
+                variant: variant.as_ref().map(|v| {
+                    Box::new(RecordVariant {
+                        tag_name: v.tag_name.clone(),
+                        tag_type: self.resolve_type(&v.tag_type),
+                        variants: v
+                            .variants
+                            .iter()
+                            .map(|(vals, vf)| {
+                                (
+                                    vals.clone(),
+                                    vf.iter()
+                                        .map(|(n, t)| (n.clone(), self.resolve_type(t)))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    })
+                }),
             },
-            PascalType::Set { elem } => PascalType::Set { elem: Box::new(self.resolve_type(elem)) },
-            PascalType::File { elem } => PascalType::File { elem: Box::new(self.resolve_type(elem)) },
-            PascalType::Proc { params, return_type } => PascalType::Proc {
+            PascalType::Set { elem } => PascalType::Set {
+                elem: Box::new(self.resolve_type(elem)),
+            },
+            PascalType::File { elem } => PascalType::File {
+                elem: Box::new(self.resolve_type(elem)),
+            },
+            PascalType::Proc {
+                params,
+                return_type,
+            } => PascalType::Proc {
                 params: params.iter().map(|t| self.resolve_type(t)).collect(),
                 return_type: return_type.as_ref().map(|t| Box::new(self.resolve_type(t))),
             },
-            PascalType::ConformantArray { lo_name, hi_name, elem } => PascalType::ConformantArray {
-                lo_name: lo_name.clone(), hi_name: hi_name.clone(),
+            PascalType::ConformantArray {
+                lo_name,
+                hi_name,
+                elem,
+            } => PascalType::ConformantArray {
+                lo_name: lo_name.clone(),
+                hi_name: hi_name.clone(),
                 elem: Box::new(self.resolve_type(elem)),
             },
             PascalType::Enum { .. } | PascalType::Subrange { .. } => ty.clone(),
@@ -3021,63 +4276,86 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn create_debug_type(&self, ty: &PascalType) -> Option<DIType<'ctx>> {
         match ty {
-            PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
-                self.di_builder.create_basic_type("long", 64, 0x05, DIFlags::ZERO)
-                    .ok().map(|t| t.as_type())
-            }
-            PascalType::Real => {
-                self.di_builder.create_basic_type("double", 64, 0x04, DIFlags::ZERO)
-                    .ok().map(|t| t.as_type())
-            }
-            PascalType::Boolean => {
-                self.di_builder.create_basic_type("bool", 8, 0x02, DIFlags::ZERO)
-                    .ok().map(|t| t.as_type())
-            }
-            PascalType::Char => {
-                self.di_builder.create_basic_type("char", 8, 0x08, DIFlags::ZERO)
-                    .ok().map(|t| t.as_type())
-            }
+            PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => self
+                .di_builder
+                .create_basic_type("long", 64, 0x05, DIFlags::ZERO)
+                .ok()
+                .map(|t| t.as_type()),
+            PascalType::Real => self
+                .di_builder
+                .create_basic_type("double", 64, 0x04, DIFlags::ZERO)
+                .ok()
+                .map(|t| t.as_type()),
+            PascalType::Boolean => self
+                .di_builder
+                .create_basic_type("bool", 8, 0x02, DIFlags::ZERO)
+                .ok()
+                .map(|t| t.as_type()),
+            PascalType::Char => self
+                .di_builder
+                .create_basic_type("char", 8, 0x08, DIFlags::ZERO)
+                .ok()
+                .map(|t| t.as_type()),
             PascalType::String => {
                 // char * — pointer to char, so lldb shows the string content
-                let char_ty = self.di_builder.create_basic_type("char", 8, 0x08, DIFlags::ZERO).ok()?;
-                Some(self.di_builder.create_pointer_type(
-                    "char *",
-                    char_ty.as_type(),
-                    64,
-                    0,
-                    AddressSpace::default(),
-                ).as_type())
+                let char_ty = self
+                    .di_builder
+                    .create_basic_type("char", 8, 0x08, DIFlags::ZERO)
+                    .ok()?;
+                Some(
+                    self.di_builder
+                        .create_pointer_type(
+                            "char *",
+                            char_ty.as_type(),
+                            64,
+                            0,
+                            AddressSpace::default(),
+                        )
+                        .as_type(),
+                )
             }
             PascalType::Pointer(inner) => {
                 let inner_di = self.create_debug_type(inner)?;
-                Some(self.di_builder.create_pointer_type(
-                    "ptr",
-                    inner_di,
-                    64,
-                    0,
-                    AddressSpace::default(),
-                ).as_type())
+                Some(
+                    self.di_builder
+                        .create_pointer_type("ptr", inner_di, 64, 0, AddressSpace::default())
+                        .as_type(),
+                )
             }
             _ => {
                 // Arrays, records — use a generic opaque type
-                self.di_builder.create_basic_type("aggregate", 64, 0x05, DIFlags::ZERO)
-                    .ok().map(|t| t.as_type())
+                self.di_builder
+                    .create_basic_type("aggregate", 64, 0x05, DIFlags::ZERO)
+                    .ok()
+                    .map(|t| t.as_type())
             }
         }
     }
 
     fn llvm_type_for(&self, ty: &PascalType) -> inkwell::types::BasicTypeEnum<'ctx> {
         match ty {
-            PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => self.context.i64_type().as_basic_type_enum(),
+            PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
+                self.context.i64_type().as_basic_type_enum()
+            }
             PascalType::Real => self.context.f64_type().as_basic_type_enum(),
             PascalType::Boolean => self.context.bool_type().as_basic_type_enum(),
             PascalType::Char => self.context.i8_type().as_basic_type_enum(),
-            PascalType::String | PascalType::Pointer(_) => {
-                self.context.ptr_type(AddressSpace::default()).as_basic_type_enum()
-            }
-            PascalType::File { .. } => self.context.ptr_type(AddressSpace::default()).as_basic_type_enum(),
-            PascalType::Proc { .. } => self.context.ptr_type(AddressSpace::default()).as_basic_type_enum(),
-            PascalType::ConformantArray { .. } => self.context.ptr_type(AddressSpace::default()).as_basic_type_enum(),
+            PascalType::String | PascalType::Pointer(_) => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .as_basic_type_enum(),
+            PascalType::File { .. } => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .as_basic_type_enum(),
+            PascalType::Proc { .. } => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .as_basic_type_enum(),
+            PascalType::ConformantArray { .. } => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .as_basic_type_enum(),
             PascalType::Set { .. } => self.context.i64_type().array_type(4).as_basic_type_enum(),
             PascalType::Array { lo, hi, elem } => {
                 let count = (hi - lo + 1).max(0) as u32;
@@ -3089,14 +4367,24 @@ impl<'ctx> CodeGen<'ctx> {
                     fields.iter().map(|(_, t)| self.llvm_type_for(t)).collect();
                 if let Some(v) = variant {
                     field_types.push(self.llvm_type_for(&v.tag_type));
-                    let max_size = v.variants.iter()
+                    let max_size = v
+                        .variants
+                        .iter()
                         .map(|(_, vf)| vf.iter().map(|(_, t)| self.sizeof_type(t)).sum::<u64>())
-                        .max().unwrap_or(0);
+                        .max()
+                        .unwrap_or(0);
                     if max_size > 0 {
-                        field_types.push(self.context.i8_type().array_type(max_size as u32).as_basic_type_enum());
+                        field_types.push(
+                            self.context
+                                .i8_type()
+                                .array_type(max_size as u32)
+                                .as_basic_type_enum(),
+                        );
                     }
                 }
-                self.context.struct_type(&field_types, false).as_basic_type_enum()
+                self.context
+                    .struct_type(&field_types, false)
+                    .as_basic_type_enum()
             }
             PascalType::Named(_) => {
                 let resolved = self.resolve_type(ty);
@@ -3126,39 +4414,52 @@ impl<'ctx> CodeGen<'ctx> {
             // lhs is the ordinal, rhs is the set ([4 x i64])
             let ord = lhs.into_int_value();
             let ord = if ord.get_type().get_bit_width() < 64 {
-                self.builder.build_int_z_extend(ord, i64_ty, "ord_ext")
+                self.builder
+                    .build_int_z_extend(ord, i64_ty, "ord_ext")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             } else {
                 ord
             };
 
             // Store set to alloca so we can GEP into it
-            let set_alloca = self.builder.build_alloca(set_ty, "set_in_tmp")
+            let set_alloca = self
+                .builder
+                .build_alloca(set_ty, "set_in_tmp")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            self.builder.build_store(set_alloca, rhs)
+            self.builder
+                .build_store(set_alloca, rhs)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
-            let word_idx = self.builder.build_int_unsigned_div(ord, sixty_four, "word_idx")
+            let word_idx = self
+                .builder
+                .build_int_unsigned_div(ord, sixty_four, "word_idx")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            let bit_idx = self.builder.build_int_unsigned_rem(ord, sixty_four, "bit_idx")
+            let bit_idx = self
+                .builder
+                .build_int_unsigned_rem(ord, sixty_four, "bit_idx")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            let mask = self.builder.build_left_shift(one_i64, bit_idx, "mask")
+            let mask = self
+                .builder
+                .build_left_shift(one_i64, bit_idx, "mask")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
             let gep = unsafe {
-                self.builder.build_in_bounds_gep(
-                    set_ty, set_alloca,
-                    &[zero, word_idx],
-                    "set_word_ptr",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                self.builder
+                    .build_in_bounds_gep(set_ty, set_alloca, &[zero, word_idx], "set_word_ptr")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             };
-            let word = self.builder.build_load(i64_ty, gep, "word")
+            let word = self
+                .builder
+                .build_load(i64_ty, gep, "word")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            let anded = self.builder.build_and(word.into_int_value(), mask, "anded")
+            let anded = self
+                .builder
+                .build_and(word.into_int_value(), mask, "anded")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            let result = self.builder.build_int_compare(
-                inkwell::IntPredicate::NE, anded, zero, "in_result",
-            ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let result = self
+                .builder
+                .build_int_compare(inkwell::IntPredicate::NE, anded, zero, "in_result")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return Ok(result.into());
         }
 
@@ -3168,13 +4469,19 @@ impl<'ctx> CodeGen<'ctx> {
             let set_ty = i64_ty.array_type(4);
             let zero = i64_ty.const_int(0, false);
 
-            let l_alloca = self.builder.build_alloca(set_ty, "set_l")
+            let l_alloca = self
+                .builder
+                .build_alloca(set_ty, "set_l")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            self.builder.build_store(l_alloca, lhs)
+            self.builder
+                .build_store(l_alloca, lhs)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            let r_alloca = self.builder.build_alloca(set_ty, "set_r")
+            let r_alloca = self
+                .builder
+                .build_alloca(set_ty, "set_r")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            self.builder.build_store(r_alloca, rhs)
+            self.builder
+                .build_store(r_alloca, rhs)
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
             // Set comparison operators return a boolean, not a set
@@ -3185,103 +4492,150 @@ impl<'ctx> CodeGen<'ctx> {
                 for i in 0..4u64 {
                     let idx = i64_ty.const_int(i, false);
                     let l_gep = unsafe {
-                        self.builder.build_in_bounds_gep(set_ty, l_alloca, &[zero, idx], "lg")
+                        self.builder
+                            .build_in_bounds_gep(set_ty, l_alloca, &[zero, idx], "lg")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     };
                     let r_gep = unsafe {
-                        self.builder.build_in_bounds_gep(set_ty, r_alloca, &[zero, idx], "rg")
+                        self.builder
+                            .build_in_bounds_gep(set_ty, r_alloca, &[zero, idx], "rg")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     };
-                    let lw = self.builder.build_load(i64_ty, l_gep, "lw")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
-                    let rw = self.builder.build_load(i64_ty, r_gep, "rw")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+                    let lw = self
+                        .builder
+                        .build_load(i64_ty, l_gep, "lw")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        .into_int_value();
+                    let rw = self
+                        .builder
+                        .build_load(i64_ty, r_gep, "rw")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        .into_int_value();
 
                     let word_ok = match op {
                         BinOp::Eq | BinOp::Neq => {
                             // Per-word equality
-                            self.builder.build_int_compare(inkwell::IntPredicate::EQ, lw, rw, "weq")
+                            self.builder
+                                .build_int_compare(inkwell::IntPredicate::EQ, lw, rw, "weq")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                         }
                         BinOp::Lte => {
                             // Subset: (l & ~r) == 0
-                            let not_r = self.builder.build_not(rw, "not_r")
+                            let not_r = self
+                                .builder
+                                .build_not(rw, "not_r")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                            let diff = self.builder.build_and(lw, not_r, "diff")
+                            let diff = self
+                                .builder
+                                .build_and(lw, not_r, "diff")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                            self.builder.build_int_compare(inkwell::IntPredicate::EQ, diff, zero, "sub_ok")
+                            self.builder
+                                .build_int_compare(inkwell::IntPredicate::EQ, diff, zero, "sub_ok")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                         }
                         BinOp::Gte => {
                             // Superset: (r & ~l) == 0
-                            let not_l = self.builder.build_not(lw, "not_l")
+                            let not_l = self
+                                .builder
+                                .build_not(lw, "not_l")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                            let diff = self.builder.build_and(rw, not_l, "diff")
+                            let diff = self
+                                .builder
+                                .build_and(rw, not_l, "diff")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                            self.builder.build_int_compare(inkwell::IntPredicate::EQ, diff, zero, "sup_ok")
+                            self.builder
+                                .build_int_compare(inkwell::IntPredicate::EQ, diff, zero, "sup_ok")
                                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                         }
                         _ => unreachable!(),
                     };
-                    acc = self.builder.build_and(acc, word_ok, "acc")
+                    acc = self
+                        .builder
+                        .build_and(acc, word_ok, "acc")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 }
                 // For <>, negate the final result
                 if op == BinOp::Neq {
-                    acc = self.builder.build_not(acc, "neq_result")
+                    acc = self
+                        .builder
+                        .build_not(acc, "neq_result")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 }
                 return Ok(acc.into());
             }
 
             // Set arithmetic ops (+, -, *) return a set
-            let out_alloca = self.builder.build_alloca(set_ty, "set_out")
+            let out_alloca = self
+                .builder
+                .build_alloca(set_ty, "set_out")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
             for i in 0..4u64 {
                 let idx = i64_ty.const_int(i, false);
                 let l_gep = unsafe {
-                    self.builder.build_in_bounds_gep(set_ty, l_alloca, &[zero, idx], "lg")
+                    self.builder
+                        .build_in_bounds_gep(set_ty, l_alloca, &[zero, idx], "lg")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 };
                 let r_gep = unsafe {
-                    self.builder.build_in_bounds_gep(set_ty, r_alloca, &[zero, idx], "rg")
+                    self.builder
+                        .build_in_bounds_gep(set_ty, r_alloca, &[zero, idx], "rg")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 };
                 let o_gep = unsafe {
-                    self.builder.build_in_bounds_gep(set_ty, out_alloca, &[zero, idx], "og")
+                    self.builder
+                        .build_in_bounds_gep(set_ty, out_alloca, &[zero, idx], "og")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 };
-                let lw = self.builder.build_load(i64_ty, l_gep, "lw")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
-                let rw = self.builder.build_load(i64_ty, r_gep, "rw")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into_int_value();
+                let lw = self
+                    .builder
+                    .build_load(i64_ty, l_gep, "lw")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into_int_value();
+                let rw = self
+                    .builder
+                    .build_load(i64_ty, r_gep, "rw")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into_int_value();
 
                 let result_word = match op {
                     BinOp::Add => {
                         // Union: OR
-                        self.builder.build_or(lw, rw, "union")
+                        self.builder
+                            .build_or(lw, rw, "union")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                     BinOp::Sub => {
                         // Difference: AND(l, NOT(r))
-                        let not_r = self.builder.build_not(rw, "not_r")
+                        let not_r = self
+                            .builder
+                            .build_not(rw, "not_r")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                        self.builder.build_and(lw, not_r, "diff")
+                        self.builder
+                            .build_and(lw, not_r, "diff")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                     BinOp::Mul => {
                         // Intersection: AND
-                        self.builder.build_and(lw, rw, "isect")
+                        self.builder
+                            .build_and(lw, rw, "isect")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
-                    _ => return Err(CodeGenError::new("unsupported operator for set type", Some(span))),
+                    _ => {
+                        return Err(CodeGenError::new(
+                            "unsupported operator for set type",
+                            Some(span),
+                        ));
+                    }
                 };
-                self.builder.build_store(o_gep, result_word)
+                self.builder
+                    .build_store(o_gep, result_word)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             }
 
-            let result = self.builder.build_load(set_ty, out_alloca, "set_result")
+            let result = self
+                .builder
+                .build_load(set_ty, out_alloca, "set_result")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return Ok(result);
         }
@@ -3289,7 +4643,9 @@ impl<'ctx> CodeGen<'ctx> {
         // Real division (/) always uses float even for integer operands
         if op == BinOp::RealDiv {
             let f64_ty = self.context.f64_type();
-            let promote = |val: BasicValueEnum<'ctx>, b: &Builder<'ctx>| -> Result<inkwell::values::FloatValue<'ctx>, CodeGenError> {
+            let promote = |val: BasicValueEnum<'ctx>,
+                           b: &Builder<'ctx>|
+             -> Result<inkwell::values::FloatValue<'ctx>, CodeGenError> {
                 if val.is_float_value() {
                     Ok(val.into_float_value())
                 } else if val.is_int_value() {
@@ -3301,7 +4657,9 @@ impl<'ctx> CodeGen<'ctx> {
             };
             let l = promote(lhs, &self.builder)?;
             let r = promote(rhs, &self.builder)?;
-            let result = self.builder.build_float_div(l, r, "rdiv")
+            let result = self
+                .builder
+                .build_float_div(l, r, "rdiv")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return Ok(result.into());
         }
@@ -3313,9 +4671,13 @@ impl<'ctx> CodeGen<'ctx> {
 
             // For comparison operators on booleans, extend to i64 first
             let (l, r) = if l.get_type().get_bit_width() != r.get_type().get_bit_width() {
-                let l64 = self.builder.build_int_z_extend(l, self.context.i64_type(), "zext_l")
+                let l64 = self
+                    .builder
+                    .build_int_z_extend(l, self.context.i64_type(), "zext_l")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                let r64 = self.builder.build_int_z_extend(r, self.context.i64_type(), "zext_r")
+                let r64 = self
+                    .builder
+                    .build_int_z_extend(r, self.context.i64_type(), "zext_r")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 (l64, r64)
             } else {
@@ -3327,7 +4689,8 @@ impl<'ctx> CodeGen<'ctx> {
                     if self.directives.overflow_check && l.get_type().get_bit_width() == 64 {
                         self.emit_checked_arith("llvm.sadd.with.overflow.i64", l, r, span)?
                     } else {
-                        self.builder.build_int_add(l, r, "add")
+                        self.builder
+                            .build_int_add(l, r, "add")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                 }
@@ -3335,7 +4698,8 @@ impl<'ctx> CodeGen<'ctx> {
                     if self.directives.overflow_check && l.get_type().get_bit_width() == 64 {
                         self.emit_checked_arith("llvm.ssub.with.overflow.i64", l, r, span)?
                     } else {
-                        self.builder.build_int_sub(l, r, "sub")
+                        self.builder
+                            .build_int_sub(l, r, "sub")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                 }
@@ -3343,29 +4707,50 @@ impl<'ctx> CodeGen<'ctx> {
                     if self.directives.overflow_check && l.get_type().get_bit_width() == 64 {
                         self.emit_checked_arith("llvm.smul.with.overflow.i64", l, r, span)?
                     } else {
-                        self.builder.build_int_mul(l, r, "mul")
+                        self.builder
+                            .build_int_mul(l, r, "mul")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                 }
-                BinOp::Div => self.builder.build_int_signed_div(l, r, "div")
+                BinOp::Div => self
+                    .builder
+                    .build_int_signed_div(l, r, "div")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Mod => self.builder.build_int_signed_rem(l, r, "mod_")
+                BinOp::Mod => self
+                    .builder
+                    .build_int_signed_rem(l, r, "mod_")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Eq => self.builder.build_int_compare(inkwell::IntPredicate::EQ, l, r, "eq")
+                BinOp::Eq => self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::EQ, l, r, "eq")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Neq => self.builder.build_int_compare(inkwell::IntPredicate::NE, l, r, "neq")
+                BinOp::Neq => self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::NE, l, r, "neq")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Lt => self.builder.build_int_compare(inkwell::IntPredicate::SLT, l, r, "lt")
+                BinOp::Lt => self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::SLT, l, r, "lt")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Gt => self.builder.build_int_compare(inkwell::IntPredicate::SGT, l, r, "gt")
+                BinOp::Gt => self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::SGT, l, r, "gt")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Lte => self.builder.build_int_compare(inkwell::IntPredicate::SLE, l, r, "lte")
+                BinOp::Lte => self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::SLE, l, r, "lte")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Gte => self.builder.build_int_compare(inkwell::IntPredicate::SGE, l, r, "gte")
+                BinOp::Gte => self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::SGE, l, r, "gte")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::And => self.builder.build_and(l, r, "and")
+                BinOp::And => self
+                    .builder
+                    .build_and(l, r, "and")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Or => self.builder.build_or(l, r, "or")
+                BinOp::Or => self
+                    .builder
+                    .build_or(l, r, "or")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
                 BinOp::RealDiv | BinOp::In => unreachable!("handled above"),
             };
@@ -3376,7 +4761,9 @@ impl<'ctx> CodeGen<'ctx> {
         // Float arithmetic (including int-to-float promotion)
         if lhs.is_float_value() || rhs.is_float_value() {
             let f64_ty = self.context.f64_type();
-            let promote = |val: BasicValueEnum<'ctx>, b: &Builder<'ctx>| -> Result<inkwell::values::FloatValue<'ctx>, CodeGenError> {
+            let promote = |val: BasicValueEnum<'ctx>,
+                           b: &Builder<'ctx>|
+             -> Result<inkwell::values::FloatValue<'ctx>, CodeGenError> {
                 if val.is_float_value() {
                     Ok(val.into_float_value())
                 } else if val.is_int_value() {
@@ -3390,27 +4777,62 @@ impl<'ctx> CodeGen<'ctx> {
             let r = promote(rhs, &self.builder)?;
 
             let result: BasicValueEnum = match op {
-                BinOp::Add => self.builder.build_float_add(l, r, "fadd")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Sub => self.builder.build_float_sub(l, r, "fsub")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Mul => self.builder.build_float_mul(l, r, "fmul")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Div | BinOp::RealDiv => self.builder.build_float_div(l, r, "fdiv")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Eq => self.builder.build_float_compare(inkwell::FloatPredicate::OEQ, l, r, "feq")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Neq => self.builder.build_float_compare(inkwell::FloatPredicate::ONE, l, r, "fne")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Lt => self.builder.build_float_compare(inkwell::FloatPredicate::OLT, l, r, "flt")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Gt => self.builder.build_float_compare(inkwell::FloatPredicate::OGT, l, r, "fgt")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Lte => self.builder.build_float_compare(inkwell::FloatPredicate::OLE, l, r, "fle")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                BinOp::Gte => self.builder.build_float_compare(inkwell::FloatPredicate::OGE, l, r, "fge")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into(),
-                _ => return Err(CodeGenError::new("unsupported operator for real type", Some(span))),
+                BinOp::Add => self
+                    .builder
+                    .build_float_add(l, r, "fadd")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Sub => self
+                    .builder
+                    .build_float_sub(l, r, "fsub")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Mul => self
+                    .builder
+                    .build_float_mul(l, r, "fmul")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Div | BinOp::RealDiv => self
+                    .builder
+                    .build_float_div(l, r, "fdiv")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Eq => self
+                    .builder
+                    .build_float_compare(inkwell::FloatPredicate::OEQ, l, r, "feq")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Neq => self
+                    .builder
+                    .build_float_compare(inkwell::FloatPredicate::ONE, l, r, "fne")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Lt => self
+                    .builder
+                    .build_float_compare(inkwell::FloatPredicate::OLT, l, r, "flt")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Gt => self
+                    .builder
+                    .build_float_compare(inkwell::FloatPredicate::OGT, l, r, "fgt")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Lte => self
+                    .builder
+                    .build_float_compare(inkwell::FloatPredicate::OLE, l, r, "fle")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                BinOp::Gte => self
+                    .builder
+                    .build_float_compare(inkwell::FloatPredicate::OGE, l, r, "fge")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into(),
+                _ => {
+                    return Err(CodeGenError::new(
+                        "unsupported operator for real type",
+                        Some(span),
+                    ));
+                }
             };
             return Ok(result);
         }
@@ -3422,34 +4844,51 @@ impl<'ctx> CodeGen<'ctx> {
             // If either side is nil or a pointer (not string), compare addresses directly.
             let lt = self.infer_expr_type(left);
             let rt = self.infer_expr_type(right);
-            let is_ptr_cmp = matches!(op, BinOp::Eq | BinOp::Neq) && (
-                matches!(lt, PascalType::Pointer(_)) ||
-                matches!(rt, PascalType::Pointer(_))
-            );
+            let is_ptr_cmp = matches!(op, BinOp::Eq | BinOp::Neq)
+                && (matches!(lt, PascalType::Pointer(_)) || matches!(rt, PascalType::Pointer(_)));
             if is_ptr_cmp {
                 let i64_ty = self.context.i64_type();
-                let li = self.builder.build_ptr_to_int(l, i64_ty, "li")
+                let li = self
+                    .builder
+                    .build_ptr_to_int(l, i64_ty, "li")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                let ri = self.builder.build_ptr_to_int(r, i64_ty, "ri")
+                let ri = self
+                    .builder
+                    .build_ptr_to_int(r, i64_ty, "ri")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                let pred = if op == BinOp::Eq { inkwell::IntPredicate::EQ } else { inkwell::IntPredicate::NE };
-                let result = self.builder.build_int_compare(pred, li, ri, "pcmp")
+                let pred = if op == BinOp::Eq {
+                    inkwell::IntPredicate::EQ
+                } else {
+                    inkwell::IntPredicate::NE
+                };
+                let result = self
+                    .builder
+                    .build_int_compare(pred, li, ri, "pcmp")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 return Ok(result.into());
             }
             match op {
                 BinOp::Add => {
                     let concat = self.module.get_function("bruto_str_concat").unwrap();
-                    let result = self.builder.build_call(concat, &[l.into(), r.into()], "concat")
+                    let result = self
+                        .builder
+                        .build_call(concat, &[l.into(), r.into()], "concat")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                        .try_as_basic_value().basic().unwrap();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
                     return Ok(result);
                 }
                 BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => {
                     let cmp = self.module.get_function("bruto_str_compare").unwrap();
-                    let cmp_result = self.builder.build_call(cmp, &[l.into(), r.into()], "strcmp")
+                    let cmp_result = self
+                        .builder
+                        .build_call(cmp, &[l.into(), r.into()], "strcmp")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                        .try_as_basic_value().basic().unwrap().into_int_value();
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap()
+                        .into_int_value();
                     let zero = self.context.i32_type().const_int(0, false);
                     let pred = match op {
                         BinOp::Eq => inkwell::IntPredicate::EQ,
@@ -3460,7 +4899,9 @@ impl<'ctx> CodeGen<'ctx> {
                         BinOp::Gte => inkwell::IntPredicate::SGE,
                         _ => unreachable!(),
                     };
-                    let result = self.builder.build_int_compare(pred, cmp_result, zero, "scmp")
+                    let result = self
+                        .builder
+                        .build_int_compare(pred, cmp_result, zero, "scmp")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     return Ok(result.into());
                 }
@@ -3468,7 +4909,10 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
 
-        Err(CodeGenError::new("unsupported operand types for binary operator", Some(span)))
+        Err(CodeGenError::new(
+            "unsupported operand types for binary operator",
+            Some(span),
+        ))
     }
 
     fn compile_unaryop(
@@ -3483,7 +4927,9 @@ impl<'ctx> CodeGen<'ctx> {
             UnaryOp::Neg => {
                 if val.is_int_value() {
                     let iv = val.into_int_value();
-                    let result = self.builder.build_int_neg(iv, "neg")
+                    let result = self
+                        .builder
+                        .build_int_neg(iv, "neg")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     Ok(result.into())
                 } else {
@@ -3493,11 +4939,16 @@ impl<'ctx> CodeGen<'ctx> {
             UnaryOp::Not => {
                 if val.is_int_value() {
                     let iv = val.into_int_value();
-                    let result = self.builder.build_not(iv, "not")
+                    let result = self
+                        .builder
+                        .build_not(iv, "not")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                     Ok(result.into())
                 } else {
-                    Err(CodeGenError::new("cannot apply 'not' to non-integer/boolean", Some(span)))
+                    Err(CodeGenError::new(
+                        "cannot apply 'not' to non-integer/boolean",
+                        Some(span),
+                    ))
                 }
             }
         }
@@ -3517,34 +4968,53 @@ impl<'ctx> CodeGen<'ctx> {
         match base_type {
             PascalType::Array { lo, hi, elem } => {
                 self.emit_range_check(idx, *lo, *hi, span)?;
-                let adj = self.builder.build_int_sub(
-                    idx, self.context.i64_type().const_int(*lo as u64, true), "adj_idx",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                let adj = self
+                    .builder
+                    .build_int_sub(
+                        idx,
+                        self.context.i64_type().const_int(*lo as u64, true),
+                        "adj_idx",
+                    )
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 let gep = unsafe {
-                    self.builder.build_in_bounds_gep(
-                        self.llvm_type_for(base_type), base_ptr,
-                        &[self.context.i64_type().const_int(0, false), adj], "arr_gep",
-                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    self.builder
+                        .build_in_bounds_gep(
+                            self.llvm_type_for(base_type),
+                            base_ptr,
+                            &[self.context.i64_type().const_int(0, false), adj],
+                            "arr_gep",
+                        )
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 };
                 Ok((gep, elem.as_ref().clone()))
             }
             PascalType::ConformantArray { lo_name, elem, .. } => {
                 // Load runtime lo from the sibling alloca.
-                let lo_alloca = *self.variables.get(lo_name.as_str())
-                    .ok_or_else(|| CodeGenError::new(format!("conformant lo '{lo_name}' missing"), Some(span)))?;
-                let lo = self.builder.build_load(self.context.i64_type(), lo_alloca, "clo")
+                let lo_alloca = *self.variables.get(lo_name.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("conformant lo '{lo_name}' missing"), Some(span))
+                })?;
+                let lo = self
+                    .builder
+                    .build_load(self.context.i64_type(), lo_alloca, "clo")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     .into_int_value();
-                let adj = self.builder.build_int_sub(idx, lo, "cadj")
+                let adj = self
+                    .builder
+                    .build_int_sub(idx, lo, "cadj")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 let elem_size = self.sizeof_type(elem);
-                let off = self.builder.build_int_mul(
-                    adj, self.context.i64_type().const_int(elem_size, false), "coff",
-                ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                let off = self
+                    .builder
+                    .build_int_mul(
+                        adj,
+                        self.context.i64_type().const_int(elem_size, false),
+                        "coff",
+                    )
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
                 let gep = unsafe {
-                    self.builder.build_in_bounds_gep(
-                        self.context.i8_type(), base_ptr, &[off], "carr_gep",
-                    ).map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    self.builder
+                        .build_in_bounds_gep(self.context.i8_type(), base_ptr, &[off], "carr_gep")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 };
                 Ok((gep, elem.as_ref().clone()))
             }
@@ -3562,70 +5032,117 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<inkwell::values::IntValue<'ctx>, CodeGenError> {
         let i64_ty = self.context.i64_type();
         let i1_ty = self.context.bool_type();
-        let result_ty = self.context.struct_type(&[i64_ty.into(), i1_ty.into()], false);
+        let result_ty = self
+            .context
+            .struct_type(&[i64_ty.into(), i1_ty.into()], false);
         let func = self.module.get_function(intrinsic).unwrap_or_else(|| {
             let ft = result_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false);
             self.module.add_function(intrinsic, ft, None)
         });
-        let call = self.builder.build_call(func, &[l.into(), r.into()], "ovf_pair")
+        let call = self
+            .builder
+            .build_call(func, &[l.into(), r.into()], "ovf_pair")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        let agg = call.try_as_basic_value().basic().unwrap().into_struct_value();
-        let val = self.builder.build_extract_value(agg, 0, "ovf_val")
+        let agg = call
+            .try_as_basic_value()
+            .basic()
+            .unwrap()
+            .into_struct_value();
+        let val = self
+            .builder
+            .build_extract_value(agg, 0, "ovf_val")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             .into_int_value();
-        let flag = self.builder.build_extract_value(agg, 1, "ovf_flag")
+        let flag = self
+            .builder
+            .build_extract_value(agg, 1, "ovf_flag")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             .into_int_value();
         let cur_fn = self.current_fn.unwrap();
         let fail_bb = self.context.append_basic_block(cur_fn, "ovf_fail");
         let ok_bb = self.context.append_basic_block(cur_fn, "ovf_ok");
-        self.builder.build_conditional_branch(flag, fail_bb, ok_bb)
+        self.builder
+            .build_conditional_branch(flag, fail_bb, ok_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         self.builder.position_at_end(fail_bb);
         let f = self.module.get_function("bruto_overflow_fail").unwrap();
-        self.builder.build_call(f, &[i64_ty.const_int(span.line as u64, false).into()], "")
+        self.builder
+            .build_call(f, &[i64_ty.const_int(span.line as u64, false).into()], "")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        self.builder.build_unreachable()
+        self.builder
+            .build_unreachable()
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         self.builder.position_at_end(ok_bb);
         Ok(val)
     }
 
     /// If `{$R+}` is enabled, emit a check that `idx` is in `[lo, hi]` and abort otherwise.
-    fn emit_range_check(&mut self, idx: inkwell::values::IntValue<'ctx>, lo: i64, hi: i64, span: Span) -> Result<(), CodeGenError> {
-        if !self.directives.range_check { return Ok(()); }
+    fn emit_range_check(
+        &mut self,
+        idx: inkwell::values::IntValue<'ctx>,
+        lo: i64,
+        hi: i64,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        if !self.directives.range_check {
+            return Ok(());
+        }
         let i64_ty = self.context.i64_type();
         let lo_v = i64_ty.const_int(lo as u64, true);
         let hi_v = i64_ty.const_int(hi as u64, true);
         // Promote idx to i64 if needed.
         let idx = if idx.get_type().get_bit_width() < 64 {
-            self.builder.build_int_s_extend(idx, i64_ty, "rngx")
+            self.builder
+                .build_int_s_extend(idx, i64_ty, "rngx")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-        } else { idx };
-        let lt = self.builder.build_int_compare(inkwell::IntPredicate::SLT, idx, lo_v, "rng_lt")
+        } else {
+            idx
+        };
+        let lt = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::SLT, idx, lo_v, "rng_lt")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        let gt = self.builder.build_int_compare(inkwell::IntPredicate::SGT, idx, hi_v, "rng_gt")
+        let gt = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::SGT, idx, hi_v, "rng_gt")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        let bad = self.builder.build_or(lt, gt, "rng_bad")
+        let bad = self
+            .builder
+            .build_or(lt, gt, "rng_bad")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let func = self.current_fn.unwrap();
         let fail_bb = self.context.append_basic_block(func, "rng_fail");
         let ok_bb = self.context.append_basic_block(func, "rng_ok");
-        self.builder.build_conditional_branch(bad, fail_bb, ok_bb)
+        self.builder
+            .build_conditional_branch(bad, fail_bb, ok_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         self.builder.position_at_end(fail_bb);
         let f = self.module.get_function("bruto_range_check_fail").unwrap();
-        self.builder.build_call(f, &[
-            i64_ty.const_int(span.line as u64, false).into(),
-            lo_v.into(), hi_v.into(), idx.into(),
-        ], "").map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        self.builder.build_unreachable()
+        self.builder
+            .build_call(
+                f,
+                &[
+                    i64_ty.const_int(span.line as u64, false).into(),
+                    lo_v.into(),
+                    hi_v.into(),
+                    idx.into(),
+                ],
+                "",
+            )
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        self.builder
+            .build_unreachable()
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         self.builder.position_at_end(ok_bb);
         Ok(())
     }
 
-    fn compile_type_cast(&self, name: &str, val: BasicValueEnum<'ctx>, span: Span) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+    fn compile_type_cast(
+        &self,
+        name: &str,
+        val: BasicValueEnum<'ctx>,
+        span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let i64_ty = self.context.i64_type();
         let i8_ty = self.context.i8_type();
         let f64_ty = self.context.f64_type();
@@ -3635,14 +5152,20 @@ impl<'ctx> CodeGen<'ctx> {
                 if val.is_int_value() {
                     let iv = val.into_int_value();
                     if iv.get_type().get_bit_width() < 64 {
-                        Ok(self.builder.build_int_z_extend(iv, i64_ty, "to_int")
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into())
+                        Ok(self
+                            .builder
+                            .build_int_z_extend(iv, i64_ty, "to_int")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                            .into())
                     } else {
                         Ok(iv.into())
                     }
                 } else if val.is_float_value() {
-                    Ok(self.builder.build_float_to_signed_int(val.into_float_value(), i64_ty, "to_int")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into())
+                    Ok(self
+                        .builder
+                        .build_float_to_signed_int(val.into_float_value(), i64_ty, "to_int")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        .into())
                 } else {
                     Err(CodeGenError::new("cannot cast to integer", Some(span)))
                 }
@@ -3651,8 +5174,11 @@ impl<'ctx> CodeGen<'ctx> {
                 if val.is_float_value() {
                     Ok(val)
                 } else if val.is_int_value() {
-                    Ok(self.builder.build_signed_int_to_float(val.into_int_value(), f64_ty, "to_real")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into())
+                    Ok(self
+                        .builder
+                        .build_signed_int_to_float(val.into_int_value(), f64_ty, "to_real")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                        .into())
                 } else {
                     Err(CodeGenError::new("cannot cast to real", Some(span)))
                 }
@@ -3663,8 +5189,11 @@ impl<'ctx> CodeGen<'ctx> {
                     if iv.get_type().get_bit_width() == 8 {
                         Ok(iv.into())
                     } else {
-                        Ok(self.builder.build_int_truncate(iv, i8_ty, "to_char")
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into())
+                        Ok(self
+                            .builder
+                            .build_int_truncate(iv, i8_ty, "to_char")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                            .into())
                     }
                 } else {
                     Err(CodeGenError::new("cannot cast to char", Some(span)))
@@ -3676,33 +5205,57 @@ impl<'ctx> CodeGen<'ctx> {
                     if iv.get_type().get_bit_width() == 1 {
                         Ok(iv.into())
                     } else {
-                        Ok(self.builder.build_int_compare(
-                            inkwell::IntPredicate::NE, iv,
-                            iv.get_type().const_int(0, false), "to_bool")
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?.into())
+                        Ok(self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::NE,
+                                iv,
+                                iv.get_type().const_int(0, false),
+                                "to_bool",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                            .into())
                     }
                 } else {
                     Err(CodeGenError::new("cannot cast to boolean", Some(span)))
                 }
             }
-            _ => Err(CodeGenError::new(format!("unknown cast: {name}"), Some(span))),
-        }.map(|v| { let _ = bool_ty; v })
+            _ => Err(CodeGenError::new(
+                format!("unknown cast: {name}"),
+                Some(span),
+            )),
+        }
+        .map(|v| {
+            let _ = bool_ty;
+            v
+        })
     }
 
-    fn promote_to_f64(&self, val: BasicValueEnum<'ctx>, span: Span) -> Result<inkwell::values::FloatValue<'ctx>, CodeGenError> {
+    fn promote_to_f64(
+        &self,
+        val: BasicValueEnum<'ctx>,
+        span: Span,
+    ) -> Result<inkwell::values::FloatValue<'ctx>, CodeGenError> {
         if val.is_float_value() {
             Ok(val.into_float_value())
         } else if val.is_int_value() {
-            self.builder.build_signed_int_to_float(val.into_int_value(), self.context.f64_type(), "itof")
+            self.builder
+                .build_signed_int_to_float(val.into_int_value(), self.context.f64_type(), "itof")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))
         } else {
-            Err(CodeGenError::new("expected numeric value".to_string(), Some(span)))
+            Err(CodeGenError::new(
+                "expected numeric value".to_string(),
+                Some(span),
+            ))
         }
     }
 
     fn get_or_declare_f64_intrinsic(&self, name: &str) -> FunctionValue<'ctx> {
         self.module.get_function(name).unwrap_or_else(|| {
-            let ft = self.context.f64_type().fn_type(&[self.context.f64_type().into()], false);
+            let ft = self
+                .context
+                .f64_type()
+                .fn_type(&[self.context.f64_type().into()], false);
             self.module.add_function(name, ft, None)
         })
     }
@@ -3714,20 +5267,39 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::CharLit(..) => PascalType::Char,
             Expr::StrLit(..) => PascalType::String,
             Expr::BoolLit(..) => PascalType::Boolean,
-            Expr::Var(name, _) => self.var_types.get(name.as_str()).cloned().unwrap_or(PascalType::Integer),
+            Expr::Var(name, _) => self
+                .var_types
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or(PascalType::Integer),
             Expr::Nil(_) => PascalType::Pointer(Box::new(PascalType::Integer)),
-            Expr::SetConstructor { .. } => PascalType::Set { elem: Box::new(PascalType::Integer) },
-            Expr::BinOp { op, left, right, .. } => {
+            Expr::SetConstructor { .. } => PascalType::Set {
+                elem: Box::new(PascalType::Integer),
+            },
+            Expr::BinOp {
+                op, left, right, ..
+            } => {
                 match op {
-                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
-                    | BinOp::And | BinOp::Or | BinOp::In => PascalType::Boolean,
+                    BinOp::Eq
+                    | BinOp::Neq
+                    | BinOp::Lt
+                    | BinOp::Gt
+                    | BinOp::Lte
+                    | BinOp::Gte
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::In => PascalType::Boolean,
                     BinOp::RealDiv => PascalType::Real,
                     _ => {
                         let lt = self.infer_expr_type(left);
                         let rt = self.infer_expr_type(right);
                         // Set operations return a set
-                        if matches!(lt, PascalType::Set { .. }) || matches!(rt, PascalType::Set { .. }) {
-                            PascalType::Set { elem: Box::new(PascalType::Integer) }
+                        if matches!(lt, PascalType::Set { .. })
+                            || matches!(rt, PascalType::Set { .. })
+                        {
+                            PascalType::Set {
+                                elem: Box::new(PascalType::Integer),
+                            }
                         } else if lt == PascalType::Real || rt == PascalType::Real {
                             PascalType::Real
                         } else {
@@ -3747,7 +5319,8 @@ impl<'ctx> CodeGen<'ctx> {
                     "real" => PascalType::Real,
                     "char" => PascalType::Char,
                     "boolean" => PascalType::Boolean,
-                    "length" | "ord" | "trunc" | "round" | "pos" | "ioresult" | "filepos" | "filesize" => PascalType::Integer,
+                    "length" | "ord" | "trunc" | "round" | "pos" | "ioresult" | "filepos"
+                    | "filesize" => PascalType::Integer,
                     "eof" | "eoln" | "odd" => PascalType::Boolean,
                     "chr" | "upcase" => PascalType::Char,
                     "copy" | "concat" => PascalType::String,
@@ -3759,11 +5332,17 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                     }
                     "succ" | "pred" => {
-                        if !args.is_empty() { self.infer_expr_type(&args[0]) } else { PascalType::Integer }
+                        if !args.is_empty() {
+                            self.infer_expr_type(&args[0])
+                        } else {
+                            PascalType::Integer
+                        }
                     }
                     "low" | "high" => PascalType::Integer,
                     "sqrt" | "sin" | "cos" | "arctan" | "exp" | "ln" => PascalType::Real,
-                    _ => self.proc_return_types.get(name.as_str())
+                    _ => self
+                        .proc_return_types
+                        .get(name.as_str())
                         .and_then(|rt| rt.clone())
                         .unwrap_or(PascalType::Integer),
                 }
@@ -3848,10 +5427,18 @@ fn collect_captures_stmt(
     out: &mut Vec<(String, PascalType)>,
     seen: &mut std::collections::HashSet<String>,
 ) {
-    let record = |name: &str, out: &mut Vec<(String, PascalType)>, seen: &mut std::collections::HashSet<String>| {
+    let record = |name: &str,
+                  out: &mut Vec<(String, PascalType)>,
+                  seen: &mut std::collections::HashSet<String>| {
         if !locals.contains(name) && parent_types.contains_key(name) && !seen.contains(name) {
             seen.insert(name.to_string());
-            out.push((name.to_string(), parent_types.get(name).cloned().unwrap_or(PascalType::Integer)));
+            out.push((
+                name.to_string(),
+                parent_types
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(PascalType::Integer),
+            ));
         }
     };
     match stmt {
@@ -3860,80 +5447,141 @@ fn collect_captures_stmt(
             record(target, out, seen);
             collect_captures_expr(expr, locals, parent_types, out, seen);
         }
-        Statement::IndexAssignment { target, index, expr, .. } => {
+        Statement::IndexAssignment {
+            target,
+            index,
+            expr,
+            ..
+        } => {
             record(target, out, seen);
             collect_captures_expr(index, locals, parent_types, out, seen);
             collect_captures_expr(expr, locals, parent_types, out, seen);
         }
-        Statement::MultiIndexAssignment { target, indices, expr, .. } => {
+        Statement::MultiIndexAssignment {
+            target,
+            indices,
+            expr,
+            ..
+        } => {
             record(target, out, seen);
-            for i in indices { collect_captures_expr(i, locals, parent_types, out, seen); }
+            for i in indices {
+                collect_captures_expr(i, locals, parent_types, out, seen);
+            }
             collect_captures_expr(expr, locals, parent_types, out, seen);
         }
         Statement::FieldAssignment { target, expr, .. } => {
             record(target, out, seen);
             collect_captures_expr(expr, locals, parent_types, out, seen);
         }
-        Statement::ChainedAssignment { target, chain, expr, .. } => {
+        Statement::ChainedAssignment {
+            target,
+            chain,
+            expr,
+            ..
+        } => {
             record(target, out, seen);
             for a in chain {
-                if let LValueAccess::Index(e) = a { collect_captures_expr(e, locals, parent_types, out, seen); }
+                if let LValueAccess::Index(e) = a {
+                    collect_captures_expr(e, locals, parent_types, out, seen);
+                }
             }
             collect_captures_expr(expr, locals, parent_types, out, seen);
         }
-        Statement::If { condition, then_branch, else_branch, .. } => {
+        Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_captures_expr(condition, locals, parent_types, out, seen);
             collect_captures(then_branch, locals, parent_types, out, seen);
-            if let Some(eb) = else_branch { collect_captures(eb, locals, parent_types, out, seen); }
+            if let Some(eb) = else_branch {
+                collect_captures(eb, locals, parent_types, out, seen);
+            }
         }
-        Statement::While { condition, body, .. } => {
+        Statement::While {
+            condition, body, ..
+        } => {
             collect_captures_expr(condition, locals, parent_types, out, seen);
             collect_captures(body, locals, parent_types, out, seen);
         }
-        Statement::For { var, from, to, body, .. } => {
+        Statement::For {
+            var,
+            from,
+            to,
+            body,
+            ..
+        } => {
             record(var, out, seen);
             collect_captures_expr(from, locals, parent_types, out, seen);
             collect_captures_expr(to, locals, parent_types, out, seen);
             collect_captures(body, locals, parent_types, out, seen);
         }
-        Statement::RepeatUntil { body, condition, .. } => {
-            for s in body { collect_captures_stmt(s, locals, parent_types, out, seen); }
+        Statement::RepeatUntil {
+            body, condition, ..
+        } => {
+            for s in body {
+                collect_captures_stmt(s, locals, parent_types, out, seen);
+            }
             collect_captures_expr(condition, locals, parent_types, out, seen);
         }
         Statement::WriteLn { args, .. } | Statement::Write { args, .. } => {
             for a in args {
                 collect_captures_expr(&a.expr, locals, parent_types, out, seen);
-                if let Some(w) = &a.width { collect_captures_expr(w, locals, parent_types, out, seen); }
-                if let Some(p) = &a.precision { collect_captures_expr(p, locals, parent_types, out, seen); }
+                if let Some(w) = &a.width {
+                    collect_captures_expr(w, locals, parent_types, out, seen);
+                }
+                if let Some(p) = &a.precision {
+                    collect_captures_expr(p, locals, parent_types, out, seen);
+                }
             }
         }
         Statement::ReadLn { targets, .. } => {
-            for t in targets { record(t, out, seen); }
+            for t in targets {
+                record(t, out, seen);
+            }
         }
         Statement::Block(b) => collect_captures(b, locals, parent_types, out, seen),
-        Statement::New { target, .. } | Statement::Dispose { target, .. } => record(target, out, seen),
-        Statement::ProcCall { args, .. } => {
-            for a in args { collect_captures_expr(a, locals, parent_types, out, seen); }
+        Statement::New { target, .. } | Statement::Dispose { target, .. } => {
+            record(target, out, seen)
         }
-        Statement::Case { expr, branches, else_branch, .. } => {
+        Statement::ProcCall { args, .. } => {
+            for a in args {
+                collect_captures_expr(a, locals, parent_types, out, seen);
+            }
+        }
+        Statement::Case {
+            expr,
+            branches,
+            else_branch,
+            ..
+        } => {
             collect_captures_expr(expr, locals, parent_types, out, seen);
             for br in branches {
                 for v in &br.values {
                     match v {
-                        CaseValue::Single(e) => collect_captures_expr(e, locals, parent_types, out, seen),
+                        CaseValue::Single(e) => {
+                            collect_captures_expr(e, locals, parent_types, out, seen)
+                        }
                         CaseValue::Range(a, b) => {
                             collect_captures_expr(a, locals, parent_types, out, seen);
                             collect_captures_expr(b, locals, parent_types, out, seen);
                         }
                     }
                 }
-                for s in &br.body { collect_captures_stmt(s, locals, parent_types, out, seen); }
+                for s in &br.body {
+                    collect_captures_stmt(s, locals, parent_types, out, seen);
+                }
             }
             if let Some(stmts) = else_branch {
-                for s in stmts { collect_captures_stmt(s, locals, parent_types, out, seen); }
+                for s in stmts {
+                    collect_captures_stmt(s, locals, parent_types, out, seen);
+                }
             }
         }
-        Statement::With { record_var, body, .. } => {
+        Statement::With {
+            record_var, body, ..
+        } => {
             record(record_var, out, seen);
             collect_captures(body, locals, parent_types, out, seen);
         }
@@ -3952,27 +5600,41 @@ fn collect_captures_expr(
         Expr::Var(name, _) => {
             if !locals.contains(name) && parent_types.contains_key(name) && !seen.contains(name) {
                 seen.insert(name.clone());
-                out.push((name.clone(), parent_types.get(name).cloned().unwrap_or(PascalType::Integer)));
+                out.push((
+                    name.clone(),
+                    parent_types
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(PascalType::Integer),
+                ));
             }
         }
         Expr::BinOp { left, right, .. } => {
             collect_captures_expr(left, locals, parent_types, out, seen);
             collect_captures_expr(right, locals, parent_types, out, seen);
         }
-        Expr::UnaryOp { operand, .. } => collect_captures_expr(operand, locals, parent_types, out, seen),
+        Expr::UnaryOp { operand, .. } => {
+            collect_captures_expr(operand, locals, parent_types, out, seen)
+        }
         Expr::Deref(inner, _) => collect_captures_expr(inner, locals, parent_types, out, seen),
         Expr::Call { args, .. } => {
-            for a in args { collect_captures_expr(a, locals, parent_types, out, seen); }
+            for a in args {
+                collect_captures_expr(a, locals, parent_types, out, seen);
+            }
         }
         Expr::Index { array, index, .. } => {
             collect_captures_expr(array, locals, parent_types, out, seen);
             collect_captures_expr(index, locals, parent_types, out, seen);
         }
-        Expr::FieldAccess { record, .. } => collect_captures_expr(record, locals, parent_types, out, seen),
+        Expr::FieldAccess { record, .. } => {
+            collect_captures_expr(record, locals, parent_types, out, seen)
+        }
         Expr::SetConstructor { elements, .. } => {
             for e in elements {
                 match e {
-                    SetElement::Single(e) => collect_captures_expr(e, locals, parent_types, out, seen),
+                    SetElement::Single(e) => {
+                        collect_captures_expr(e, locals, parent_types, out, seen)
+                    }
                     SetElement::Range(a, b) => {
                         collect_captures_expr(a, locals, parent_types, out, seen);
                         collect_captures_expr(b, locals, parent_types, out, seen);
@@ -4012,8 +5674,8 @@ mod tests {
             .status()
             .expect("run failed");
         assert!(status.success(), "non-zero exit");
-        let captured = std::fs::read_to_string("/tmp/turbo_pascal_console.txt")
-            .expect("capture file missing");
+        let captured =
+            std::fs::read_to_string("/tmp/turbo_pascal_console.txt").expect("capture file missing");
         assert_eq!(captured.trim(), "42", "expected 42, got: {captured:?}");
         let _ = std::fs::remove_file("/tmp/turbo_pascal_console.txt");
 
@@ -4059,13 +5721,20 @@ mod tests {
         // Run lldb in batch mode: set breakpoint on line 5, run, check output
         let lldb_out = std::process::Command::new("lldb")
             .args([
-                "--no-use-colors", "--batch",
-                "--one-line", "breakpoint set --file test_bp.pas --line 5",
-                "--one-line", "run",
-                "--one-line", "frame variable",
-                "--one-line", "continue",
-                "--one-line", "quit",
-                "--", exe_path,
+                "--no-use-colors",
+                "--batch",
+                "--one-line",
+                "breakpoint set --file test_bp.pas --line 5",
+                "--one-line",
+                "run",
+                "--one-line",
+                "frame variable",
+                "--one-line",
+                "continue",
+                "--one-line",
+                "quit",
+                "--",
+                exe_path,
             ])
             .output()
             .expect("lldb failed");
@@ -4104,11 +5773,16 @@ mod tests {
         let _ = std::fs::remove_file("/tmp/turbo_pascal_console.txt");
         let status = std::process::Command::new(exe_path)
             .stdout(std::process::Stdio::null())
-            .status().unwrap();
+            .status()
+            .unwrap();
         assert!(status.success());
 
         let captured = std::fs::read_to_string("/tmp/turbo_pascal_console.txt").unwrap();
-        assert_eq!(captured.trim(), "hello capture", "capture file: {captured:?}");
+        assert_eq!(
+            captured.trim(),
+            "hello capture",
+            "capture file: {captured:?}"
+        );
 
         let _ = std::fs::remove_file(exe_path);
         let _ = std::fs::remove_dir_all(format!("{exe_path}.dSYM"));

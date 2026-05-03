@@ -17,23 +17,86 @@ impl PascalHighlighter {
     fn is_keyword(word: &str) -> bool {
         matches!(
             word,
-            "program" | "var" | "begin" | "end" | "if" | "then" | "else"
-                | "while" | "do" | "for" | "to" | "downto" | "repeat" | "until"
-                | "write" | "writeln" | "read" | "readln"
-                | "div" | "mod" | "and" | "or" | "not"
-                | "true" | "false" | "const" | "type" | "procedure" | "function"
-                | "array" | "of" | "record" | "nil" | "case" | "with"
-                | "new" | "dispose" | "forward" | "set" | "in"
-                | "label" | "goto" | "file" | "packed"
-                | "assign" | "reset" | "rewrite" | "close" | "append"
-                | "eof" | "eoln" | "seek" | "filepos" | "filesize" | "ioresult"
-                | "odd" | "page" | "pack" | "unpack" | "get" | "put"
-                | "input" | "output" | "maxint"
+            "program"
+                | "var"
+                | "begin"
+                | "end"
+                | "if"
+                | "then"
+                | "else"
+                | "while"
+                | "do"
+                | "for"
+                | "to"
+                | "downto"
+                | "repeat"
+                | "until"
+                | "write"
+                | "writeln"
+                | "read"
+                | "readln"
+                | "div"
+                | "mod"
+                | "and"
+                | "or"
+                | "not"
+                | "true"
+                | "false"
+                | "const"
+                | "type"
+                | "procedure"
+                | "function"
+                | "array"
+                | "of"
+                | "record"
+                | "nil"
+                | "case"
+                | "with"
+                | "new"
+                | "dispose"
+                | "forward"
+                | "set"
+                | "in"
+                | "label"
+                | "goto"
+                | "file"
+                | "packed"
+                | "assign"
+                | "reset"
+                | "rewrite"
+                | "close"
+                | "append"
+                | "eof"
+                | "eoln"
+                | "seek"
+                | "filepos"
+                | "filesize"
+                | "ioresult"
+                | "odd"
+                | "page"
+                | "pack"
+                | "unpack"
+                | "get"
+                | "put"
+                | "input"
+                | "output"
+                | "maxint"
         )
     }
 
     fn is_type_name(word: &str) -> bool {
-        matches!(word, "integer" | "string" | "boolean" | "real" | "char" | "byte" | "word" | "longint" | "text")
+        matches!(
+            word,
+            "integer"
+                | "string"
+                | "boolean"
+                | "real"
+                | "char"
+                | "byte"
+                | "word"
+                | "longint"
+                | "text"
+        )
     }
 }
 
@@ -156,7 +219,8 @@ impl SyntaxHighlighter for PascalHighlighter {
             }
 
             // Numbers
-            if ch.is_ascii_digit() || (ch == '$' && i + 1 < len && chars[i + 1].is_ascii_hexdigit()) {
+            if ch.is_ascii_digit() || (ch == '$' && i + 1 < len && chars[i + 1].is_ascii_hexdigit())
+            {
                 let start = i;
                 if ch == '$' {
                     i += 1;
@@ -202,7 +266,7 @@ impl SyntaxHighlighter for PascalHighlighter {
             }
 
             // Single-character operators and punctuation
-            if matches!(ch, '+' | '-' | '*' | '=' | '<' | '>' | '/' ) {
+            if matches!(ch, '+' | '-' | '*' | '=' | '<' | '>' | '/') {
                 tokens.push(Token::new(i, i + 1, TokenType::Operator));
                 i += 1;
                 continue;
@@ -255,7 +319,9 @@ impl SyntaxHighlighter for PascalHighlighter {
                 while i < len && chars[i] != '\'' {
                     i += 1;
                 }
-                if i < len { i += 1; }
+                if i < len {
+                    i += 1;
+                }
                 continue;
             }
             if chars[i] == '/' && i + 1 < len && chars[i + 1] == '/' {

@@ -106,12 +106,19 @@ pub enum PascalType {
         values: Vec<String>,
     },
     /// Subrange type: lo..hi (stored as i64)
-    Subrange { lo: i64, hi: i64 },
+    Subrange {
+        lo: i64,
+        hi: i64,
+    },
     /// Set of ordinal type — stored as 256-bit bitmask (4 x i64)
-    Set { elem: Box<PascalType> },
+    Set {
+        elem: Box<PascalType>,
+    },
     /// File of <type> — stored as opaque pointer to bruto_file struct.
     /// `text` is `File { elem: Char }`.
-    File { elem: Box<PascalType> },
+    File {
+        elem: Box<PascalType>,
+    },
     /// Procedural type — function pointer with a known signature.
     /// `return_type = None` means procedure (void); Some => function.
     Proc {
@@ -240,9 +247,15 @@ pub enum Statement {
         span: Span,
     },
     /// Goto statement: `goto 10`
-    Goto { label: i64, span: Span },
+    Goto {
+        label: i64,
+        span: Span,
+    },
     /// Label marker: `10: statement`
-    Label { label: i64, span: Span },
+    Label {
+        label: i64,
+        span: Span,
+    },
     /// With statement: `with record_var do statement`
     With {
         record_var: String,

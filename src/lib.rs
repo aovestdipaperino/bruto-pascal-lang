@@ -47,8 +47,7 @@ impl Language for MiniPascal {
 
     fn build(&self, source: &str) -> Result<BuildResult, String> {
         let source_path = "/tmp/bruto_pascal_src.pas".to_string();
-        std::fs::write(&source_path, source)
-            .map_err(|e| format!("Failed to write source: {e}"))?;
+        std::fs::write(&source_path, source).map_err(|e| format!("Failed to write source: {e}"))?;
 
         let mut parser = Parser::new(source);
         let program = parser
@@ -99,14 +98,23 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         | ast::Statement::ChainedAssignment { span, .. } => {
             lines.insert(span.line as usize);
         }
-        ast::Statement::If { condition: _, then_branch, else_branch, span } => {
+        ast::Statement::If {
+            condition: _,
+            then_branch,
+            else_branch,
+            span,
+        } => {
             lines.insert(span.line as usize); // the `if` condition line
             collect_block_lines(then_branch, lines);
             if let Some(eb) = else_branch {
                 collect_block_lines(eb, lines);
             }
         }
-        ast::Statement::While { condition: _, body, span } => {
+        ast::Statement::While {
+            condition: _,
+            body,
+            span,
+        } => {
             lines.insert(span.line as usize);
             collect_block_lines(body, lines);
         }
@@ -120,17 +128,25 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
                 collect_stmt_lines(stmt, lines);
             }
         }
-        ast::Statement::Case { branches, else_branch, span, .. } => {
+        ast::Statement::Case {
+            branches,
+            else_branch,
+            span,
+            ..
+        } => {
             lines.insert(span.line as usize);
             for branch in branches {
-                for stmt in &branch.body { collect_stmt_lines(stmt, lines); }
+                for stmt in &branch.body {
+                    collect_stmt_lines(stmt, lines);
+                }
             }
             if let Some(stmts) = else_branch {
-                for stmt in stmts { collect_stmt_lines(stmt, lines); }
+                for stmt in stmts {
+                    collect_stmt_lines(stmt, lines);
+                }
             }
         }
-        ast::Statement::Goto { span, .. }
-        | ast::Statement::Label { span, .. } => {
+        ast::Statement::Goto { span, .. } | ast::Statement::Label { span, .. } => {
             lines.insert(span.line as usize);
         }
         ast::Statement::With { body, span, .. } => {
@@ -239,8 +255,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .status()
             .expect("run failed");
-        let captured = std::fs::read_to_string(&result.console_capture_path)
-            .unwrap_or_default();
+        let captured = std::fs::read_to_string(&result.console_capture_path).unwrap_or_default();
         let _ = std::fs::remove_file(&result.exe_path);
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&result.source_path);
@@ -266,7 +281,10 @@ mod tests {
         assert!(out.contains("Point = ("), "expected point, got: {out}");
         assert!(out.contains("Hello Pascal!"), "expected string, got: {out}");
         assert!(out.contains("Heap value: 42"), "expected heap, got: {out}");
-        assert!(out.contains("First power of 2 > 100: 128"), "expected repeat, got: {out}");
+        assert!(
+            out.contains("First power of 2 > 100: 128"),
+            "expected repeat, got: {out}"
+        );
         assert!(out.contains("ord(A) = 65"), "expected ord, got: {out}");
         assert!(out.contains("chr(90) = Z"), "expected chr, got: {out}");
         assert!(out.contains("All correct!"), "expected correct, got: {out}");
@@ -337,9 +355,8 @@ mod tests {
 
     #[test]
     fn const_section() {
-        let (ok, out) = build_and_run_source(
-            "program T;\nconst\n  X = 42;\nbegin\n  writeln(X)\nend.\n",
-        );
+        let (ok, out) =
+            build_and_run_source("program T;\nconst\n  X = 42;\nbegin\n  writeln(X)\nend.\n");
         assert!(ok);
         assert_eq!(out.trim(), "42");
     }
@@ -373,9 +390,8 @@ mod tests {
 
     #[test]
     fn string_length() {
-        let (ok, out) = build_and_run_source(
-            "program T;\nbegin\n  writeln(length('Hello'))\nend.\n",
-        );
+        let (ok, out) =
+            build_and_run_source("program T;\nbegin\n  writeln(length('Hello'))\nend.\n");
         assert!(ok);
         assert_eq!(out.trim(), "5");
     }
@@ -465,10 +481,10 @@ mod tests {
         );
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(lines[0], "0");  // sin(0) = 0
-        assert_eq!(lines[1], "1");  // cos(0) = 1
-        assert_eq!(lines[2], "1");  // exp(0) = 1
-        assert_eq!(lines[3], "0");  // ln(1) = 0
+        assert_eq!(lines[0], "0"); // sin(0) = 0
+        assert_eq!(lines[1], "1"); // cos(0) = 1
+        assert_eq!(lines[2], "1"); // exp(0) = 1
+        assert_eq!(lines[3], "0"); // ln(1) = 0
     }
 
     #[test]
@@ -647,9 +663,7 @@ end.
 
     #[test]
     fn maxint_constant() {
-        let (ok, out) = build_and_run_source(
-            "program T;\nbegin\n  writeln(maxint)\nend.\n",
-        );
+        let (ok, out) = build_and_run_source("program T;\nbegin\n  writeln(maxint)\nend.\n");
         assert!(ok);
         assert_eq!(out.trim(), "9223372036854775807");
     }
@@ -665,18 +679,16 @@ end.
 
     #[test]
     fn program_parameters_header() {
-        let (ok, out) = build_and_run_source(
-            "program T(input, output);\nbegin\n  writeln('hi')\nend.\n",
-        );
+        let (ok, out) =
+            build_and_run_source("program T(input, output);\nbegin\n  writeln('hi')\nend.\n");
         assert!(ok);
         assert_eq!(out.trim(), "hi");
     }
 
     #[test]
     fn write_to_predefined_output() {
-        let (ok, out) = build_and_run_source(
-            "program T;\nbegin\n  writeln(output, 'via output')\nend.\n",
-        );
+        let (ok, out) =
+            build_and_run_source("program T;\nbegin\n  writeln(output, 'via output')\nend.\n");
         assert!(ok);
         // writes to stdout — capture file misses it, but stdout test would need direct capture.
         // Just verify it built and ran successfully.
@@ -716,7 +728,7 @@ end.
 "#,
         );
         assert!(ok);
-        assert_eq!(out.trim(), "81");  // (3*3)*(3*3) = 9*9 = 81
+        assert_eq!(out.trim(), "81"); // (3*3)*(3*3) = 9*9 = 81
     }
 
     #[test]
@@ -810,7 +822,10 @@ end.
             .stderr(std::process::Stdio::null())
             .status()
             .expect("run failed");
-        assert!(!status.success(), "expected non-zero exit from overflow check");
+        assert!(
+            !status.success(),
+            "expected non-zero exit from overflow check"
+        );
         let _ = std::fs::remove_file(&result.exe_path);
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&result.source_path);
@@ -891,9 +906,8 @@ end.
 
     #[test]
     fn write_format_int() {
-        let (ok, out) = build_and_run_source(
-            "program T;\nbegin\n  writeln(42:5);\n  writeln(7:3)\nend.\n",
-        );
+        let (ok, out) =
+            build_and_run_source("program T;\nbegin\n  writeln(42:5);\n  writeln(7:3)\nend.\n");
         assert!(ok);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "   42");
@@ -929,6 +943,9 @@ end.
         let source = include_str!("../../SAMPLE.PAS");
         let (ok, out) = build_and_run_source(source);
         assert!(ok, "SAMPLE.PAS failed to run");
-        assert!(out.contains("=== All features OK ==="), "missing final line: {out}");
+        assert!(
+            out.contains("=== All features OK ==="),
+            "missing final line: {out}"
+        );
     }
 }

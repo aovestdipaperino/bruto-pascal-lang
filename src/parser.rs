@@ -18,7 +18,6 @@
 ///   multiplicative = unary (("*" | "div" | "mod" | "and") unary)*
 ///   unary        = ["-" | "not"] primary
 ///   primary      = INT_LIT | STR_LIT | "true" | "false" | IDENT | "(" expr ")"
-
 use crate::ast::*;
 use std::fmt;
 
@@ -27,19 +26,54 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     // Keywords
-    Program, Var, Begin, End, If, Then, Else, While, Do,
-    For, To, DownTo, Repeat, Until,
-    KwWrite, KwWriteLn, KwReadLn, KwRead,
-    KwDiv, KwMod, KwAnd, KwOr, KwNot,
-    KwTrue, KwFalse,
-    KwNew, KwDispose, KwNil,
-    Const, KwType,
-    KwProcedure, KwFunction, KwForward,
-    KwSet, KwIn, KwCase, KwLabel, KwGoto, KwWith,
-    KwFile, KwPacked,
-    TyReal, TyChar, TyText,
+    Program,
+    Var,
+    Begin,
+    End,
+    If,
+    Then,
+    Else,
+    While,
+    Do,
+    For,
+    To,
+    DownTo,
+    Repeat,
+    Until,
+    KwWrite,
+    KwWriteLn,
+    KwReadLn,
+    KwRead,
+    KwDiv,
+    KwMod,
+    KwAnd,
+    KwOr,
+    KwNot,
+    KwTrue,
+    KwFalse,
+    KwNew,
+    KwDispose,
+    KwNil,
+    Const,
+    KwType,
+    KwProcedure,
+    KwFunction,
+    KwForward,
+    KwSet,
+    KwIn,
+    KwCase,
+    KwLabel,
+    KwGoto,
+    KwWith,
+    KwFile,
+    KwPacked,
+    TyReal,
+    TyChar,
+    TyText,
     // Type keywords
-    TyInteger, TyString, TyBoolean,
+    TyInteger,
+    TyString,
+    TyBoolean,
     // Literals
     IntLit(i64),
     RealLit(f64),
@@ -48,10 +82,31 @@ enum Tok {
     // Identifier
     Ident(String),
     // Operators
-    Plus, Minus, Star, Slash, Assign, Eq, Neq, Lt, Gt, Lte, Gte,
-    KwArray, KwOf, KwRecord,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Assign,
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    Lte,
+    Gte,
+    KwArray,
+    KwOf,
+    KwRecord,
     // Delimiters
-    LParen, RParen, LBracket, RBracket, Semi, Colon, Comma, Dot, DotDot, Caret,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    Semi,
+    Colon,
+    Comma,
+    Dot,
+    DotDot,
+    Caret,
     // End of input
     Eof,
 }
@@ -150,7 +205,11 @@ pub struct ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "line {}:{}: {}", self.span.line, self.span.column, self.message)
+        write!(
+            f,
+            "line {}:{}: {}",
+            self.span.line, self.span.column, self.message
+        )
     }
 }
 
@@ -210,10 +269,14 @@ impl Lexer {
         // A directive looks like `$R+`, `$Q-`, `$I+`, possibly with multiple
         // entries separated by commas, e.g. `$R+,Q+`.
         let body = body.trim();
-        if !body.starts_with('$') { return; }
+        if !body.starts_with('$') {
+            return;
+        }
         for entry in body[1..].split(',') {
             let e = entry.trim();
-            if e.len() < 2 { continue; }
+            if e.len() < 2 {
+                continue;
+            }
             let kind = e.as_bytes()[0].to_ascii_uppercase();
             let sign = e.as_bytes()[1];
             let on = sign == b'+';
@@ -232,7 +295,9 @@ impl Lexer {
             while self.pos < self.chars.len() && self.peek().is_whitespace() {
                 self.advance();
             }
-            if self.pos >= self.chars.len() { return; }
+            if self.pos >= self.chars.len() {
+                return;
+            }
 
             // Line comment: //
             if self.peek() == '/' && self.chars.get(self.pos + 1) == Some(&'/') {
@@ -249,19 +314,25 @@ impl Lexer {
                 while self.pos < self.chars.len() && self.peek() != '}' {
                     body.push(self.advance());
                 }
-                if self.pos < self.chars.len() { self.advance(); }
+                if self.pos < self.chars.len() {
+                    self.advance();
+                }
                 self.handle_directive(&body);
                 continue;
             }
 
             // Block comment: (* *)   (also `(*$X+/-*)` directives)
             if self.peek() == '(' && self.chars.get(self.pos + 1) == Some(&'*') {
-                self.advance(); self.advance();
+                self.advance();
+                self.advance();
                 let mut body = String::new();
                 loop {
-                    if self.pos >= self.chars.len() { break; }
+                    if self.pos >= self.chars.len() {
+                        break;
+                    }
                     if self.peek() == '*' && self.chars.get(self.pos + 1) == Some(&')') {
-                        self.advance(); self.advance();
+                        self.advance();
+                        self.advance();
                         break;
                     }
                     body.push(self.advance());
@@ -290,7 +361,9 @@ impl Lexer {
             self.advance();
             let mut s = String::new();
             loop {
-                if self.pos >= self.chars.len() { break; }
+                if self.pos >= self.chars.len() {
+                    break;
+                }
                 if self.peek() == '\'' {
                     self.advance();
                     if self.peek() == '\'' {
@@ -358,80 +431,85 @@ impl Lexer {
             }
             let lower = word.to_lowercase();
             let tok = match lower.as_str() {
-                "program"  => Tok::Program,
-                "var"      => Tok::Var,
-                "begin"    => Tok::Begin,
-                "end"      => Tok::End,
-                "if"       => Tok::If,
-                "then"     => Tok::Then,
-                "else"     => Tok::Else,
-                "while"    => Tok::While,
-                "do"       => Tok::Do,
-                "write"    => Tok::KwWrite,
-                "writeln"  => Tok::KwWriteLn,
-                "readln"   => Tok::KwReadLn,
-                "div"      => Tok::KwDiv,
-                "mod"      => Tok::KwMod,
-                "and"      => Tok::KwAnd,
-                "or"       => Tok::KwOr,
-                "not"      => Tok::KwNot,
-                "true"     => Tok::KwTrue,
-                "false"    => Tok::KwFalse,
-                "new"      => Tok::KwNew,
-                "dispose"  => Tok::KwDispose,
-                "nil"      => Tok::KwNil,
-                "file"     => Tok::KwFile,
-                "packed"   => Tok::KwPacked,
-                "text"     => Tok::TyText,
-                "for"      => Tok::For,
-                "to"       => Tok::To,
-                "downto"   => Tok::DownTo,
-                "repeat"   => Tok::Repeat,
-                "until"    => Tok::Until,
-                "read"     => Tok::KwRead,
-                "const"    => Tok::Const,
-                "type"     => Tok::KwType,
+                "program" => Tok::Program,
+                "var" => Tok::Var,
+                "begin" => Tok::Begin,
+                "end" => Tok::End,
+                "if" => Tok::If,
+                "then" => Tok::Then,
+                "else" => Tok::Else,
+                "while" => Tok::While,
+                "do" => Tok::Do,
+                "write" => Tok::KwWrite,
+                "writeln" => Tok::KwWriteLn,
+                "readln" => Tok::KwReadLn,
+                "div" => Tok::KwDiv,
+                "mod" => Tok::KwMod,
+                "and" => Tok::KwAnd,
+                "or" => Tok::KwOr,
+                "not" => Tok::KwNot,
+                "true" => Tok::KwTrue,
+                "false" => Tok::KwFalse,
+                "new" => Tok::KwNew,
+                "dispose" => Tok::KwDispose,
+                "nil" => Tok::KwNil,
+                "file" => Tok::KwFile,
+                "packed" => Tok::KwPacked,
+                "text" => Tok::TyText,
+                "for" => Tok::For,
+                "to" => Tok::To,
+                "downto" => Tok::DownTo,
+                "repeat" => Tok::Repeat,
+                "until" => Tok::Until,
+                "read" => Tok::KwRead,
+                "const" => Tok::Const,
+                "type" => Tok::KwType,
                 "procedure" => Tok::KwProcedure,
                 "function" => Tok::KwFunction,
-                "forward"  => Tok::KwForward,
-                "set"      => Tok::KwSet,
-                "in"       => Tok::KwIn,
-                "case"     => Tok::KwCase,
-                "label"    => Tok::KwLabel,
-                "goto"     => Tok::KwGoto,
-                "with"     => Tok::KwWith,
-                "array"    => Tok::KwArray,
-                "of"       => Tok::KwOf,
-                "record"   => Tok::KwRecord,
-                "integer"  => Tok::TyInteger,
-                "string"   => Tok::TyString,
-                "boolean"  => Tok::TyBoolean,
-                "real"     => Tok::TyReal,
-                "char"     => Tok::TyChar,
-                _          => Tok::Ident(word),
+                "forward" => Tok::KwForward,
+                "set" => Tok::KwSet,
+                "in" => Tok::KwIn,
+                "case" => Tok::KwCase,
+                "label" => Tok::KwLabel,
+                "goto" => Tok::KwGoto,
+                "with" => Tok::KwWith,
+                "array" => Tok::KwArray,
+                "of" => Tok::KwOf,
+                "record" => Tok::KwRecord,
+                "integer" => Tok::TyInteger,
+                "string" => Tok::TyString,
+                "boolean" => Tok::TyBoolean,
+                "real" => Tok::TyReal,
+                "char" => Tok::TyChar,
+                _ => Tok::Ident(word),
             };
             return (tok, span);
         }
 
         // Two-character operators
         if ch == '.' && self.chars.get(self.pos + 1) == Some(&'.') {
-            self.advance(); self.advance();
+            self.advance();
+            self.advance();
             return (Tok::DotDot, span);
         }
         if ch == ':' && self.chars.get(self.pos + 1) == Some(&'=') {
-            self.advance(); self.advance();
+            self.advance();
+            self.advance();
             return (Tok::Assign, span);
         }
         if ch == '<' && self.chars.get(self.pos + 1) == Some(&'>') {
-            self.advance(); self.advance();
+            self.advance();
+            self.advance();
             return (Tok::Neq, span);
         }
         if ch == '<' && self.chars.get(self.pos + 1) == Some(&'=') {
-            self.advance(); self.advance();
+            self.advance();
+            self.advance();
             return (Tok::Lte, span);
         }
         if ch == '>' && self.chars.get(self.pos + 1) == Some(&'=') {
-            self.advance(); self.advance();
+            self.advance();
+            self.advance();
             return (Tok::Gte, span);
         }
 
@@ -479,9 +557,15 @@ impl Parser {
             let (tok, span) = lexer.next_token();
             let is_eof = tok == Tok::Eof;
             tokens.push((tok, span));
-            if is_eof { break; }
+            if is_eof {
+                break;
+            }
         }
-        Self { tokens, pos: 0, directives: lexer.directives }
+        Self {
+            tokens,
+            pos: 0,
+            directives: lexer.directives,
+        }
     }
 
     fn peek(&self) -> &Tok {
@@ -579,7 +663,16 @@ impl Parser {
         let body = self.parse_block()?;
         self.expect(&Tok::Dot)?;
 
-        Ok(Program { name, labels, consts, type_decls, vars, procedures, body, span })
+        Ok(Program {
+            name,
+            labels,
+            consts,
+            type_decls,
+            vars,
+            procedures,
+            body,
+            span,
+        })
     }
 
     // ── label section ────────────────────────────────────
@@ -610,7 +703,11 @@ impl Parser {
                 *name = decl_name.clone();
             }
             self.expect(&Tok::Semi)?;
-            decls.push(TypeDecl { name: decl_name, ty, span });
+            decls.push(TypeDecl {
+                name: decl_name,
+                ty,
+                span,
+            });
         }
         if decls.is_empty() {
             return Err(ParseError {
@@ -639,7 +736,12 @@ impl Parser {
             self.expect(&Tok::Eq)?;
             let value = self.parse_expr()?;
             self.expect(&Tok::Semi)?;
-            decls.push(ConstDecl { name, ty, value, span });
+            decls.push(ConstDecl {
+                name,
+                ty,
+                value,
+                span,
+            });
         }
         if decls.is_empty() {
             return Err(ParseError {
@@ -707,17 +809,23 @@ impl Parser {
             self.advance();
             self.expect(&Tok::KwOf)?;
             let elem = self.parse_type()?;
-            return Ok(PascalType::Set { elem: Box::new(elem) });
+            return Ok(PascalType::Set {
+                elem: Box::new(elem),
+            });
         }
         if *self.peek() == Tok::KwFile {
             self.advance();
             self.expect(&Tok::KwOf)?;
             let elem = self.parse_type()?;
-            return Ok(PascalType::File { elem: Box::new(elem) });
+            return Ok(PascalType::File {
+                elem: Box::new(elem),
+            });
         }
         if *self.peek() == Tok::TyText {
             self.advance();
-            return Ok(PascalType::File { elem: Box::new(PascalType::Char) });
+            return Ok(PascalType::File {
+                elem: Box::new(PascalType::Char),
+            });
         }
         if *self.peek() == Tok::KwArray {
             // Look ahead: `array[ident .. ident : type ] of T` is a conformant
@@ -730,7 +838,10 @@ impl Parser {
                     match &self.tokens[p].0 {
                         Tok::LBracket => depth += 1,
                         Tok::RBracket => depth -= 1,
-                        Tok::Colon if depth == 1 => { saw_colon = true; break; }
+                        Tok::Colon if depth == 1 => {
+                            saw_colon = true;
+                            break;
+                        }
                         Tok::Semi | Tok::Eof => break,
                         _ => {}
                     }
@@ -746,9 +857,15 @@ impl Parser {
             return self.parse_record_type();
         }
         match self.peek() {
-            Tok::TyInteger => { self.advance(); Ok(PascalType::Integer) }
-            Tok::TyReal    => { self.advance(); Ok(PascalType::Real) }
-            Tok::TyString  => {
+            Tok::TyInteger => {
+                self.advance();
+                Ok(PascalType::Integer)
+            }
+            Tok::TyReal => {
+                self.advance();
+                Ok(PascalType::Real)
+            }
+            Tok::TyString => {
                 self.advance();
                 // Optional length: `string[N]` — accepted but treated as plain string
                 if *self.peek() == Tok::LBracket {
@@ -758,8 +875,14 @@ impl Parser {
                 }
                 Ok(PascalType::String)
             }
-            Tok::TyBoolean => { self.advance(); Ok(PascalType::Boolean) }
-            Tok::TyChar    => { self.advance(); Ok(PascalType::Char) }
+            Tok::TyBoolean => {
+                self.advance();
+                Ok(PascalType::Boolean)
+            }
+            Tok::TyChar => {
+                self.advance();
+                Ok(PascalType::Char)
+            }
             Tok::Ident(name) => {
                 let name = name.clone();
                 self.advance();
@@ -783,7 +906,11 @@ impl Parser {
         self.expect(&Tok::RBracket)?;
         self.expect(&Tok::KwOf)?;
         let elem = self.parse_type()?;
-        Ok(PascalType::ConformantArray { lo_name, hi_name, elem: Box::new(elem) })
+        Ok(PascalType::ConformantArray {
+            lo_name,
+            hi_name,
+            elem: Box::new(elem),
+        })
     }
 
     fn parse_array_type(&mut self) -> Result<PascalType, ParseError> {
@@ -810,7 +937,11 @@ impl Parser {
         // Build nested array types from innermost to outermost
         let mut result = elem;
         for (lo, hi) in dimensions.into_iter().rev() {
-            result = PascalType::Array { lo, hi, elem: Box::new(result) };
+            result = PascalType::Array {
+                lo,
+                hi,
+                elem: Box::new(result),
+            };
         }
         Ok(result)
     }
@@ -908,7 +1039,11 @@ impl Parser {
                 self.advance();
             }
         }
-        Ok(RecordVariant { tag_name, tag_type, variants })
+        Ok(RecordVariant {
+            tag_name,
+            tag_type,
+            variants,
+        })
     }
 
     fn parse_enum_type(&mut self) -> Result<PascalType, ParseError> {
@@ -922,7 +1057,10 @@ impl Parser {
             values.push(name);
         }
         self.expect(&Tok::RParen)?;
-        Ok(PascalType::Enum { name: String::new(), values })
+        Ok(PascalType::Enum {
+            name: String::new(),
+            values,
+        })
     }
 
     // ── procedure / function ──────────────────────────────
@@ -953,10 +1091,16 @@ impl Parser {
             self.advance();
             self.expect(&Tok::Semi)?;
             return Ok(ProcDecl {
-                name, params, return_type,
+                name,
+                params,
+                return_type,
                 vars: Vec::new(),
                 nested_procs: Vec::new(),
-                body: Block { statements: Vec::new(), span, end_span: span },
+                body: Block {
+                    statements: Vec::new(),
+                    span,
+                    end_span: span,
+                },
                 span,
             });
         }
@@ -976,7 +1120,15 @@ impl Parser {
         let body = self.parse_block()?;
         self.expect(&Tok::Semi)?;
 
-        Ok(ProcDecl { name, params, return_type, vars, nested_procs, body, span })
+        Ok(ProcDecl {
+            name,
+            params,
+            return_type,
+            vars,
+            nested_procs,
+            body,
+            span,
+        })
     }
 
     fn parse_param_list(&mut self) -> Result<Vec<ParamGroup>, ParseError> {
@@ -1024,7 +1176,10 @@ impl Parser {
             return Ok(ParamGroup {
                 mode: ParamMode::Value,
                 names: vec![pname],
-                ty: PascalType::Proc { params, return_type },
+                ty: PascalType::Proc {
+                    params,
+                    return_type,
+                },
             });
         }
 
@@ -1051,7 +1206,9 @@ impl Parser {
     /// Used inside the parens of `procedure p(name: T; ...)`.
     fn parse_proc_param_type(&mut self) -> Result<PascalType, ParseError> {
         // `var name: T` or `name: T` — we capture only the type.
-        if *self.peek() == Tok::Var { self.advance(); }
+        if *self.peek() == Tok::Var {
+            self.advance();
+        }
         let _ = self.expect_ident()?;
         while *self.peek() == Tok::Comma {
             self.advance();
@@ -1091,7 +1248,11 @@ impl Parser {
         }
         let end_span = self.span();
         self.expect(&Tok::End)?;
-        Ok(Block { statements, span, end_span })
+        Ok(Block {
+            statements,
+            span,
+            end_span,
+        })
     }
 
     // ── statement ────────────────────────────────────────
@@ -1099,7 +1260,12 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         // Check for label: N: statement
         if let Tok::IntLit(n) = self.peek().clone() {
-            if self.tokens.get(self.pos + 1).map(|(t, _)| t == &Tok::Colon).unwrap_or(false) {
+            if self
+                .tokens
+                .get(self.pos + 1)
+                .map(|(t, _)| t == &Tok::Colon)
+                .unwrap_or(false)
+            {
                 let span = self.span();
                 self.advance(); // consume number
                 self.advance(); // consume colon
@@ -1129,7 +1295,10 @@ impl Parser {
                         Ok(Statement::Goto { label: n, span })
                     }
                     _ => Err(ParseError {
-                        message: format!("expected label number after 'goto', found {}", self.peek()),
+                        message: format!(
+                            "expected label number after 'goto', found {}",
+                            self.peek()
+                        ),
                         span: self.span(),
                     }),
                 }
@@ -1178,22 +1347,62 @@ impl Parser {
             self.advance();
             let expr = self.parse_expr()?;
             if chain.is_empty() {
-                return Ok(Statement::Assignment { target: name, expr, span });
+                return Ok(Statement::Assignment {
+                    target: name,
+                    expr,
+                    span,
+                });
             }
             // Single-step chains: emit the specific existing statement types
             if chain.len() == 1 {
                 match chain.into_iter().next().unwrap() {
-                    LValueAccess::Field(field) => return Ok(Statement::FieldAssignment { target: name, field, expr, span }),
-                    LValueAccess::Index(index) => return Ok(Statement::IndexAssignment { target: name, index, expr, span }),
-                    LValueAccess::Deref => return Ok(Statement::DerefAssignment { target: name, expr, span }),
+                    LValueAccess::Field(field) => {
+                        return Ok(Statement::FieldAssignment {
+                            target: name,
+                            field,
+                            expr,
+                            span,
+                        });
+                    }
+                    LValueAccess::Index(index) => {
+                        return Ok(Statement::IndexAssignment {
+                            target: name,
+                            index,
+                            expr,
+                            span,
+                        });
+                    }
+                    LValueAccess::Deref => {
+                        return Ok(Statement::DerefAssignment {
+                            target: name,
+                            expr,
+                            span,
+                        });
+                    }
                 }
             }
             // Multi-index shorthand: a[i, j] := expr
             if chain.iter().all(|a| matches!(a, LValueAccess::Index(_))) {
-                let indices: Vec<Expr> = chain.into_iter().map(|a| match a { LValueAccess::Index(e) => e, _ => unreachable!() }).collect();
-                return Ok(Statement::MultiIndexAssignment { target: name, indices, expr, span });
+                let indices: Vec<Expr> = chain
+                    .into_iter()
+                    .map(|a| match a {
+                        LValueAccess::Index(e) => e,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                return Ok(Statement::MultiIndexAssignment {
+                    target: name,
+                    indices,
+                    expr,
+                    span,
+                });
             }
-            return Ok(Statement::ChainedAssignment { target: name, chain, expr, span });
+            return Ok(Statement::ChainedAssignment {
+                target: name,
+                chain,
+                expr,
+                span,
+            });
         }
 
         // Procedure call (chain should be empty for proc calls)
@@ -1212,7 +1421,11 @@ impl Parser {
         }
 
         // No-arg procedure call
-        Ok(Statement::ProcCall { name, args: Vec::new(), span })
+        Ok(Statement::ProcCall {
+            name,
+            args: Vec::new(),
+            span,
+        })
     }
 
     fn parse_if(&mut self) -> Result<Statement, ParseError> {
@@ -1223,20 +1436,39 @@ impl Parser {
         let then_stmt = self.parse_statement()?;
         let then_branch = match then_stmt {
             Statement::Block(b) => b,
-            other => { let s = other.span(); Block { span: s, end_span: s, statements: vec![other] } },
+            other => {
+                let s = other.span();
+                Block {
+                    span: s,
+                    end_span: s,
+                    statements: vec![other],
+                }
+            }
         };
         let else_branch = if *self.peek() == Tok::Else {
             self.advance();
             let else_stmt = self.parse_statement()?;
             let block = match else_stmt {
                 Statement::Block(b) => b,
-                other => { let s = other.span(); Block { span: s, end_span: s, statements: vec![other] } },
+                other => {
+                    let s = other.span();
+                    Block {
+                        span: s,
+                        end_span: s,
+                        statements: vec![other],
+                    }
+                }
             };
             Some(block)
         } else {
             None
         };
-        Ok(Statement::If { condition, then_branch, else_branch, span })
+        Ok(Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        })
     }
 
     fn parse_while(&mut self) -> Result<Statement, ParseError> {
@@ -1247,9 +1479,20 @@ impl Parser {
         let body_stmt = self.parse_statement()?;
         let body = match body_stmt {
             Statement::Block(b) => b,
-            other => { let s = other.span(); Block { span: s, end_span: s, statements: vec![other] } },
+            other => {
+                let s = other.span();
+                Block {
+                    span: s,
+                    end_span: s,
+                    statements: vec![other],
+                }
+            }
         };
-        Ok(Statement::While { condition, body, span })
+        Ok(Statement::While {
+            condition,
+            body,
+            span,
+        })
     }
 
     fn parse_for(&mut self) -> Result<Statement, ParseError> {
@@ -1259,21 +1502,43 @@ impl Parser {
         self.expect(&Tok::Assign)?;
         let from = self.parse_expr()?;
         let downto = match self.peek() {
-            Tok::To => { self.advance(); false }
-            Tok::DownTo => { self.advance(); true }
-            _ => return Err(ParseError {
-                message: format!("expected 'to' or 'downto', found {}", self.peek()),
-                span: self.span(),
-            }),
+            Tok::To => {
+                self.advance();
+                false
+            }
+            Tok::DownTo => {
+                self.advance();
+                true
+            }
+            _ => {
+                return Err(ParseError {
+                    message: format!("expected 'to' or 'downto', found {}", self.peek()),
+                    span: self.span(),
+                });
+            }
         };
         let to = self.parse_expr()?;
         self.expect(&Tok::Do)?;
         let body_stmt = self.parse_statement()?;
         let body = match body_stmt {
             Statement::Block(b) => b,
-            other => { let s = other.span(); Block { span: s, end_span: s, statements: vec![other] } },
+            other => {
+                let s = other.span();
+                Block {
+                    span: s,
+                    end_span: s,
+                    statements: vec![other],
+                }
+            }
         };
-        Ok(Statement::For { var, from, to, downto, body, span })
+        Ok(Statement::For {
+            var,
+            from,
+            to,
+            downto,
+            body,
+            span,
+        })
     }
 
     fn parse_repeat_until(&mut self) -> Result<Statement, ParseError> {
@@ -1284,13 +1549,19 @@ impl Parser {
             stmts.push(self.parse_statement()?);
             while *self.peek() == Tok::Semi {
                 self.advance();
-                if *self.peek() == Tok::Until { break; }
+                if *self.peek() == Tok::Until {
+                    break;
+                }
                 stmts.push(self.parse_statement()?);
             }
         }
         self.expect(&Tok::Until)?;
         let condition = self.parse_expr()?;
-        Ok(Statement::RepeatUntil { body: stmts, condition, span })
+        Ok(Statement::RepeatUntil {
+            body: stmts,
+            condition,
+            span,
+        })
     }
 
     fn parse_case(&mut self) -> Result<Statement, ParseError> {
@@ -1303,7 +1574,9 @@ impl Parser {
         let mut else_branch = None;
 
         loop {
-            if *self.peek() == Tok::End { break; }
+            if *self.peek() == Tok::End {
+                break;
+            }
             if *self.peek() == Tok::Else {
                 self.advance();
                 let mut stmts = Vec::new();
@@ -1311,7 +1584,9 @@ impl Parser {
                     stmts.push(self.parse_statement()?);
                     while *self.peek() == Tok::Semi {
                         self.advance();
-                        if *self.peek() == Tok::End { break; }
+                        if *self.peek() == Tok::End {
+                            break;
+                        }
                         stmts.push(self.parse_statement()?);
                     }
                 }
@@ -1329,12 +1604,23 @@ impl Parser {
             self.expect(&Tok::Colon)?;
             let mut body = Vec::new();
             body.push(self.parse_statement()?);
-            branches.push(CaseBranch { values, body, span: branch_span });
-            if *self.peek() == Tok::Semi { self.advance(); }
+            branches.push(CaseBranch {
+                values,
+                body,
+                span: branch_span,
+            });
+            if *self.peek() == Tok::Semi {
+                self.advance();
+            }
         }
 
         self.expect(&Tok::End)?;
-        Ok(Statement::Case { expr, branches, else_branch, span })
+        Ok(Statement::Case {
+            expr,
+            branches,
+            else_branch,
+            span,
+        })
     }
 
     fn parse_case_value(&mut self) -> Result<CaseValue, ParseError> {
@@ -1358,10 +1644,18 @@ impl Parser {
             Statement::Block(b) => b,
             other => {
                 let s = other.span();
-                Block { span: s, end_span: s, statements: vec![other] }
+                Block {
+                    span: s,
+                    end_span: s,
+                    statements: vec![other],
+                }
             }
         };
-        Ok(Statement::With { record_var, body, span })
+        Ok(Statement::With {
+            record_var,
+            body,
+            span,
+        })
     }
 
     fn parse_new(&mut self) -> Result<Statement, ParseError> {
@@ -1416,7 +1710,11 @@ impl Parser {
                 precision = Some(self.parse_expr()?);
             }
         }
-        Ok(WriteArg { expr, width, precision })
+        Ok(WriteArg {
+            expr,
+            width,
+            precision,
+        })
     }
 
     fn parse_readln(&mut self) -> Result<Statement, ParseError> {
@@ -1460,19 +1758,24 @@ impl Parser {
         let mut left = self.parse_additive()?;
         loop {
             let op = match self.peek() {
-                Tok::Eq   => BinOp::Eq,
-                Tok::Neq  => BinOp::Neq,
-                Tok::Lt   => BinOp::Lt,
-                Tok::Gt   => BinOp::Gt,
-                Tok::Lte  => BinOp::Lte,
-                Tok::Gte  => BinOp::Gte,
+                Tok::Eq => BinOp::Eq,
+                Tok::Neq => BinOp::Neq,
+                Tok::Lt => BinOp::Lt,
+                Tok::Gt => BinOp::Gt,
+                Tok::Lte => BinOp::Lte,
+                Tok::Gte => BinOp::Gte,
                 Tok::KwIn => BinOp::In,
                 _ => break,
             };
             let span = self.span();
             self.advance();
             let right = self.parse_additive()?;
-            left = Expr::BinOp { op, left: Box::new(left), right: Box::new(right), span };
+            left = Expr::BinOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+                span,
+            };
         }
         Ok(left)
     }
@@ -1481,15 +1784,20 @@ impl Parser {
         let mut left = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
-                Tok::Plus  => BinOp::Add,
+                Tok::Plus => BinOp::Add,
                 Tok::Minus => BinOp::Sub,
-                Tok::KwOr  => BinOp::Or,
+                Tok::KwOr => BinOp::Or,
                 _ => break,
             };
             let span = self.span();
             self.advance();
             let right = self.parse_multiplicative()?;
-            left = Expr::BinOp { op, left: Box::new(left), right: Box::new(right), span };
+            left = Expr::BinOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+                span,
+            };
         }
         Ok(left)
     }
@@ -1498,7 +1806,7 @@ impl Parser {
         let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
-                Tok::Star  => BinOp::Mul,
+                Tok::Star => BinOp::Mul,
                 Tok::Slash => BinOp::RealDiv,
                 Tok::KwDiv => BinOp::Div,
                 Tok::KwMod => BinOp::Mod,
@@ -1508,7 +1816,12 @@ impl Parser {
             let span = self.span();
             self.advance();
             let right = self.parse_unary()?;
-            left = Expr::BinOp { op, left: Box::new(left), right: Box::new(right), span };
+            left = Expr::BinOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+                span,
+            };
         }
         Ok(left)
     }
@@ -1519,13 +1832,21 @@ impl Parser {
                 let span = self.span();
                 self.advance();
                 let operand = self.parse_primary()?;
-                Ok(Expr::UnaryOp { op: UnaryOp::Neg, operand: Box::new(operand), span })
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Neg,
+                    operand: Box::new(operand),
+                    span,
+                })
             }
             Tok::KwNot => {
                 let span = self.span();
                 self.advance();
                 let operand = self.parse_primary()?;
-                Ok(Expr::UnaryOp { op: UnaryOp::Not, operand: Box::new(operand), span })
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Not,
+                    operand: Box::new(operand),
+                    span,
+                })
             }
             _ => self.parse_primary(),
         }
@@ -1569,7 +1890,11 @@ impl Parser {
                 Ok(Expr::Nil(span))
             }
             Tok::TyInteger | Tok::TyReal | Tok::TyChar | Tok::TyBoolean
-                if self.tokens.get(self.pos + 1).map(|(t, _)| t == &Tok::LParen).unwrap_or(false) =>
+                if self
+                    .tokens
+                    .get(self.pos + 1)
+                    .map(|(t, _)| t == &Tok::LParen)
+                    .unwrap_or(false) =>
             {
                 let span = self.span();
                 let name = match self.peek() {
@@ -1578,12 +1903,17 @@ impl Parser {
                     Tok::TyChar => "char",
                     Tok::TyBoolean => "boolean",
                     _ => unreachable!(),
-                }.to_string();
+                }
+                .to_string();
                 self.advance();
                 self.expect(&Tok::LParen)?;
                 let arg = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;
-                Ok(Expr::Call { name, args: vec![arg], span })
+                Ok(Expr::Call {
+                    name,
+                    args: vec![arg],
+                    span,
+                })
             }
             Tok::Ident(name) => {
                 let span = self.span();
@@ -1611,23 +1941,39 @@ impl Parser {
                             self.advance();
                             let index = self.parse_expr()?;
                             if *self.peek() == Tok::Comma {
-                                let mut expr_so_far = Expr::Index { array: Box::new(expr), index: Box::new(index), span };
+                                let mut expr_so_far = Expr::Index {
+                                    array: Box::new(expr),
+                                    index: Box::new(index),
+                                    span,
+                                };
                                 while *self.peek() == Tok::Comma {
                                     self.advance();
                                     let next_index = self.parse_expr()?;
-                                    expr_so_far = Expr::Index { array: Box::new(expr_so_far), index: Box::new(next_index), span };
+                                    expr_so_far = Expr::Index {
+                                        array: Box::new(expr_so_far),
+                                        index: Box::new(next_index),
+                                        span,
+                                    };
                                 }
                                 self.expect(&Tok::RBracket)?;
                                 expr = expr_so_far;
                             } else {
                                 self.expect(&Tok::RBracket)?;
-                                expr = Expr::Index { array: Box::new(expr), index: Box::new(index), span };
+                                expr = Expr::Index {
+                                    array: Box::new(expr),
+                                    index: Box::new(index),
+                                    span,
+                                };
                             }
                         }
                         Tok::Dot => {
                             self.advance();
                             let (field, _) = self.expect_ident()?;
-                            expr = Expr::FieldAccess { record: Box::new(expr), field, span };
+                            expr = Expr::FieldAccess {
+                                record: Box::new(expr),
+                                field,
+                                span,
+                            };
                         }
                         Tok::Caret => {
                             self.advance();
