@@ -805,8 +805,11 @@ end.
         );
         let (ok, out) = build_and_run_source(&prog);
         assert!(ok);
-        // 'ABC\n' = 4 bytes
-        assert_eq!(out.trim(), "4");
+        // Pascal `text` files open in C text mode, so `writeln` emits the
+        // platform line ending: 4 bytes on Unix ("ABC\n"), 5 on Windows
+        // ("ABC\r\n").
+        let expected = if cfg!(windows) { "5" } else { "4" };
+        assert_eq!(out.trim(), expected);
         let _ = std::fs::remove_file(&path);
     }
 
