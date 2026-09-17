@@ -4,6 +4,7 @@ pub mod ast;
 pub mod codegen;
 pub mod parser;
 mod pascal_syntax;
+pub mod prof_runtime;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -229,6 +230,8 @@ impl PascalBuildJob {
             exe_path: paths.exe_path,
             source_path: paths.source_path,
             console_capture_path: bruto_lang::target::console_capture_path(),
+            profile_path: None,
+            profile_map_path: None,
         })
     }
 }

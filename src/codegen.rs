@@ -329,6 +329,15 @@ impl<'ctx> CodeGen<'ctx> {
     /// the running child. The caller drives it via `try_wait` so the
     /// IDE can surface progress / handle cancel.
     pub fn spawn_linker(obj_path: &str, output_path: &str) -> Result<std::process::Child, String> {
+        Self::spawn_linker_objs(&[obj_path], output_path)
+    }
+
+    /// Same as [`spawn_linker`] for several object files (the profile build
+    /// links the program object plus the profiler runtime object).
+    pub fn spawn_linker_objs(
+        obj_paths: &[&str],
+        output_path: &str,
+    ) -> Result<std::process::Child, String> {
         // Linker selection per platform:
         //   macOS:   `cc` resolves to Apple's clang; supports -lm/-g.
         //   Linux:   `cc` resolves to gcc/clang; need -no-pie because the
@@ -342,25 +351,18 @@ impl<'ctx> CodeGen<'ctx> {
         } else {
             "cc"
         };
-        let link_args: Vec<&str> = {
-            #[allow(unused_mut)]
-            let mut a: Vec<&str> = vec![obj_path, "-o", output_path, "-g"];
-            #[cfg(not(target_os = "windows"))]
-            a.push("-lm");
-            #[cfg(target_os = "linux")]
-            a.push("-no-pie");
-            // On Windows-MSVC, force LLVM's lld-link as the linker so we
-            // don't depend on link.exe finding the right .lib paths from
-            // a GitHub-runner-shaped environment, and explicitly pull in
-            // the UCRT/legacy stdio libs the runtime helpers reference.
-            #[cfg(all(target_os = "windows", target_env = "msvc"))]
-            {
-                a.push("-fuse-ld=lld");
-                a.push("-lmsvcrt");
-                a.push("-llegacy_stdio_definitions");
-            }
-            a
-        };
+        let mut link_args: Vec<&str> = obj_paths.to_vec();
+        link_args.extend(["-o", output_path, "-g"]);
+        #[cfg(not(target_os = "windows"))]
+        link_args.push("-lm");
+        #[cfg(target_os = "linux")]
+        link_args.push("-no-pie");
+        #[cfg(all(target_os = "windows", target_env = "msvc"))]
+        {
+            link_args.push("-fuse-ld=lld");
+            link_args.push("-lmsvcrt");
+            link_args.push("-llegacy_stdio_definitions");
+        }
         std::process::Command::new(linker)
             .args(&link_args)
             .stdout(std::process::Stdio::piped())
@@ -4347,12 +4349,13 @@ impl<'ctx> CodeGen<'ctx> {
                 let enumerators: Vec<_> = values
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| {
-                        self.di_builder
-                            .create_enumerator(v, i as i64, false)
-                    })
+                    .map(|(i, v)| self.di_builder.create_enumerator(v, i as i64, false))
                     .collect();
-                let display_name = if name.is_empty() { "Enum" } else { name.as_str() };
+                let display_name = if name.is_empty() {
+                    "Enum"
+                } else {
+                    name.as_str()
+                };
                 Some(
                     self.di_builder
                         .create_enumeration_type(
@@ -4448,9 +4451,7 @@ impl<'ctx> CodeGen<'ctx> {
             let size = self.sizeof_type(&resolved) * 8;
             members.push(
                 self.di_builder
-                    .create_member_type(
-                        scope, name, file, 0, size, 64, offset, DIFlags::ZERO, mty,
-                    )
+                    .create_member_type(scope, name, file, 0, size, 64, offset, DIFlags::ZERO, mty)
                     .as_type(),
             );
             offset += self.sizeof_type(&resolved) * 8;
