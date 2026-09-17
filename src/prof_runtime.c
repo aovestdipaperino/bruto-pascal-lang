@@ -66,8 +66,11 @@ static uint32_t bp_overflow = 0;   /* enters beyond BP_STACK, ignored */
 static uint32_t bp_flags = 0;
 static uint64_t bp_start = 0;
 static int bp_registered = 0;
+static const char *bp_default_out = 0;
 
 static void bp_write(void);
+
+void __bruto_prof_set_output(const char *path) { bp_default_out = path; }
 
 static uint32_t bp_find(uint32_t parent, uint32_t loc, uint8_t kind) {
     uint32_t h = (parent * 2654435761u) ^ (loc * 40503u);
@@ -152,7 +155,11 @@ static void bp_write(void) {
     /* Close frames still open at exit (e.g. halt inside a routine). */
     while (bp_depth > 0) __bruto_prof_exit();
     const char *path = getenv("BRUTO_PROF_OUT");
-    if (!path || !*path) return;
+    if (!path || !*path) path = bp_default_out;
+    if (!path || !*path) {
+        fputs("bruto profiler: no output path (set BRUTO_PROF_OUT)\n", stderr);
+        return;
+    }
     FILE *fp = fopen(path, "wb");
     if (!fp) return;
     /* Node slots are sparse; compact them and remap parent indices. */

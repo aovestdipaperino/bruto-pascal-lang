@@ -237,6 +237,9 @@ impl PascalBuildJob {
         let mut codegen = CodeGen::new(&context, &source_path);
         codegen.set_directives(parser.directives);
         codegen.set_instrument(self.profile);
+        if self.profile {
+            codegen.set_prof_output(&format!("{exe_path}.bruto-prof"));
+        }
         if let Err(e) = codegen.compile(&program) {
             return BuildPhase::Failed(format!("Codegen error: {e}"));
         }
@@ -1466,7 +1469,6 @@ end.
         let prof_path = result.profile_path.clone().expect("profile path");
         let _ = std::fs::remove_file(&prof_path);
         let status = std::process::Command::new(&result.exe_path)
-            .env("BRUTO_PROF_OUT", &prof_path)
             .stdout(std::process::Stdio::null())
             .status()
             .expect("run");

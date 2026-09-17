@@ -56,20 +56,28 @@ mod tests {
         assert!(status.success(), "cc -c failed");
 
         // A tiny driver: main -> enter(1) line(2) enter(3) line(4) exit exit.
+        // It bakes in a default output path via __bruto_prof_set_output, the
+        // same way codegen does for real profile builds.
+        let default_out = dir.join("driver.bruto-prof");
         let driver = dir.join("driver.c");
         std::fs::write(
             &driver,
-            r#"
+            format!(
+                r#"
 #include <stdint.h>
 void __bruto_prof_enter(uint32_t); void __bruto_prof_exit(void); void __bruto_prof_line(uint32_t);
-int main(void) {
+void __bruto_prof_set_output(const char *);
+int main(void) {{
+    __bruto_prof_set_output("{default_out}");
     __bruto_prof_enter(1);
     __bruto_prof_line(2);
-    for (int i = 0; i < 3; i++) { __bruto_prof_enter(3); __bruto_prof_line(4); __bruto_prof_exit(); }
+    for (int i = 0; i < 3; i++) {{ __bruto_prof_enter(3); __bruto_prof_line(4); __bruto_prof_exit(); }}
     __bruto_prof_exit();
     return 0;
-}
+}}
 "#,
+                default_out = default_out.display()
+            ),
         )
         .unwrap();
         let exe = dir.join("driver");
@@ -87,12 +95,36 @@ int main(void) {
             .unwrap();
         assert!(status.success(), "link failed");
 
-        let out = dir.join("driver.bruto-prof");
+        let out = default_out.clone();
+        let _ = std::fs::remove_file(&out);
+        let status = std::process::Command::new(&exe).status().unwrap();
+        assert!(status.success());
+        assert!(
+            out.exists(),
+            "the baked-in default output path must be used when BRUTO_PROF_OUT is unset"
+        );
+
+        // A second run with BRUTO_PROF_OUT set must write there instead.
+        let override_out = dir.join("driver_override.bruto-prof");
+        let _ = std::fs::remove_file(&override_out);
         let _ = std::fs::remove_file(&out);
         let status = std::process::Command::new(&exe)
-            .env("BRUTO_PROF_OUT", &out)
+            .env("BRUTO_PROF_OUT", &override_out)
             .status()
             .unwrap();
+        assert!(status.success());
+        assert!(
+            override_out.exists(),
+            "BRUTO_PROF_OUT must override the baked-in default path"
+        );
+        assert!(
+            !out.exists(),
+            "the default path must not be written when BRUTO_PROF_OUT overrides it"
+        );
+
+        // Re-run once more without the env var so the rest of this test
+        // exercises fresh data at the default path.
+        let status = std::process::Command::new(&exe).status().unwrap();
         assert!(status.success());
 
         let bytes = std::fs::read(&out).expect("profile written");

@@ -103,6 +103,9 @@ pub struct CodeGen<'ctx> {
     prof_next_id: u32,
     // `P <id> <line> <name>` / `L <id> <line> <col>` lines for <exe>.bruto-prof-map
     prof_map_lines: Vec<String>,
+    // Default output path baked into the program; `BRUTO_PROF_OUT` overrides
+    // it at runtime. Set via `set_prof_output` before `compile`.
+    prof_output: Option<String>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -162,6 +165,7 @@ impl<'ctx> CodeGen<'ctx> {
             instrument: false,
             prof_next_id: 1,
             prof_map_lines: Vec::new(),
+            prof_output: None,
         }
     }
 
@@ -176,6 +180,14 @@ impl<'ctx> CodeGen<'ctx> {
     /// `compile`.
     pub fn set_instrument(&mut self, on: bool) {
         self.instrument = on;
+    }
+
+    /// Bake `path` into the program as the default profile output, written
+    /// via `__bruto_prof_set_output` right after instrumentation starts.
+    /// `BRUTO_PROF_OUT` still overrides it at runtime. Must be called before
+    /// `compile`.
+    pub fn set_prof_output(&mut self, path: &str) {
+        self.prof_output = Some(path.to_string());
     }
 
     /// The id map accumulated so far (for tests and `write_prof_map`).
@@ -209,6 +221,12 @@ impl<'ctx> CodeGen<'ctx> {
         self.module.add_function(
             "__bruto_prof_line",
             void_ty.fn_type(&[i32_ty.into()], false),
+            None,
+        );
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        self.module.add_function(
+            "__bruto_prof_set_output",
+            void_ty.fn_type(&[ptr_ty.into()], false),
             None,
         );
     }
@@ -358,6 +376,18 @@ impl<'ctx> CodeGen<'ctx> {
         // Install signal handler to catch stack overflow / segfaults.
         self.set_debug_loc(program.span);
         self.emit_prof_enter("program", program.body.span.line)?;
+        if self.instrument {
+            if let Some(path) = self.prof_output.clone() {
+                let ptr = self
+                    .builder
+                    .build_global_string_ptr(&path, "prof_output_path")
+                    .map_err(|e| CodeGenError::new(e.to_string(), None))?;
+                let f = self.module.get_function("__bruto_prof_set_output").unwrap();
+                self.builder
+                    .build_call(f, &[ptr.as_pointer_value().into()], "")
+                    .map_err(|e| CodeGenError::new(e.to_string(), None))?;
+            }
+        }
         {
             let f = self
                 .module
@@ -1053,7 +1083,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_statement(&mut self, stmt: &Statement) -> Result<(), CodeGenError> {
-        if !matches!(stmt, Statement::Label { .. }) {
+        if self.instrument && !matches!(stmt, Statement::Label { .. }) {
             // The hook carries the statement's own debug location so the
             // call is attributed to the line it measures.
             self.set_debug_loc(stmt.span());
