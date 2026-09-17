@@ -1054,6 +1054,9 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn compile_statement(&mut self, stmt: &Statement) -> Result<(), CodeGenError> {
         if !matches!(stmt, Statement::Label { .. }) {
+            // The hook carries the statement's own debug location so the
+            // call is attributed to the line it measures.
+            self.set_debug_loc(stmt.span());
             self.emit_prof_line(stmt.span())?;
         }
         match stmt {
