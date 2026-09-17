@@ -48,23 +48,39 @@ impl Language for MiniPascal {
     }
 
     fn build_job(&self, source: &str) -> Box<dyn BuildJob> {
-        Box::new(PascalBuildJob::new(source.to_string(), Vec::new()))
+        Box::new(PascalBuildJob::new(source.to_string(), Vec::new(), false))
     }
 
     fn build_job_at(&self, source: &str, source_path: Option<&Path>) -> Box<dyn BuildJob> {
-        let mut search_dirs = Vec::new();
-        if let Some(p) = source_path {
-            if let Some(dir) = p.parent() {
-                search_dirs.push(dir.to_path_buf());
-            }
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            if !search_dirs.iter().any(|d| d == &cwd) {
-                search_dirs.push(cwd);
-            }
-        }
-        Box::new(PascalBuildJob::new(source.to_string(), search_dirs))
+        Box::new(PascalBuildJob::new(
+            source.to_string(),
+            search_dirs_for(source_path),
+            false,
+        ))
     }
+
+    fn profile_job_at(&self, source: &str, source_path: Option<&Path>) -> Box<dyn BuildJob> {
+        Box::new(PascalBuildJob::new(
+            source.to_string(),
+            search_dirs_for(source_path),
+            true,
+        ))
+    }
+}
+
+/// Directories searched for `uses` units: the source file's directory
+/// first, then the current directory.
+fn search_dirs_for(source_path: Option<&Path>) -> Vec<PathBuf> {
+    let mut search_dirs = Vec::new();
+    if let Some(dir) = source_path.and_then(|p| p.parent()) {
+        search_dirs.push(dir.to_path_buf());
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && !search_dirs.iter().any(|d| d == &cwd)
+    {
+        search_dirs.push(cwd);
+    }
+    search_dirs
 }
 
 /// Poll-driven build state machine. The first `poll` runs everything
@@ -75,11 +91,18 @@ impl Language for MiniPascal {
 struct PascalBuildJob {
     inner: JobInner,
     search_dirs: Vec<PathBuf>,
+    /// Compile with profiler hooks and link the profiler runtime.
+    profile: bool,
 }
 
 enum JobInner {
     /// First poll runs everything synchronously through cc spawn.
     NotStarted { source: String },
+    /// Profile builds only: `cc -c` on the runtime source is running.
+    CompilingRuntime {
+        paths: JobPaths,
+        child: std::process::Child,
+    },
     /// cc/clang is running; poll its status.
     Linking {
         paths: JobPaths,
@@ -98,13 +121,17 @@ struct JobPaths {
     source_path: String,
     exe_path: String,
     obj_path: String,
+    /// Profile builds: the runtime object and the id map.
+    runtime_obj_path: Option<String>,
+    prof_map_path: Option<String>,
 }
 
 impl PascalBuildJob {
-    fn new(source: String, search_dirs: Vec<PathBuf>) -> Self {
+    fn new(source: String, search_dirs: Vec<PathBuf>, profile: bool) -> Self {
         Self {
             inner: JobInner::NotStarted { source },
             search_dirs,
+            profile,
         }
     }
 }
@@ -116,6 +143,21 @@ impl BuildJob for PascalBuildJob {
         let state = std::mem::replace(&mut self.inner, JobInner::Drained);
         match state {
             JobInner::NotStarted { source } => self.start(source),
+            JobInner::CompilingRuntime { paths, mut child } => match child.try_wait() {
+                Ok(None) => {
+                    self.inner = JobInner::CompilingRuntime { paths, child };
+                    BuildPhase::Pending("Compiling profiler runtime…".into())
+                }
+                Ok(Some(status)) if status.success() => self.spawn_link(paths),
+                Ok(Some(_)) => {
+                    let stderr = child
+                        .wait_with_output()
+                        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                        .unwrap_or_default();
+                    BuildPhase::Failed(format!("profiler runtime: {stderr}"))
+                }
+                Err(e) => BuildPhase::Failed(format!("waiting on profiler runtime compile: {e}")),
+            },
             JobInner::Linking { paths, mut child } => match child.try_wait() {
                 Ok(None) => {
                     self.inner = JobInner::Linking { paths, child };
@@ -163,11 +205,16 @@ impl PascalBuildJob {
             .join("bruto_pascal_src.pas")
             .to_string_lossy()
             .into_owned();
+        let stem = if self.profile {
+            "bruto_pascal_prof"
+        } else {
+            "bruto_pascal_out"
+        };
         let exe_path = tmp
             .join(if cfg!(windows) {
-                "bruto_pascal_out.exe"
+                format!("{stem}.exe")
             } else {
-                "bruto_pascal_out"
+                stem.to_string()
             })
             .to_string_lossy()
             .into_owned();
@@ -189,6 +236,7 @@ impl PascalBuildJob {
         let context = Context::create();
         let mut codegen = CodeGen::new(&context, &source_path);
         codegen.set_directives(parser.directives);
+        codegen.set_instrument(self.profile);
         if let Err(e) = codegen.compile(&program) {
             return BuildPhase::Failed(format!("Codegen error: {e}"));
         }
@@ -199,15 +247,46 @@ impl PascalBuildJob {
         };
         let _ = codegen.write_metadata(&exe_path);
 
-        let child = match CodeGen::spawn_linker(&obj_path, &exe_path) {
-            Ok(c) => c,
-            Err(e) => return BuildPhase::Failed(e),
-        };
-
-        let paths = JobPaths {
+        let mut paths = JobPaths {
             source_path,
             exe_path,
             obj_path,
+            runtime_obj_path: None,
+            prof_map_path: None,
+        };
+
+        if self.profile {
+            paths.prof_map_path = match codegen.write_prof_map(&paths.exe_path) {
+                Ok(p) => Some(p),
+                Err(e) => return BuildPhase::Failed(e),
+            };
+            let c_path = match prof_runtime::write_runtime_source(&tmp) {
+                Ok(p) => p,
+                Err(e) => return BuildPhase::Failed(e),
+            };
+            let rt_obj = tmp.join("bruto_prof_runtime.o");
+            let child = match prof_runtime::spawn_runtime_compile(&c_path, &rt_obj) {
+                Ok(c) => c,
+                Err(e) => return BuildPhase::Failed(e),
+            };
+            paths.runtime_obj_path = Some(rt_obj.to_string_lossy().into_owned());
+            self.inner = JobInner::CompilingRuntime { paths, child };
+            return BuildPhase::Pending("Compiling profiler runtime…".into());
+        }
+
+        self.spawn_link(paths)
+    }
+
+    /// Spawn the linker over the program object (plus the runtime object
+    /// for profile builds) and move to `Linking`.
+    fn spawn_link(&mut self, paths: JobPaths) -> BuildPhase {
+        let mut objs: Vec<&str> = vec![paths.obj_path.as_str()];
+        if let Some(rt) = paths.runtime_obj_path.as_deref() {
+            objs.push(rt);
+        }
+        let child = match CodeGen::spawn_linker_objs(&objs, &paths.exe_path) {
+            Ok(c) => c,
+            Err(e) => return BuildPhase::Failed(e),
         };
         self.inner = JobInner::Linking { paths, child };
         BuildPhase::Pending("Linking…".into())
@@ -226,12 +305,18 @@ impl PascalBuildJob {
 
     fn finalize(&mut self, paths: JobPaths) -> BuildPhase {
         let _ = std::fs::remove_file(&paths.obj_path);
+        if let Some(rt) = &paths.runtime_obj_path {
+            let _ = std::fs::remove_file(rt);
+        }
+        let profile_path = self
+            .profile
+            .then(|| format!("{}.bruto-prof", paths.exe_path));
         BuildPhase::Done(BuildResult {
             exe_path: paths.exe_path,
             source_path: paths.source_path,
             console_capture_path: bruto_lang::target::console_capture_path(),
-            profile_path: None,
-            profile_map_path: None,
+            profile_path,
+            profile_map_path: paths.prof_map_path,
         })
     }
 }
@@ -241,7 +326,9 @@ impl Drop for PascalBuildJob {
         // Cancel = kill any live child so the linker / dsymutil
         // doesn't keep running after the IDE moves on.
         match &mut self.inner {
-            JobInner::Linking { child, .. } | JobInner::Dsymutil { child, .. } => {
+            JobInner::CompilingRuntime { child, .. }
+            | JobInner::Linking { child, .. }
+            | JobInner::Dsymutil { child, .. } => {
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -1359,6 +1446,58 @@ end.
         let (ir, map) = ir_for(PROF_SRC, false);
         assert!(!ir.contains("__bruto_prof"));
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn profile_build_and_run() {
+        use bruto_lang::profile::ProfileKind;
+        // `acc` is passed by `var`: top-level procedures cannot reference
+        // globals directly in the current codegen (pre-existing limitation).
+        let src = "program Hot;\nvar i, acc: integer;\nprocedure Work(var a: integer);\nvar k: integer;\nbegin\n  for k := 1 to 2000 do\n    a := a + k\nend;\nbegin\n  acc := 0;\n  for i := 1 to 50 do\n    Work(acc);\n  writeln(acc)\nend.\n";
+        let lang = MiniPascal;
+        let mut job = lang.profile_job_at(src, None);
+        let result = loop {
+            match job.poll() {
+                BuildPhase::Pending(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                BuildPhase::Done(r) => break r,
+                BuildPhase::Failed(e) => panic!("profile build failed: {e}"),
+            }
+        };
+        let prof_path = result.profile_path.clone().expect("profile path");
+        let _ = std::fs::remove_file(&prof_path);
+        let status = std::process::Command::new(&result.exe_path)
+            .env("BRUTO_PROF_OUT", &prof_path)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run");
+        assert!(status.success());
+
+        let profile = lang.load_profile(&result).expect("load profile");
+        assert!(profile.elapsed_ns > 0);
+        assert!(!profile.truncated);
+        let work = profile
+            .nodes
+            .iter()
+            .find(|n| n.kind == ProfileKind::Routine && n.name == "Work")
+            .expect("Work node");
+        assert_eq!(work.calls, 50);
+        assert_eq!(work.line, 3);
+        let totals = profile.line_totals();
+        let (hot_line, _) = totals
+            .iter()
+            .max_by_key(|(_, (self_ns, _))| *self_ns)
+            .map(|(l, v)| (*l, *v))
+            .unwrap();
+        assert_eq!(
+            hot_line, 7,
+            "hottest line should be the inner assignment: {totals:?}"
+        );
+        assert_eq!(totals[&7].1, 50 * 2000, "hits of the inner assignment");
+
+        let _ = std::fs::remove_file(&result.exe_path);
+        let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
+        let _ = std::fs::remove_file(&prof_path);
+        let _ = std::fs::remove_file(result.profile_map_path.unwrap());
     }
 }
 
