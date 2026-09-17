@@ -100,21 +100,124 @@ int main(void) {
         let count = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
         // Nodes: routine 1, line 2, routine 3 (once, 3 calls), line 4.
         assert_eq!(count, 4, "expected one node per (parent, loc) pair");
-        // Routine 3 must have calls == 3: scan nodes for kind 1 / loc 3.
-        let mut found = false;
+
+        #[derive(Debug, Clone, Copy)]
+        struct Node {
+            kind: u8,
+            loc: u32,
+            parent: u32,
+            calls: u64,
+            self_ns: u64,
+            total_ns: u64,
+        }
+
+        let mut nodes = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
             let at = 24 + i * 33;
             let kind = bytes[at];
             let loc =
                 u32::from_le_bytes([bytes[at + 1], bytes[at + 2], bytes[at + 3], bytes[at + 4]]);
-            if kind == 1 && loc == 3 {
-                let mut c = [0u8; 8];
-                c.copy_from_slice(&bytes[at + 9..at + 17]);
-                assert_eq!(u64::from_le_bytes(c), 3);
-                found = true;
-            }
+            let parent =
+                u32::from_le_bytes([bytes[at + 5], bytes[at + 6], bytes[at + 7], bytes[at + 8]]);
+            let mut c = [0u8; 8];
+            c.copy_from_slice(&bytes[at + 9..at + 17]);
+            let calls = u64::from_le_bytes(c);
+            let mut s = [0u8; 8];
+            s.copy_from_slice(&bytes[at + 17..at + 25]);
+            let self_ns = u64::from_le_bytes(s);
+            let mut t = [0u8; 8];
+            t.copy_from_slice(&bytes[at + 25..at + 33]);
+            let total_ns = u64::from_le_bytes(t);
+            nodes.push(Node {
+                kind,
+                loc,
+                parent,
+                calls,
+                self_ns,
+                total_ns,
+            });
         }
-        assert!(found, "routine 3 node missing");
+
+        let idx_of = |kind: u8, loc: u32| -> usize {
+            nodes
+                .iter()
+                .position(|n| n.kind == kind && n.loc == loc)
+                .unwrap_or_else(|| panic!("node kind={kind} loc={loc} not found in {nodes:?}"))
+        };
+
+        let idx_r1 = idx_of(1, 1);
+        let idx_l2 = idx_of(2, 2);
+        let idx_r3 = idx_of(1, 3);
+        let idx_l4 = idx_of(2, 4);
+
+        let r1 = nodes[idx_r1];
+        let l2 = nodes[idx_l2];
+        let r3 = nodes[idx_r3];
+        let l4 = nodes[idx_l4];
+
+        // 1. Routine 1 is the tree root, entered once.
+        assert_eq!(
+            r1.parent,
+            u32::MAX,
+            "routine 1 must be a root; nodes = {nodes:?}"
+        );
+        assert_eq!(r1.calls, 1, "routine 1 calls; nodes = {nodes:?}");
+
+        // 2. Line 2 runs inside routine 1, once.
+        assert_eq!(
+            l2.parent, idx_r1 as u32,
+            "line 2 parent must be routine 1; nodes = {nodes:?}"
+        );
+        assert_eq!(l2.calls, 1, "line 2 calls; nodes = {nodes:?}");
+
+        // 3. Routine 3 is entered while line 2 is the running line, 3 times.
+        assert_eq!(
+            r3.parent, idx_l2 as u32,
+            "routine 3 parent must be line 2 (the running line at entry); nodes = {nodes:?}"
+        );
+        assert_eq!(r3.calls, 3, "routine 3 calls; nodes = {nodes:?}");
+
+        // 4. Line 4 runs inside routine 3, once per call.
+        assert_eq!(
+            l4.parent, idx_r3 as u32,
+            "line 4 parent must be routine 3; nodes = {nodes:?}"
+        );
+        assert_eq!(l4.calls, 3, "line 4 calls; nodes = {nodes:?}");
+
+        // 5. Self/total bookkeeping: self = total - (child routine time), exactly.
+        assert_eq!(
+            r1.self_ns,
+            r1.total_ns - r3.total_ns,
+            "routine 1 self_ns must equal total_ns minus routine 3's total_ns; nodes = {nodes:?}"
+        );
+        assert_eq!(
+            l2.self_ns,
+            l2.total_ns - r3.total_ns,
+            "line 2 self_ns must equal total_ns minus routine 3's total_ns; nodes = {nodes:?}"
+        );
+        // Routine 3 has no routine children, so self == total exactly (line 4 is
+        // a line node, not a routine, and does not subtract from routine 3's self).
+        assert_eq!(
+            r3.self_ns, r3.total_ns,
+            "routine 3 has no callee routines, so self_ns must equal total_ns; nodes = {nodes:?}"
+        );
+        assert!(
+            l4.total_ns <= r3.total_ns,
+            "line 4's total_ns must not exceed its enclosing routine 3's total_ns; nodes = {nodes:?}"
+        );
+
+        // 6. Sanity: parent total dominates child total, and total >= self everywhere.
+        assert!(
+            r1.total_ns >= r3.total_ns,
+            "routine 1 total_ns must be >= routine 3 total_ns (3 calls nested inside); nodes = {nodes:?}"
+        );
+        for n in &nodes {
+            assert!(
+                n.total_ns >= n.self_ns,
+                "total_ns must be >= self_ns for every node; node = {n:?}; nodes = {nodes:?}"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
