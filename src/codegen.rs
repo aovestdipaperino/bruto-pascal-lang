@@ -97,6 +97,12 @@ pub struct CodeGen<'ctx> {
     // Per-variable metadata for the watch window. Populated during compile.
     // Format lines: `name|kind|extra` (kind = "enum", "set", "vrec", "real", "char", "bool")
     metadata_lines: Vec<String>,
+
+    // Profiling instrumentation (see prof_runtime.rs). Off by default.
+    instrument: bool,
+    prof_next_id: u32,
+    // `P <id> <line> <name>` / `L <id> <line> <col>` lines for <exe>.bruto-prof-map
+    prof_map_lines: Vec<String>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -153,6 +159,9 @@ impl<'ctx> CodeGen<'ctx> {
             source_path: source_path.to_string(),
             directives: crate::parser::Directives::default(),
             metadata_lines: Vec::new(),
+            instrument: false,
+            prof_next_id: 1,
+            prof_map_lines: Vec::new(),
         }
     }
 
@@ -163,6 +172,104 @@ impl<'ctx> CodeGen<'ctx> {
         std::fs::write(&path, body).map_err(|e| format!("metadata write: {e}"))
     }
 
+    /// Turn profiler instrumentation on or off. Must be called before
+    /// `compile`.
+    pub fn set_instrument(&mut self, on: bool) {
+        self.instrument = on;
+    }
+
+    /// The id map accumulated so far (for tests and `write_prof_map`).
+    pub fn prof_map_lines(&self) -> &[String] {
+        &self.prof_map_lines
+    }
+
+    /// Write `<exe>.bruto-prof-map` and return its path.
+    pub fn write_prof_map(&self, exe_path: &str) -> Result<String, String> {
+        let path = format!("{exe_path}.bruto-prof-map");
+        let mut body = self.prof_map_lines.join("\n");
+        body.push('\n');
+        std::fs::write(&path, body).map_err(|e| format!("prof map write: {e}"))?;
+        Ok(path)
+    }
+
+    // ── profiler hooks ───────────────────────────────────
+
+    /// Declare the three runtime hooks. Called once from `compile` when
+    /// instrumentation is on.
+    fn emit_prof_decls(&self) {
+        let void_ty = self.context.void_type();
+        let i32_ty = self.context.i32_type();
+        self.module.add_function(
+            "__bruto_prof_enter",
+            void_ty.fn_type(&[i32_ty.into()], false),
+            None,
+        );
+        self.module
+            .add_function("__bruto_prof_exit", void_ty.fn_type(&[], false), None);
+        self.module.add_function(
+            "__bruto_prof_line",
+            void_ty.fn_type(&[i32_ty.into()], false),
+            None,
+        );
+    }
+
+    fn prof_alloc_id(&mut self) -> u32 {
+        let id = self.prof_next_id;
+        self.prof_next_id += 1;
+        id
+    }
+
+    /// `__bruto_prof_enter(id)` at the current insertion point, registering
+    /// `name` at `line` as a routine.
+    fn emit_prof_enter(&mut self, name: &str, line: u32) -> Result<(), CodeGenError> {
+        if !self.instrument {
+            return Ok(());
+        }
+        let id = self.prof_alloc_id();
+        self.prof_map_lines.push(format!("P {id} {line} {name}"));
+        let f = self.module.get_function("__bruto_prof_enter").unwrap();
+        self.builder
+            .build_call(
+                f,
+                &[self.context.i32_type().const_int(id as u64, false).into()],
+                "",
+            )
+            .map_err(|e| CodeGenError::new(e.to_string(), None))?;
+        Ok(())
+    }
+
+    /// `__bruto_prof_exit()` at the current insertion point (call right
+    /// before every `ret`).
+    fn emit_prof_exit(&mut self) -> Result<(), CodeGenError> {
+        if !self.instrument {
+            return Ok(());
+        }
+        let f = self.module.get_function("__bruto_prof_exit").unwrap();
+        self.builder
+            .build_call(f, &[], "")
+            .map_err(|e| CodeGenError::new(e.to_string(), None))?;
+        Ok(())
+    }
+
+    /// `__bruto_prof_line(id)` for the statement at `span`.
+    fn emit_prof_line(&mut self, span: Span) -> Result<(), CodeGenError> {
+        if !self.instrument {
+            return Ok(());
+        }
+        let id = self.prof_alloc_id();
+        self.prof_map_lines
+            .push(format!("L {id} {} {}", span.line, span.column));
+        let f = self.module.get_function("__bruto_prof_line").unwrap();
+        self.builder
+            .build_call(
+                f,
+                &[self.context.i32_type().const_int(id as u64, false).into()],
+                "",
+            )
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
     /// Set compiler directives (parsed by the lexer from `{$X+/-}` comments).
     pub fn set_directives(&mut self, d: crate::parser::Directives) {
         self.directives = d;
@@ -171,6 +278,9 @@ impl<'ctx> CodeGen<'ctx> {
     /// Compile a Pascal program AST into LLVM IR.
     pub fn compile(&mut self, program: &Program) -> Result<(), CodeGenError> {
         self.emit_runtime_decls();
+        if self.instrument {
+            self.emit_prof_decls();
+        }
 
         // Create main function
         let main_fn_type = self.context.i64_type().fn_type(&[], false);
@@ -247,6 +357,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Install signal handler to catch stack overflow / segfaults.
         self.set_debug_loc(program.span);
+        self.emit_prof_enter("program", program.body.span.line)?;
         {
             let f = self
                 .module
@@ -283,6 +394,7 @@ impl<'ctx> CodeGen<'ctx> {
         // stop frame and issues `continue`, so the process still exits
         // cleanly without the user pressing F8 over and over.
         self.set_debug_loc(program.body.end_span);
+        self.emit_prof_exit()?;
         self.builder
             .build_return(Some(&self.context.i64_type().const_int(0, false)))
             .map_err(|e| CodeGenError::new(e.to_string(), None))?;
@@ -788,6 +900,8 @@ impl<'ctx> CodeGen<'ctx> {
         self.current_fn = Some(func);
         self.current_scope = Some(di_sub.as_debug_info_scope());
         self.set_debug_loc(proc.span);
+        let proc_name = proc.name.clone();
+        self.emit_prof_enter(&proc_name, proc.span.line)?;
 
         // Create allocas for parameters
         for (i, (name, mode, ty)) in param_info.iter().enumerate() {
@@ -893,7 +1007,8 @@ impl<'ctx> CodeGen<'ctx> {
         // Compile body
         self.compile_block(&proc.body)?;
 
-        // Return
+        // Return (profiler exit first so the routine's time closes)
+        self.emit_prof_exit()?;
         if let Some(ref ret_ty) = proc.return_type {
             let llvm_ty = self.llvm_type_for(ret_ty);
             let alloca = *self.variables.get(&proc.name).unwrap();
@@ -938,6 +1053,9 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_statement(&mut self, stmt: &Statement) -> Result<(), CodeGenError> {
+        if !matches!(stmt, Statement::Label { .. }) {
+            self.emit_prof_line(stmt.span())?;
+        }
         match stmt {
             Statement::Assignment { target, expr, span } => {
                 self.set_debug_loc(*span);

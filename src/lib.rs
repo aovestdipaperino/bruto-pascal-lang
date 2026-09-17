@@ -1312,6 +1312,54 @@ end.
             "unexpected output: {captured}"
         );
     }
+
+    fn ir_for(source: &str, instrument: bool) -> (String, Vec<String>) {
+        let mut parser = Parser::new(source);
+        let program = parser.parse_program().expect("parse");
+        let context = Context::create();
+        let mut cg = CodeGen::new(&context, "/tmp/t.pas");
+        cg.set_instrument(instrument);
+        cg.compile(&program).expect("codegen");
+        (cg.print_ir(), cg.prof_map_lines().to_vec())
+    }
+
+    // Globals are passed by `var` parameter: top-level procedures cannot
+    // reference globals directly in the current codegen (pre-existing).
+    const PROF_SRC: &str = "program P;\nvar i: integer;\nprocedure Q(var n: integer);\nbegin\n  n := n + 1\nend;\nbegin\n  i := 0;\n  Q(i)\nend.\n";
+
+    #[test]
+    fn instrumented_ir_has_hooks_and_map() {
+        let (ir, map) = ir_for(PROF_SRC, true);
+        assert!(ir.contains("call void @__bruto_prof_enter"));
+        assert!(ir.contains("call void @__bruto_prof_exit"));
+        assert!(ir.contains("call void @__bruto_prof_line"));
+        // Two routines: Q (line 3) and the program block; three statements
+        // (line 5, line 8, line 9).
+        assert!(
+            map.iter()
+                .any(|l| l.starts_with("P ") && l.ends_with(" 3 Q")),
+            "{map:?}"
+        );
+        assert!(
+            map.iter()
+                .any(|l| l.starts_with("P ") && l.ends_with(" program")),
+            "{map:?}"
+        );
+        assert_eq!(
+            map.iter().filter(|l| l.starts_with("L ")).count(),
+            3,
+            "{map:?}"
+        );
+        // exit before every ret: Q returns once, main returns once.
+        assert_eq!(ir.matches("call void @__bruto_prof_exit").count(), 2);
+    }
+
+    #[test]
+    fn uninstrumented_ir_is_clean() {
+        let (ir, map) = ir_for(PROF_SRC, false);
+        assert!(!ir.contains("__bruto_prof"));
+        assert!(map.is_empty());
+    }
 }
 
 /// Test-only helper: drive a `BuildJob` to completion synchronously.
