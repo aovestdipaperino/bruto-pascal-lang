@@ -9,7 +9,7 @@ pub mod prof_runtime;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use bruto_lang::language::{BuildJob, BuildPhase, BuildResult, Language};
+use bruto_lang::language::{BuildJob, BuildOptions, BuildPhase, BuildResult, Language};
 use codegen::CodeGen;
 use inkwell::context::Context;
 use parser::Parser;
@@ -48,13 +48,28 @@ impl Language for MiniPascal {
     }
 
     fn build_job(&self, source: &str) -> Box<dyn BuildJob> {
-        Box::new(PascalBuildJob::new(source.to_string(), Vec::new(), false))
+        Box::new(PascalBuildJob::new(
+            source.to_string(),
+            Vec::new(),
+            BuildOptions::default(),
+            false,
+        ))
     }
 
     fn build_job_at(&self, source: &str, source_path: Option<&Path>) -> Box<dyn BuildJob> {
+        self.build_job_with(source, source_path, &BuildOptions::default())
+    }
+
+    fn build_job_with(
+        &self,
+        source: &str,
+        source_path: Option<&Path>,
+        options: &BuildOptions,
+    ) -> Box<dyn BuildJob> {
         Box::new(PascalBuildJob::new(
             source.to_string(),
             search_dirs_for(source_path),
+            *options,
             false,
         ))
     }
@@ -63,6 +78,7 @@ impl Language for MiniPascal {
         Box::new(PascalBuildJob::new(
             source.to_string(),
             search_dirs_for(source_path),
+            BuildOptions::default(),
             true,
         ))
     }
@@ -93,6 +109,7 @@ struct PascalBuildJob {
     search_dirs: Vec<PathBuf>,
     /// Compile with profiler hooks and link the profiler runtime.
     profile: bool,
+    options: BuildOptions,
 }
 
 enum JobInner {
@@ -124,13 +141,23 @@ struct JobPaths {
     /// Profile builds: the runtime object and the id map.
     runtime_obj_path: Option<String>,
     prof_map_path: Option<String>,
+    /// `.s` listing path, kept alongside the executable (unlike `obj_path`,
+    /// which is removed once linking succeeds) so the IDE's Disassembly
+    /// window can read it after the build finishes.
+    asm_path: Option<String>,
 }
 
 impl PascalBuildJob {
-    fn new(source: String, search_dirs: Vec<PathBuf>, profile: bool) -> Self {
+    fn new(
+        source: String,
+        search_dirs: Vec<PathBuf>,
+        options: BuildOptions,
+        profile: bool,
+    ) -> Self {
         Self {
             inner: JobInner::NotStarted { source },
             search_dirs,
+            options,
             profile,
         }
     }
@@ -236,6 +263,7 @@ impl PascalBuildJob {
         let context = Context::create();
         let mut codegen = CodeGen::new(&context, &source_path);
         codegen.set_directives(parser.directives);
+        codegen.set_build_options(self.options);
         codegen.set_instrument(self.profile);
         if self.profile {
             codegen.set_prof_output(&format!("{exe_path}.bruto-prof"));
@@ -244,8 +272,8 @@ impl PascalBuildJob {
             return BuildPhase::Failed(format!("Codegen error: {e}"));
         }
 
-        let obj_path = match codegen.emit_object(&exe_path) {
-            Ok(p) => p,
+        let artifacts = match codegen.emit_object(&exe_path) {
+            Ok(a) => a,
             Err(e) => return BuildPhase::Failed(e),
         };
         let _ = codegen.write_metadata(&exe_path);
@@ -253,9 +281,10 @@ impl PascalBuildJob {
         let mut paths = JobPaths {
             source_path,
             exe_path,
-            obj_path,
+            obj_path: artifacts.obj_path,
             runtime_obj_path: None,
             prof_map_path: None,
+            asm_path: artifacts.asm_path,
         };
 
         if self.profile {
@@ -287,15 +316,20 @@ impl PascalBuildJob {
         if let Some(rt) = paths.runtime_obj_path.as_deref() {
             objs.push(rt);
         }
-        let child = match CodeGen::spawn_linker_objs(&objs, &paths.exe_path) {
-            Ok(c) => c,
-            Err(e) => return BuildPhase::Failed(e),
-        };
+        let child =
+            match CodeGen::spawn_linker_objs(&objs, &paths.exe_path, self.options.debug_info()) {
+                Ok(c) => c,
+                Err(e) => return BuildPhase::Failed(e),
+            };
         self.inner = JobInner::Linking { paths, child };
         BuildPhase::Pending("Linking…".into())
     }
 
     fn after_linker(&mut self, paths: JobPaths) -> BuildPhase {
+        if !self.options.debug_info() {
+            CodeGen::remove_stale_dsym(&paths.exe_path);
+            return self.finalize(paths);
+        }
         match CodeGen::spawn_dsymutil(&paths.exe_path) {
             Ok(Some(child)) => {
                 self.inner = JobInner::Dsymutil { paths, child };
@@ -320,6 +354,7 @@ impl PascalBuildJob {
             console_capture_path: bruto_lang::target::console_capture_path(),
             profile_path,
             profile_map_path: paths.prof_map_path,
+            asm_path: paths.asm_path,
         })
     }
 }

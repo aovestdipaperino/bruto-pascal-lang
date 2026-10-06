@@ -1,7 +1,6 @@
 /// AST types for Mini-Pascal.
 ///
 /// Every node carries a `Span` for error reporting and DWARF debug info generation.
-
 /// Source location (1-based line and column).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Span {
