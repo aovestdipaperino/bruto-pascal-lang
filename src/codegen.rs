@@ -46,6 +46,18 @@ impl CodeGenError {
     }
 }
 
+/// Result of [`CodeGen::emit_object`]: the object file ready for linking,
+/// plus a text assembly listing for the IDE's Disassembly window.
+pub struct ObjectArtifacts {
+    /// Path to the `.o` file. Caller links it, then removes it.
+    pub obj_path: String,
+    /// Path to the `.s` file, or `None` if assembly emission failed for
+    /// this target. Debug builds keep `.loc` directives mapping each
+    /// block back to a Pascal source line; Retail builds strip debug
+    /// info first, so their listing has no source mapping.
+    pub asm_path: Option<String>,
+}
+
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
@@ -93,6 +105,9 @@ pub struct CodeGen<'ctx> {
 
     // Compiler directives ({$R+}, {$Q+}, {$I+}).
     directives: crate::parser::Directives,
+
+    // Debug vs Retail + optimization goal; applied at object emit / link.
+    build_options: bruto_lang::language::BuildOptions,
 
     // Per-variable metadata for the watch window. Populated during compile.
     // Format lines: `name|kind|extra` (kind = "enum", "set", "vrec", "real", "char", "bool")
@@ -152,6 +167,7 @@ impl<'ctx> CodeGen<'ctx> {
             label_blocks: HashMap::new(),
             source_path: source_path.to_string(),
             directives: crate::parser::Directives::default(),
+            build_options: bruto_lang::language::BuildOptions::default(),
             metadata_lines: Vec::new(),
         }
     }
@@ -166,6 +182,16 @@ impl<'ctx> CodeGen<'ctx> {
     /// Set compiler directives (parsed by the lexer from `{$X+/-}` comments).
     pub fn set_directives(&mut self, d: crate::parser::Directives) {
         self.directives = d;
+    }
+
+    /// Set the build profile (Debug/Retail) and optimization goal.
+    pub fn set_build_options(&mut self, options: bruto_lang::language::BuildOptions) {
+        self.build_options = options;
+    }
+
+    /// The build options this codegen emits with.
+    pub fn build_options(&self) -> bruto_lang::language::BuildOptions {
+        self.build_options
     }
 
     /// Compile a Pascal program AST into LLVM IR.
@@ -302,8 +328,28 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Write the LLVM module to a `.o` file and return its path.
     /// Caller is responsible for linking + cleanup.
-    pub fn emit_object(&self, output_path: &str) -> Result<String, String> {
+    ///
+    /// Retail builds strip the DWARF metadata and run the LLVM
+    /// optimization pipeline selected by the build options first.
+    /// Build the `TargetMachine` for this build's options, applying its
+    /// side effects to `self.module` first: strip DWARF for Retail builds,
+    /// then run the optimization pipeline. Shared by [`emit_object`]
+    /// (writes `.o` and `.s` from the *same* prepared module, so the two
+    /// never drift apart) — don't call this a second time on the same
+    /// `CodeGen`, since stripping/optimizing again would double-apply.
+    ///
+    /// [`emit_object`]: Self::emit_object
+    fn make_target_machine(&self) -> Result<TargetMachine, String> {
+        use bruto_lang::language::{BuildProfile, OptimizeFor};
+
         Target::initialize_native(&InitializationConfig::default()).map_err(|e| e.to_string())?;
+
+        let opt_level = match (self.build_options.profile, self.build_options.optimize) {
+            (BuildProfile::Debug, _) => OptimizationLevel::None,
+            (BuildProfile::Retail, OptimizeFor::Size) => OptimizationLevel::Less,
+            (BuildProfile::Retail, OptimizeFor::Both) => OptimizationLevel::Default,
+            (BuildProfile::Retail, OptimizeFor::Speed) => OptimizationLevel::Aggressive,
+        };
 
         let triple = TargetMachine::get_default_triple();
         let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
@@ -312,23 +358,61 @@ impl<'ctx> CodeGen<'ctx> {
                 &triple,
                 "generic",
                 "",
-                OptimizationLevel::None,
+                opt_level,
                 RelocMode::Default,
                 CodeModel::Default,
             )
             .ok_or("could not create target machine")?;
 
+        if !self.build_options.debug_info() {
+            self.module.strip_debug_info();
+        }
+        if let Some(pipeline) = self.build_options.pass_pipeline() {
+            self.module
+                .run_passes(
+                    pipeline,
+                    &machine,
+                    inkwell::passes::PassBuilderOptions::create(),
+                )
+                .map_err(|e| format!("optimization failed: {e}"))?;
+        }
+
+        Ok(machine)
+    }
+
+    /// Write the module to an `.o` object file (for linking) and a `.s`
+    /// text listing (for the IDE's Disassembly window), both from the
+    /// same prepared module so the listing matches the linked binary
+    /// exactly. `asm_path` is `None` if the target machine couldn't emit
+    /// textual assembly — rare, and the object file is unaffected either
+    /// way, so this only disables the Disassembly window for that build.
+    pub fn emit_object(&self, output_path: &str) -> Result<ObjectArtifacts, String> {
+        let machine = self.make_target_machine()?;
+
         let obj_path = format!("{output_path}.o");
         machine
             .write_to_file(&self.module, FileType::Object, Path::new(&obj_path))
             .map_err(|e| e.to_string())?;
-        Ok(obj_path)
+
+        let asm_path = format!("{output_path}.s");
+        let asm_path = machine
+            .write_to_file(&self.module, FileType::Assembly, Path::new(&asm_path))
+            .is_ok()
+            .then_some(asm_path);
+
+        Ok(ObjectArtifacts { obj_path, asm_path })
     }
 
     /// Spawn the platform linker on `obj_path → output_path` and return
     /// the running child. The caller drives it via `try_wait` so the
     /// IDE can surface progress / handle cancel.
-    pub fn spawn_linker(obj_path: &str, output_path: &str) -> Result<std::process::Child, String> {
+    /// `debug_info` adds `-g` so the linker keeps the debug map that
+    /// dsymutil needs; Retail builds leave it off.
+    pub fn spawn_linker(
+        obj_path: &str,
+        output_path: &str,
+        debug_info: bool,
+    ) -> Result<std::process::Child, String> {
         // Linker selection per platform:
         //   macOS:   `cc` resolves to Apple's clang; supports -lm/-g.
         //   Linux:   `cc` resolves to gcc/clang; need -no-pie because the
@@ -344,7 +428,10 @@ impl<'ctx> CodeGen<'ctx> {
         };
         let link_args: Vec<&str> = {
             #[allow(unused_mut)]
-            let mut a: Vec<&str> = vec![obj_path, "-o", output_path, "-g"];
+            let mut a: Vec<&str> = vec![obj_path, "-o", output_path];
+            if debug_info {
+                a.push("-g");
+            }
             #[cfg(not(target_os = "windows"))]
             a.push("-lm");
             #[cfg(target_os = "linux")]
@@ -389,12 +476,20 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// Remove a `.dSYM` bundle left behind by an earlier Debug build of
+    /// the same output path, so a Retail binary isn't paired with debug
+    /// info that no longer matches it.
+    pub fn remove_stale_dsym(output_path: &str) {
+        let _ = std::fs::remove_dir_all(format!("{output_path}.dSYM"));
+    }
+
     /// One-shot synchronous build (used by callers that don't need
     /// progress info). Drives object emit + linker + dsymutil to
     /// completion blocking on each child.
     pub fn emit_executable(&self, output_path: &str) -> Result<(), String> {
-        let obj_path = self.emit_object(output_path)?;
-        let linker = Self::spawn_linker(&obj_path, output_path)?;
+        let debug_info = self.build_options.debug_info();
+        let artifacts = self.emit_object(output_path)?;
+        let linker = Self::spawn_linker(&artifacts.obj_path, output_path, debug_info)?;
         let link_out = linker
             .wait_with_output()
             .map_err(|e| format!("waiting on linker: {e}"))?;
@@ -406,7 +501,13 @@ impl<'ctx> CodeGen<'ctx> {
             return Err(format!("linking failed: {stderr}{stdout}"));
         }
 
-        if let Some(dsym) = Self::spawn_dsymutil(output_path)? {
+        let dsym = if debug_info {
+            Self::spawn_dsymutil(output_path)?
+        } else {
+            Self::remove_stale_dsym(output_path);
+            None
+        };
+        if let Some(dsym) = dsym {
             let dsym_out = dsym
                 .wait_with_output()
                 .map_err(|e| format!("waiting on dsymutil: {e}"))?;
@@ -416,7 +517,12 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
 
-        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(&artifacts.obj_path);
+        // The CLI one-shot path has nowhere to show the listing — drop it
+        // rather than littering the output directory with a stray `.s`.
+        if let Some(asm_path) = &artifacts.asm_path {
+            let _ = std::fs::remove_file(asm_path);
+        }
         Ok(())
     }
 
@@ -4347,12 +4453,13 @@ impl<'ctx> CodeGen<'ctx> {
                 let enumerators: Vec<_> = values
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| {
-                        self.di_builder
-                            .create_enumerator(v, i as i64, false)
-                    })
+                    .map(|(i, v)| self.di_builder.create_enumerator(v, i as i64, false))
                     .collect();
-                let display_name = if name.is_empty() { "Enum" } else { name.as_str() };
+                let display_name = if name.is_empty() {
+                    "Enum"
+                } else {
+                    name.as_str()
+                };
                 Some(
                     self.di_builder
                         .create_enumeration_type(
@@ -4448,9 +4555,7 @@ impl<'ctx> CodeGen<'ctx> {
             let size = self.sizeof_type(&resolved) * 8;
             members.push(
                 self.di_builder
-                    .create_member_type(
-                        scope, name, file, 0, size, 64, offset, DIFlags::ZERO, mty,
-                    )
+                    .create_member_type(scope, name, file, 0, size, 64, offset, DIFlags::ZERO, mty)
                     .as_type(),
             );
             offset += self.sizeof_type(&resolved) * 8;
@@ -5983,6 +6088,107 @@ mod tests {
         let _ = std::fs::remove_file(exe_path);
         let _ = std::fs::remove_dir_all(format!("{exe_path}.dSYM"));
         let _ = std::fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn retail_build_is_optimized_and_has_no_debug_info() {
+        use bruto_lang::language::{BuildOptions, BuildProfile, OptimizeFor};
+
+        let source = "program Opt;\nvar\n  i, s: integer;\nbegin\n  s := 0;\n  for i := 1 to 10 do\n    s := s + i;\n  writeln(s)\nend.\n";
+        let tmp = std::env::temp_dir();
+        let source_path_buf = tmp.join("test_retail.pas");
+        let source_path = source_path_buf.to_string_lossy();
+        std::fs::write(source_path.as_ref(), source).unwrap();
+
+        for optimize in [OptimizeFor::Size, OptimizeFor::Both, OptimizeFor::Speed] {
+            let mut parser = Parser::new(source);
+            let program = parser.parse_program().unwrap();
+            let context = Context::create();
+            let mut codegen = CodeGen::new(&context, source_path.as_ref());
+            codegen.set_build_options(BuildOptions {
+                profile: BuildProfile::Retail,
+                optimize,
+            });
+            codegen.compile(&program).unwrap();
+
+            let exe_path_buf = tmp.join(format!(
+                "test_retail_{}_out{}",
+                optimize.as_str(),
+                if cfg!(windows) { ".exe" } else { "" }
+            ));
+            let exe_path = exe_path_buf.to_string_lossy();
+            // A leftover bundle from a Debug build must not survive a Retail one.
+            let _ = std::fs::create_dir_all(format!("{exe_path}.dSYM"));
+            codegen.emit_executable(exe_path.as_ref()).unwrap();
+
+            let ir = codegen.print_ir();
+            assert!(
+                !ir.contains("DICompileUnit") && !ir.contains("!dbg"),
+                "{optimize:?}: debug info survived a Retail build"
+            );
+            assert!(
+                !std::path::Path::new(&format!("{exe_path}.dSYM")).exists(),
+                "{optimize:?}: stale .dSYM left next to Retail binary"
+            );
+
+            let output = std::process::Command::new(exe_path.as_ref())
+                .output()
+                .expect("run failed");
+            assert!(output.status.success(), "{optimize:?}: non-zero exit");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let captured = std::fs::read_to_string(bruto_lang::target::console_capture_path())
+                .unwrap_or_default();
+            assert!(
+                stdout.contains("55") || captured.contains("55"),
+                "{optimize:?}: expected 55, got stdout={stdout:?} capture={captured:?}"
+            );
+
+            let _ = std::fs::remove_file(exe_path.as_ref());
+        }
+        let _ = std::fs::remove_file(source_path.as_ref());
+    }
+
+    #[test]
+    fn debug_build_assembly_maps_back_to_pascal_lines() {
+        // End-to-end: Debug build -> emit_object's .s listing -> bruto_lang's
+        // .loc parser -> at least one instruction tagged with the real
+        // Pascal line the IDE's Disassembly window would navigate to.
+        let source = "program Asm;\nvar\n  x: integer;\nbegin\n  x := 42;\n  writeln(x)\nend.\n";
+        let tmp = std::env::temp_dir();
+        let source_path_buf = tmp.join("test_asm_map.pas");
+        let source_path = source_path_buf.to_string_lossy();
+        std::fs::write(source_path.as_ref(), source).unwrap();
+
+        let mut parser = Parser::new(source);
+        let program = parser.parse_program().unwrap();
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, source_path.as_ref());
+        codegen.compile(&program).unwrap();
+
+        let out_path_buf = tmp.join("test_asm_map_out");
+        let out_path = out_path_buf.to_string_lossy();
+        let artifacts = codegen.emit_object(out_path.as_ref()).unwrap();
+        let asm_path = artifacts
+            .asm_path
+            .as_ref()
+            .expect("Debug build should emit a .s listing");
+        let asm_text = std::fs::read_to_string(asm_path).unwrap();
+        assert!(asm_text.contains(".loc"), "no .loc directives in listing");
+
+        let lines = bruto_lang::disasm::parse(&asm_text);
+        assert!(!lines.is_empty(), "parser produced no lines");
+        assert!(
+            lines.iter().any(|l| l.source_line == Some(5)),
+            "no instruction mapped to line 5 (`x := 42;`)"
+        );
+        assert!(
+            lines.iter().any(|l| l.source_line == Some(6)),
+            "no instruction mapped to line 6 (`writeln(x)`)"
+        );
+
+        let _ = std::fs::remove_file(&artifacts.obj_path);
+        let _ = std::fs::remove_file(asm_path);
+        let _ = std::fs::remove_file(source_path.as_ref());
     }
 
     #[test]

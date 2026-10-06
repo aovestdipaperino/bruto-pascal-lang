@@ -8,7 +8,7 @@ mod pascal_syntax;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use bruto_lang::language::{BuildJob, BuildPhase, BuildResult, Language};
+use bruto_lang::language::{BuildJob, BuildOptions, BuildPhase, BuildResult, Language};
 use codegen::CodeGen;
 use inkwell::context::Context;
 use parser::Parser;
@@ -47,10 +47,23 @@ impl Language for MiniPascal {
     }
 
     fn build_job(&self, source: &str) -> Box<dyn BuildJob> {
-        Box::new(PascalBuildJob::new(source.to_string(), Vec::new()))
+        Box::new(PascalBuildJob::new(
+            source.to_string(),
+            Vec::new(),
+            BuildOptions::default(),
+        ))
     }
 
     fn build_job_at(&self, source: &str, source_path: Option<&Path>) -> Box<dyn BuildJob> {
+        self.build_job_with(source, source_path, &BuildOptions::default())
+    }
+
+    fn build_job_with(
+        &self,
+        source: &str,
+        source_path: Option<&Path>,
+        options: &BuildOptions,
+    ) -> Box<dyn BuildJob> {
         let mut search_dirs = Vec::new();
         if let Some(p) = source_path {
             if let Some(dir) = p.parent() {
@@ -62,7 +75,11 @@ impl Language for MiniPascal {
                 search_dirs.push(cwd);
             }
         }
-        Box::new(PascalBuildJob::new(source.to_string(), search_dirs))
+        Box::new(PascalBuildJob::new(
+            source.to_string(),
+            search_dirs,
+            *options,
+        ))
     }
 }
 
@@ -74,6 +91,7 @@ impl Language for MiniPascal {
 struct PascalBuildJob {
     inner: JobInner,
     search_dirs: Vec<PathBuf>,
+    options: BuildOptions,
 }
 
 enum JobInner {
@@ -97,13 +115,18 @@ struct JobPaths {
     source_path: String,
     exe_path: String,
     obj_path: String,
+    /// `.s` listing path, kept alongside the executable (unlike `obj_path`,
+    /// which is removed once linking succeeds) so the IDE's Disassembly
+    /// window can read it after the build finishes.
+    asm_path: Option<String>,
 }
 
 impl PascalBuildJob {
-    fn new(source: String, search_dirs: Vec<PathBuf>) -> Self {
+    fn new(source: String, search_dirs: Vec<PathBuf>, options: BuildOptions) -> Self {
         Self {
             inner: JobInner::NotStarted { source },
             search_dirs,
+            options,
         }
     }
 }
@@ -188,17 +211,22 @@ impl PascalBuildJob {
         let context = Context::create();
         let mut codegen = CodeGen::new(&context, &source_path);
         codegen.set_directives(parser.directives);
+        codegen.set_build_options(self.options);
         if let Err(e) = codegen.compile(&program) {
             return BuildPhase::Failed(format!("Codegen error: {e}"));
         }
 
-        let obj_path = match codegen.emit_object(&exe_path) {
-            Ok(p) => p,
+        let artifacts = match codegen.emit_object(&exe_path) {
+            Ok(a) => a,
             Err(e) => return BuildPhase::Failed(e),
         };
         let _ = codegen.write_metadata(&exe_path);
 
-        let child = match CodeGen::spawn_linker(&obj_path, &exe_path) {
+        let child = match CodeGen::spawn_linker(
+            &artifacts.obj_path,
+            &exe_path,
+            self.options.debug_info(),
+        ) {
             Ok(c) => c,
             Err(e) => return BuildPhase::Failed(e),
         };
@@ -206,13 +234,18 @@ impl PascalBuildJob {
         let paths = JobPaths {
             source_path,
             exe_path,
-            obj_path,
+            obj_path: artifacts.obj_path,
+            asm_path: artifacts.asm_path,
         };
         self.inner = JobInner::Linking { paths, child };
         BuildPhase::Pending("Linking…".into())
     }
 
     fn after_linker(&mut self, paths: JobPaths) -> BuildPhase {
+        if !self.options.debug_info() {
+            CodeGen::remove_stale_dsym(&paths.exe_path);
+            return self.finalize(paths);
+        }
         match CodeGen::spawn_dsymutil(&paths.exe_path) {
             Ok(Some(child)) => {
                 self.inner = JobInner::Dsymutil { paths, child };
@@ -229,6 +262,7 @@ impl PascalBuildJob {
             exe_path: paths.exe_path,
             source_path: paths.source_path,
             console_capture_path: bruto_lang::target::console_capture_path(),
+            asm_path: paths.asm_path,
         })
     }
 }
