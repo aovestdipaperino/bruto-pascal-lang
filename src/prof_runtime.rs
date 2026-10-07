@@ -60,6 +60,15 @@ mod tests {
         // same way codegen does for real profile builds.
         let default_out = dir.join("driver.bruto-prof");
         let driver = dir.join("driver.c");
+        // Escape the path for a C string literal: on Windows it contains
+        // backslashes (e.g. `\Users`), which the C compiler would read as
+        // escape sequences (`\U` -> error). Backslash and quote are the only
+        // characters that matter inside a `"..."` literal.
+        let default_out_c = default_out
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         std::fs::write(
             &driver,
             format!(
@@ -68,7 +77,7 @@ mod tests {
 void __bruto_prof_enter(uint32_t); void __bruto_prof_exit(void); void __bruto_prof_line(uint32_t);
 void __bruto_prof_set_output(const char *);
 int main(void) {{
-    __bruto_prof_set_output("{default_out}");
+    __bruto_prof_set_output("{default_out_c}");
     __bruto_prof_enter(1);
     __bruto_prof_line(2);
     for (int i = 0; i < 3; i++) {{ __bruto_prof_enter(3); __bruto_prof_line(4); __bruto_prof_exit(); }}
@@ -76,7 +85,7 @@ int main(void) {{
     return 0;
 }}
 "#,
-                default_out = default_out.display()
+                default_out_c = default_out_c
             ),
         )
         .unwrap();
