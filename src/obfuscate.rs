@@ -338,7 +338,11 @@ fn rewrite_stmt(s: &mut Statement, n: &Namer) {
             rewrite_block(body, n);
         }
         Statement::For {
-            var, from, to, body, ..
+            var,
+            from,
+            to,
+            body,
+            ..
         } => {
             *var = n.lookup(var).to_string();
             rewrite_expr(from, n);
@@ -555,9 +559,8 @@ fn bcf<'ctx>(module: &Module<'ctx>, dbg: Option<(&'ctx Context, &DebugInfoBuilde
         // present. Functions without a subprogram (runtime helpers) get no
         // location — they carry no `.loc` either, so nothing to align.
         let loc0 = dbg.and_then(|(context, dib)| {
-            func.get_subprogram().map(|sp| {
-                dib.create_debug_location(context, 0, 0, sp.as_debug_info_scope(), None)
-            })
+            func.get_subprogram()
+                .map(|sp| dib.create_debug_location(context, 0, 0, sp.as_debug_info_scope(), None))
         });
 
         for block in func.get_basic_blocks() {
@@ -597,12 +600,9 @@ fn bcf<'ctx>(module: &Module<'ctx>, dbg: Option<(&'ctx Context, &DebugInfoBuilde
             if let Some(inst) = loaded.as_instruction() {
                 let _ = inst.set_volatile(true);
             }
-            let Ok(cond) = builder.build_int_compare(
-                IntPredicate::NE,
-                loaded,
-                i32_ty.const_zero(),
-                "bz_p",
-            ) else {
+            let Ok(cond) =
+                builder.build_int_compare(IntPredicate::NE, loaded, i32_ty.const_zero(), "bz_p")
+            else {
                 continue;
             };
             let _ = builder.build_conditional_branch(cond, succ, bogus);
@@ -721,8 +721,7 @@ end.
         // rename doesn't touch debug locations).
         use crate::codegen::CodeGen;
 
-        let source =
-            "program P;\nvar x: integer;\nbegin\n  x := 42;\n  writeln(x)\nend.\n";
+        let source = "program P;\nvar x: integer;\nbegin\n  x := 42;\n  writeln(x)\nend.\n";
         let tmp = std::env::temp_dir();
         let src_path = tmp.join("obf_rename_src.pas");
         std::fs::write(&src_path, source).unwrap();
@@ -732,7 +731,8 @@ end.
 
         let context = Context::create();
         let mut cg = CodeGen::new(&context, &src_path.to_string_lossy());
-        cg.compile(&program).expect("renamed program should compile");
+        cg.compile(&program)
+            .expect("renamed program should compile");
 
         let out = tmp.join("obf_rename_out");
         let artifacts = cg.emit_object(&out.to_string_lossy()).unwrap();
@@ -783,7 +783,10 @@ end.
         let output = std::process::Command::new(exe.as_ref())
             .output()
             .expect("run failed");
-        assert!(output.status.success(), "obfuscated program exited non-zero");
+        assert!(
+            output.status.success(),
+            "obfuscated program exited non-zero"
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let captured =
             std::fs::read_to_string(bruto_lang::target::console_capture_path()).unwrap_or_default();
