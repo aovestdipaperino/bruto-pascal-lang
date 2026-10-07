@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod codegen;
+pub mod obfuscate;
 pub mod parser;
 mod pascal_syntax;
 pub mod prof_runtime;
@@ -260,6 +261,13 @@ impl PascalBuildJob {
             return BuildPhase::Failed(e);
         }
 
+        // Obfuscation pass 1 (identifier rename) runs on the AST, before
+        // codegen builds symbol tables from it. Pass 2 (bogus control flow)
+        // runs on the module after compile(), below.
+        if self.options.obfuscation_enabled() {
+            obfuscate::rename_identifiers(&mut program);
+        }
+
         let context = Context::create();
         let mut codegen = CodeGen::new(&context, &source_path);
         codegen.set_directives(parser.directives);
@@ -270,6 +278,12 @@ impl PascalBuildJob {
         }
         if let Err(e) = codegen.compile(&program) {
             return BuildPhase::Failed(format!("Codegen error: {e}"));
+        }
+
+        // Obfuscation pass 2: bogus control flow over the compiled module,
+        // after a successful compile and before the object is emitted.
+        if self.options.obfuscation_enabled() {
+            codegen.apply_bogus_control_flow();
         }
 
         let artifacts = match codegen.emit_object(&exe_path) {

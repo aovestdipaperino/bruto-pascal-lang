@@ -319,6 +319,26 @@ impl<'ctx> CodeGen<'ctx> {
         self.build_options
     }
 
+    /// Run the bogus-control-flow obfuscation pass over the compiled module.
+    /// Call after [`compile`](Self::compile) and before
+    /// [`emit_object`](Self::emit_object). The identifier rename runs
+    /// earlier, on the AST (see [`crate::obfuscate::rename_identifiers`]).
+    /// The synthetic instructions get a line-0 debug location so a Debug
+    /// build's disassembly stays aligned to the real Pascal lines.
+    pub fn apply_bogus_control_flow(&self) {
+        crate::obfuscate::apply_bogus_control_flow_with_debug(
+            &self.module,
+            self.context,
+            &self.di_builder,
+        );
+    }
+
+    /// Whether the current module passes LLVM's verifier. Mainly useful
+    /// after running a transform (e.g. obfuscation) to assert validity.
+    pub fn module_is_valid(&self) -> bool {
+        self.module.verify().is_ok()
+    }
+
     /// Compile a Pascal program AST into LLVM IR.
     pub fn compile(&mut self, program: &Program) -> Result<(), CodeGenError> {
         self.emit_runtime_decls();
@@ -6270,6 +6290,7 @@ mod tests {
             codegen.set_build_options(BuildOptions {
                 profile: BuildProfile::Retail,
                 optimize,
+                obfuscate: false,
             });
             codegen.compile(&program).unwrap();
 
