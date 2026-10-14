@@ -212,16 +212,13 @@ impl<'ctx> CodeGen<'ctx> {
                 params.push(if group.mode == ParamMode::Var {
                     ptr.into()
                 } else {
-                    self.llvm_type_for(&ty).into()
+                    self.abi_type_for(&ty).into()
                 });
             }
         }
         match (&method.kind, &method.return_type) {
             (RoutineKind::Constructor, _) => ptr.fn_type(&params, false),
-            (RoutineKind::Function, Some(rt)) => {
-                let rt = self.resolve_type(rt);
-                self.llvm_type_for(&rt).fn_type(&params, false)
-            }
+            (RoutineKind::Function, Some(rt)) => self.abi_type_for(rt).fn_type(&params, false),
             _ => self.context.void_type().fn_type(&params, false),
         }
     }
@@ -355,7 +352,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// by an enclosing `with`, or of the object whose method is being
     /// compiled, that object type and the instance to call it on.
     pub(super) fn implicit_method(&self, name: &str) -> Option<(String, PointerValue<'ctx>)> {
-        if self.variables.contains_key(name) {
+        if self.bypass_user || self.variables.contains_key(name) {
             return None;
         }
         let has = |object: &str| self.objects[object].methods.contains_key(name);

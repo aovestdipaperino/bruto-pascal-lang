@@ -23,6 +23,8 @@ use std::fmt;
 use std::path::Path;
 
 mod objects;
+mod strings;
+mod system;
 
 const UNTYPED_DEREF: &str =
     "an untyped pointer can't be dereferenced; cast it to a typed pointer first";
@@ -131,6 +133,9 @@ pub struct CodeGen<'ctx> {
     loop_targets: Vec<(BasicBlock<'ctx>, BasicBlock<'ctx>)>,
     // How many pointers `create_debug_type` is currently inside.
     debug_pointer_depth: std::cell::Cell<u32>,
+    // Compiling a `System.X` call: built-ins win over methods and the
+    // program's own routines.
+    bypass_user: bool,
     // Objects named by enclosing `with` statements, innermost last.
     with_objects: Vec<(String, PointerValue<'ctx>)>,
     // Object types (lowered to records) and the method being compiled.
@@ -230,6 +235,7 @@ impl<'ctx> CodeGen<'ctx> {
             debug_pointer_depth: std::cell::Cell::new(0),
             objects: HashMap::new(),
             with_objects: Vec::new(),
+            bypass_user: false,
             current_object: None,
             method_context: None,
             current_function: None,
@@ -411,8 +417,16 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         // Create main function
-        let main_fn_type = self.context.i64_type().fn_type(&[], false);
+        // `main(argc, argv)`, kept for ParamCount / ParamStr.
+        let main_fn_type = self.context.i64_type().fn_type(
+            &[
+                self.context.i32_type().into(),
+                self.context.ptr_type(AddressSpace::default()).into(),
+            ],
+            false,
+        );
         let main_fn = self.module.add_function("main", main_fn_type, None);
+        self.declare_command_line_globals();
 
         // Debug info for main
         let di_i64 = self
@@ -449,6 +463,16 @@ impl<'ctx> CodeGen<'ctx> {
 
         let entry = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry);
+        for (i, global) in [system::ARGC_GLOBAL, system::ARGV_GLOBAL]
+            .iter()
+            .enumerate()
+        {
+            let slot = self.module.get_global(global).unwrap().as_pointer_value();
+            let value = main_fn.get_nth_param(i as u32).unwrap();
+            self.builder
+                .build_store(slot, value)
+                .map_err(|e| CodeGenError::new(e.to_string(), None))?;
+        }
 
         self.current_fn = Some(main_fn);
         self.current_scope = Some(di_main.as_debug_info_scope());
@@ -484,6 +508,8 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
         self.emit_vmts();
+
+        self.declare_system_variables();
 
         // Program-level constants and variables become LLVM globals before
         // any procedure is compiled, so every routine can reach them.
@@ -949,7 +975,9 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Initialize scalar types to zero
             match &resolved_ty {
-                PascalType::SizedInt { .. } | PascalType::Object(_) => {
+                PascalType::SizedInt { .. }
+                | PascalType::Object(_)
+                | PascalType::ShortString { .. } => {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
@@ -1443,7 +1471,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let ty = if group.mode == ParamMode::Var {
                     self.context.ptr_type(AddressSpace::default()).into()
                 } else {
-                    self.llvm_type_for(&resolved_group_ty).into()
+                    self.abi_type_for(&resolved_group_ty).into()
                 };
                 param_llvm_types.push(ty);
                 param_info.push((name.clone(), group.mode, resolved_group_ty.clone()));
@@ -1454,7 +1482,7 @@ impl<'ctx> CodeGen<'ctx> {
         let fn_type = match &method {
             Some((_, m)) => self.method_fn_type(m),
             None => match &return_type {
-                Some(ret_ty) => self.llvm_type_for(ret_ty).fn_type(&param_llvm_types, false),
+                Some(ret_ty) => self.abi_type_for(ret_ty).fn_type(&param_llvm_types, false),
                 None => self.context.void_type().fn_type(&param_llvm_types, false),
             },
         };
@@ -1545,9 +1573,8 @@ impl<'ctx> CodeGen<'ctx> {
                 let alloca = self
                     .entry_alloca(llvm_ty, name)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
-                self.builder
-                    .build_store(alloca, param_val)
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
+                // (A short string arrives as a C string and is copied in.)
+                self.store_value(alloca, param_val, &resolved_ty, proc.span)?;
                 self.variables.insert(name.clone(), alloca);
                 self.var_types.insert(name.clone(), resolved_ty);
             }
@@ -1686,10 +1713,14 @@ impl<'ctx> CodeGen<'ctx> {
         } else if let Some(ref ret_ty) = return_type {
             let llvm_ty = self.llvm_type_for(ret_ty);
             let alloca = *self.lookup_var(&proc.name).unwrap();
-            let ret_val = self
-                .builder
-                .build_load(llvm_ty, alloca, "retval")
-                .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
+            // A short string result is returned as a C string.
+            let ret_val = if let PascalType::ShortString { .. } = self.resolve_type(ret_ty) {
+                self.short_to_c_string(alloca, proc.span)?
+            } else {
+                self.builder
+                    .build_load(llvm_ty, alloca, "retval")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?
+            };
             self.builder
                 .build_return(Some(&ret_val))
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
@@ -1723,6 +1754,18 @@ impl<'ctx> CodeGen<'ctx> {
 
     // ── block / statements ───────────────────────────────
 
+    /// The LLVM type a value of type `ty` has when passed by value or
+    /// returned: a short string travels as an ordinary (C) string.
+    fn abi_type_for(&self, ty: &PascalType) -> inkwell::types::BasicTypeEnum<'ctx> {
+        match self.resolve_type(ty) {
+            PascalType::ShortString { .. } => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .as_basic_type_enum(),
+            resolved => self.llvm_type_for(&resolved),
+        }
+    }
+
     /// Turn a value just loaded from a slot of type `ty` into its
     /// expression form: integers narrower than 64 bits are sign- or
     /// zero-extended, so arithmetic only ever sees 64-bit integers.
@@ -1732,7 +1775,20 @@ impl<'ctx> CodeGen<'ctx> {
         ty: &PascalType,
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
-        let PascalType::SizedInt { bits, signed } = self.resolve_type(ty) else {
+        let resolved = self.resolve_type(ty);
+        // A short string's bytes become an ordinary (C) string.
+        if let PascalType::ShortString { .. } = resolved
+            && val.is_array_value()
+        {
+            let temp = self
+                .entry_alloca(val.get_type(), "short_tmp")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.builder
+                .build_store(temp, val)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            return self.short_to_c_string(temp, span);
+        }
+        let PascalType::SizedInt { bits, signed } = resolved else {
             return Ok(val);
         };
         if bits >= 64 || !val.is_int_value() {
@@ -1812,6 +1868,10 @@ impl<'ctx> CodeGen<'ctx> {
         ty: &PascalType,
         span: Span,
     ) -> Result<(), CodeGenError> {
+        // Into a short string: copy (and truncate) the characters.
+        if let PascalType::ShortString { max } = self.resolve_type(ty) {
+            return self.store_short_string(ptr, val, max, span);
+        }
         let val = self.convert_for_store(val, ty, span)?;
         self.builder
             .build_store(ptr, val)
@@ -1953,6 +2013,18 @@ impl<'ctx> CodeGen<'ctx> {
             self.emit_prof_line(stmt.span())?;
         }
         match stmt {
+            // `System.X(...)`: the built-in X, whatever else X names here.
+            Statement::ProcCall { name, args, span } if name.starts_with("system.") => {
+                let bare = Statement::ProcCall {
+                    name: name["system.".len()..].to_string(),
+                    args: args.clone(),
+                    span: *span,
+                };
+                let saved = std::mem::replace(&mut self.bypass_user, true);
+                let result = self.compile_statement(&bare);
+                self.bypass_user = saved;
+                result
+            }
             Statement::Assignment { target, expr, span } => {
                 self.set_debug_loc(*span);
                 let val = self.compile_expr(expr)?;
@@ -2319,11 +2391,23 @@ impl<'ctx> CodeGen<'ctx> {
                 if name == "assign" && args.len() == 2 {
                     return self.compile_file_assign(args, *span);
                 }
-                if name == "reset" && args.len() == 1 {
-                    return self.compile_file_open(&args[0], "r", *span);
+                // An untyped `file` (or a record size, `Reset(F, 1)`) is
+                // opened in binary read/write mode, FPC's default.
+                if name == "reset" && (args.len() == 1 || args.len() == 2) {
+                    let mode = if args.len() == 2 || self.is_untyped_file(&args[0]) {
+                        "r+b"
+                    } else {
+                        "r"
+                    };
+                    return self.compile_file_open(&args[0], mode, *span);
                 }
-                if name == "rewrite" && args.len() == 1 {
-                    return self.compile_file_open(&args[0], "w", *span);
+                if name == "rewrite" && (args.len() == 1 || args.len() == 2) {
+                    let mode = if args.len() == 2 || self.is_untyped_file(&args[0]) {
+                        "w+b"
+                    } else {
+                        "w"
+                    };
+                    return self.compile_file_open(&args[0], mode, *span);
                 }
                 if name == "append" && args.len() == 1 {
                     return self.compile_file_open(&args[0], "a", *span);
@@ -2686,33 +2770,10 @@ impl<'ctx> CodeGen<'ctx> {
                     if is_last && self.resolve_type(&cur_type) == PascalType::String {
                         return self.set_string_char(ptr, idx_val, val, span);
                     }
-                    let (lo, hi) = match &cur_type {
-                        PascalType::Array { lo, hi, .. } => (*lo, *hi),
-                        _ => return Err(CodeGenError::new("indexing non-array", Some(span))),
-                    };
-                    let elem_ty = match &cur_type {
-                        PascalType::Array { elem, .. } => elem.as_ref().clone(),
-                        _ => unreachable!(),
-                    };
-                    self.emit_range_check(idx_val.into_int_value(), lo, hi, span)?;
-                    let adj = self
-                        .builder
-                        .build_int_sub(
-                            idx_val.into_int_value(),
-                            self.context.i64_type().const_int(lo as u64, true),
-                            "adj",
-                        )
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                    let gep = unsafe {
-                        self.builder
-                            .build_in_bounds_gep(
-                                self.llvm_type_for(&cur_type),
-                                ptr,
-                                &[self.context.i64_type().const_int(0, false), adj],
-                                "chain_idx",
-                            )
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                    };
+                    let idx_val = self.first_char_if_string(idx_val, span)?;
+                    let resolved = self.resolve_type(&cur_type);
+                    let (gep, elem_ty) =
+                        self.gep_array_elem(ptr, &resolved, idx_val.into_int_value(), span)?;
                     if is_last {
                         self.store_value(gep, val, &elem_ty, span)?;
                         return Ok(());
@@ -2845,6 +2906,7 @@ impl<'ctx> CodeGen<'ctx> {
         match ty {
             // Object declarations are lowered to records when registered.
             PascalType::Object(_) => 0,
+            PascalType::ShortString { max } => *max as u64 + 1,
             PascalType::Integer
             | PascalType::Enum { .. }
             | PascalType::Subrange { .. }
@@ -3297,6 +3359,9 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return Ok(());
         }
+        if self.module.get_function(name).is_none() && self.compile_system_proc(name, args, span)? {
+            return Ok(());
+        }
         let func = self.module.get_function(name).ok_or_else(|| {
             CodeGenError::new(format!("undefined procedure '{name}'"), Some(span))
         })?;
@@ -3318,6 +3383,39 @@ impl<'ctx> CodeGen<'ctx> {
             return Err(CodeGenError::new("inc/dec requires a variable", Some(span)));
         }
         let (alloca, var_type) = self.resolve_array_base(&args[0], span)?;
+        // A pointer steps by whole elements (bytes for an untyped one).
+        if let PascalType::Pointer(pointed) = self.resolve_type(&var_type) {
+            let err =
+                |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            let elem = if *pointed == PascalType::Untyped {
+                self.context.i8_type().as_basic_type_enum()
+            } else {
+                self.llvm_type_for(&self.resolve_type(&pointed))
+            };
+            let mut step = match args.get(1) {
+                Some(n) => {
+                    let n = self.compile_expr(n)?;
+                    self.to_i64(n, span)?
+                }
+                None => self.context.i64_type().const_int(1, false),
+            };
+            if !is_inc {
+                step = self.builder.build_int_neg(step, "neg").map_err(err)?;
+            }
+            let current = self
+                .builder
+                .build_load(ptr_ty, alloca, "p")
+                .map_err(err)?
+                .into_pointer_value();
+            let moved = unsafe {
+                self.builder
+                    .build_gep(elem, current, &[step], "p_step")
+                    .map_err(err)?
+            };
+            self.builder.build_store(alloca, moved).map_err(err)?;
+            return Ok(());
+        }
         let llvm_ty = self.llvm_type_for(&var_type);
 
         // Work in 64 bits whatever the variable's width (chars and narrow
@@ -3362,27 +3460,22 @@ impl<'ctx> CodeGen<'ctx> {
         self.store_value(alloca, result.into(), &var_type, span)
     }
 
+    /// `delete(s, index, count)`: rebuild the string without the range
+    /// and store it back (into a dynamic or a short string).
     fn compile_str_delete(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let s_name = match &args[0] {
-            Expr::Var(name, _) => name.clone(),
-            _ => {
-                return Err(CodeGenError::new(
-                    "delete requires a string variable",
-                    Some(span),
-                ));
-            }
-        };
-        let alloca = *self.lookup_var(s_name.as_str()).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span))
-        })?;
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let s_val = self
-            .builder
-            .build_load(ptr_ty, alloca, "s")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        if !self.is_addressable(&args[0]) {
+            return Err(CodeGenError::new(
+                "delete requires a string variable",
+                Some(span),
+            ));
+        }
+        let (slot, ty) = self.resolve_array_base(&args[0], span)?;
+        let s_val = self.compile_expr(&args[0])?;
         let idx = self.compile_expr(&args[1])?;
+        let idx = self.to_i64(idx, span)?;
         let cnt = self.compile_expr(&args[2])?;
+        let cnt = self.to_i64(cnt, span)?;
         let f = self.module.get_function("bruto_str_delete").unwrap();
         let result = self
             .builder
@@ -3391,33 +3484,34 @@ impl<'ctx> CodeGen<'ctx> {
             .try_as_basic_value()
             .basic()
             .unwrap();
-        self.builder
-            .build_store(alloca, result)
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        Ok(())
+        self.store_value(slot, result, &ty, span)
     }
 
+    /// `insert(source, s, index)`: rebuild the string with `source` inserted
+    /// and store it back.
     fn compile_str_insert(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let source = self.compile_expr(&args[0])?;
-        let s_name = match &args[1] {
-            Expr::Var(name, _) => name.clone(),
-            _ => {
-                return Err(CodeGenError::new(
-                    "insert requires a string variable as 2nd arg",
-                    Some(span),
-                ));
-            }
+        let source = if source.is_int_value() {
+            // A single character: make it a one-character string.
+            self.compile_expr(&Expr::Call {
+                name: "string".to_string(),
+                args: vec![args[0].clone()],
+                span,
+            })?
+        } else {
+            source
         };
-        let alloca = *self.lookup_var(s_name.as_str()).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span))
-        })?;
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let s_val = self
-            .builder
-            .build_load(ptr_ty, alloca, "s")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        if !self.is_addressable(&args[1]) {
+            return Err(CodeGenError::new(
+                "insert requires a string variable as 2nd arg",
+                Some(span),
+            ));
+        }
+        let (slot, ty) = self.resolve_array_base(&args[1], span)?;
+        let s_val = self.compile_expr(&args[1])?;
         let idx = self.compile_expr(&args[2])?;
+        let idx = self.to_i64(idx, span)?;
         let f = self.module.get_function("bruto_str_insert").unwrap();
         let result = self
             .builder
@@ -3426,10 +3520,7 @@ impl<'ctx> CodeGen<'ctx> {
             .try_as_basic_value()
             .basic()
             .unwrap();
-        self.builder
-            .build_store(alloca, result)
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        Ok(())
+        self.store_value(slot, result, &ty, span)
     }
 
     fn compile_str_proc(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
@@ -3502,14 +3593,12 @@ impl<'ctx> CodeGen<'ctx> {
         let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
         for (param, arg) in params.iter().zip(args) {
             let param = self.resolve_type(param);
-            param_types.push(self.llvm_type_for(&param).into());
+            param_types.push(self.abi_type_for(&param).into());
             let val = self.compile_expr(arg)?;
             call_args.push(self.convert_for_store(val, &param, span)?.into());
         }
         let fn_type = match &return_type {
-            Some(rt) => self
-                .llvm_type_for(&self.resolve_type(rt))
-                .fn_type(&param_types, false),
+            Some(rt) => self.abi_type_for(rt).fn_type(&param_types, false),
             None => self.context.void_type().fn_type(&param_types, false),
         };
         let result = self
@@ -3700,6 +3789,14 @@ impl<'ctx> CodeGen<'ctx> {
             .build_store(alloca, new_struct)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
+    }
+
+    /// Whether `expr` is an untyped `file` variable.
+    fn is_untyped_file(&self, expr: &Expr) -> bool {
+        matches!(
+            self.resolve_type(&self.infer_declared_type(expr)),
+            PascalType::File { elem } if *elem == PascalType::Untyped
+        )
     }
 
     fn compile_file_open(
@@ -4527,34 +4624,9 @@ impl<'ctx> CodeGen<'ctx> {
             } => {
                 let (base_ptr, base_type) = self.resolve_array_base(array, *idx_span)?;
                 let idx_val = self.compile_expr(index)?;
-                let (lo, hi) = match &base_type {
-                    PascalType::Array { lo, hi, .. } => (*lo, *hi),
-                    _ => return Err(CodeGenError::new("indexing non-array", Some(span))),
-                };
-                let elem_ty = match &base_type {
-                    PascalType::Array { elem, .. } => elem.as_ref().clone(),
-                    _ => unreachable!(),
-                };
-                self.emit_range_check(idx_val.into_int_value(), lo, hi, span)?;
-                let adj = self
-                    .builder
-                    .build_int_sub(
-                        idx_val.into_int_value(),
-                        self.context.i64_type().const_int(lo as u64, true),
-                        "adj_idx",
-                    )
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                let gep = unsafe {
-                    self.builder
-                        .build_in_bounds_gep(
-                            self.llvm_type_for(&base_type),
-                            base_ptr,
-                            &[self.context.i64_type().const_int(0, false), adj],
-                            "arr_gep",
-                        )
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                };
-                Ok((gep, elem_ty))
+                let idx_val = self.first_char_if_string(idx_val, span)?;
+                let resolved = self.resolve_type(&base_type);
+                self.gep_array_elem(base_ptr, &resolved, idx_val.into_int_value(), span)
             }
             Expr::FieldAccess {
                 record,
@@ -4766,6 +4838,25 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         match expr {
+            // `System.X`: the built-in X, whatever else X names here.
+            Expr::Call { name, args, span } if name.starts_with("system.") => {
+                let bare = Expr::Call {
+                    name: name["system.".len()..].to_string(),
+                    args: args.clone(),
+                    span: *span,
+                };
+                let saved = std::mem::replace(&mut self.bypass_user, true);
+                let result = self.compile_expr(&bare);
+                self.bypass_user = saved;
+                result
+            }
+            Expr::Var(name, span) if name.starts_with("system.") => {
+                let bare = Expr::Var(name["system.".len()..].to_string(), *span);
+                let saved = std::mem::replace(&mut self.bypass_user, true);
+                let result = self.compile_expr(&bare);
+                self.bypass_user = saved;
+                result
+            }
             Expr::IndirectCall { callee, args, span } => self
                 .compile_indirect_call(callee, args, *span)?
                 .ok_or_else(|| {
@@ -4873,6 +4964,12 @@ impl<'ctx> CodeGen<'ctx> {
                         args: Vec::new(),
                         span: *span,
                     });
+                }
+                if self.lookup_var(name.as_str()).is_none()
+                    && self.system_func_type(name, 0).is_some()
+                    && let Some(value) = self.compile_system_func(name, &[], *span)?
+                {
+                    return Ok(value);
                 }
                 let alloca = *self.lookup_var(name.as_str()).ok_or_else(|| {
                     CodeGenError::new(format!("undefined variable '{name}'"), Some(*span))
@@ -5806,6 +5903,11 @@ impl<'ctx> CodeGen<'ctx> {
                         )
                     });
                 }
+                if !self.proc_return_types.contains_key(name.as_str())
+                    && let Some(value) = self.compile_system_func(name, args, *span)?
+                {
+                    return Ok(value);
+                }
                 let func = self.module.get_function(name).ok_or_else(|| {
                     CodeGenError::new(format!("undefined function '{name}'"), Some(*span))
                 })?;
@@ -6430,6 +6532,11 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn llvm_type_for(&self, ty: &PascalType) -> inkwell::types::BasicTypeEnum<'ctx> {
         match ty {
+            PascalType::ShortString { max } => self
+                .context
+                .i8_type()
+                .array_type(max + 1)
+                .as_basic_type_enum(),
             PascalType::SizedInt { bits, .. } => self
                 .context
                 .custom_width_int_type(*bits)
@@ -7291,6 +7398,38 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 Ok((gep, elem.as_ref().clone()))
             }
+            // `s[i]` on a short string: byte i of its buffer (byte 0 is the
+            // length).
+            PascalType::ShortString { .. } => {
+                let gep = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(
+                            self.llvm_type_for(base_type),
+                            base_ptr,
+                            &[self.context.i64_type().const_zero(), idx],
+                            "short_char",
+                        )
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                };
+                Ok((gep, PascalType::Char))
+            }
+            // `p[i]` on a typed pointer (`PChar`, `PByte`...): the i-th
+            // element after where it points. `base_ptr` holds the pointer.
+            PascalType::Pointer(pointed) if **pointed != PascalType::Untyped => {
+                let pointed = self.resolve_type(pointed);
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let target = self
+                    .builder
+                    .build_load(ptr_ty, base_ptr, "ptr_base")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into_pointer_value();
+                let gep = unsafe {
+                    self.builder
+                        .build_gep(self.llvm_type_for(&pointed), target, &[idx], "ptr_index")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                };
+                Ok((gep, pointed))
+            }
             _ => Err(CodeGenError::new("indexing non-array", Some(span))),
         }
     }
@@ -7617,8 +7756,10 @@ impl<'ctx> CodeGen<'ctx> {
     fn infer_expr_type(&self, expr: &Expr) -> PascalType {
         match self.infer_declared_type(expr) {
             PascalType::SizedInt { .. } => PascalType::Integer,
+            PascalType::ShortString { .. } => PascalType::String,
             PascalType::Named(n) => match self.resolve_type(&PascalType::Named(n.clone())) {
                 PascalType::SizedInt { .. } => PascalType::Integer,
+                PascalType::ShortString { .. } => PascalType::String,
                 _ => PascalType::Named(n),
             },
             other => other,
@@ -7628,6 +7769,15 @@ impl<'ctx> CodeGen<'ctx> {
     /// The declared type of what an expression names, before widening.
     fn infer_declared_type(&self, expr: &Expr) -> PascalType {
         match expr {
+            Expr::Call { name, args, span } if name.starts_with("system.") => self
+                .infer_declared_type(&Expr::Call {
+                    name: name["system.".len()..].to_string(),
+                    args: args.clone(),
+                    span: *span,
+                }),
+            Expr::Var(name, span) if name.starts_with("system.") => {
+                self.infer_declared_type(&Expr::Var(name["system.".len()..].to_string(), *span))
+            }
             Expr::IndirectCall { callee, .. } => {
                 match self.resolve_type(&self.infer_declared_type(callee)) {
                     PascalType::Proc {
@@ -7663,6 +7813,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .and_then(|o| self.method_result_type(&o, name))
                 })
                 .or_else(|| self.proc_return_types.get(name.as_str()).cloned().flatten())
+                .or_else(|| self.system_func_type(name, 0))
                 .unwrap_or(PascalType::Integer),
             Expr::Nil(_) => PascalType::Pointer(Box::new(PascalType::Integer)),
             Expr::SetConstructor { .. } => PascalType::Set {
@@ -7749,6 +7900,9 @@ impl<'ctx> CodeGen<'ctx> {
                 if name == "string" && args.len() == 1 {
                     return PascalType::String;
                 }
+                if let Some(ty) = self.system_func_type(name, args.len()) {
+                    return ty;
+                }
                 if args.len() == 1
                     && let Some(target) = self.cast_target(name)
                 {
@@ -7795,7 +7949,8 @@ impl<'ctx> CodeGen<'ctx> {
                     PascalType::Array { elem, .. } | PascalType::ConformantArray { elem, .. } => {
                         *elem
                     }
-                    PascalType::String => PascalType::Char,
+                    PascalType::String | PascalType::ShortString { .. } => PascalType::Char,
+                    PascalType::Pointer(elem) if *elem != PascalType::Untyped => *elem,
                     _ => PascalType::Integer,
                 }
             }

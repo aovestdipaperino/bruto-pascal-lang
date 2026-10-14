@@ -174,6 +174,13 @@ pub struct VarDecl {
 pub enum PascalType {
     /// The 64-bit signed integer (`integer`, `int64`, `ptrint`, ...).
     Integer,
+    /// A Turbo Pascal short string: `max + 1` bytes stored in place, the
+    /// first holding the length. `string[N]`, `ShortString`, and `string`
+    /// itself under `{$H-}` or `{$mode objfpc}`. In expressions it is
+    /// read as an ordinary (C) string.
+    ShortString {
+        max: u32,
+    },
     /// A fixed-width integer other than the 64-bit signed one: `byte`,
     /// `word`, `longint`, `qword` and so on. Stored at its real width;
     /// widened to 64 bits as soon as it is loaded into an expression.

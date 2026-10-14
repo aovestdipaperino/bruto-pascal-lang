@@ -507,15 +507,29 @@ fn load_unit_recursive(
 }
 
 fn find_unit_file(name: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    // `Name.pas` or `Name.pp`, matching the name without regard to case.
+    let wanted: Vec<String> = ["pas", "pp"]
+        .iter()
+        .map(|ext| format!("{}.{ext}", name.to_ascii_lowercase()))
+        .collect();
     for dir in search_dirs {
-        let candidates = [
+        for candidate in [
             dir.join(format!("{name}.pas")),
-            dir.join(format!("{}.pas", name.to_ascii_lowercase())),
             dir.join(format!("{}.pas", capitalize(name))),
-        ];
-        for c in candidates {
-            if c.is_file() {
-                return Some(c);
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut matches: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|e| wanted.contains(&e.file_name().to_string_lossy().to_ascii_lowercase()))
+                .map(|e| e.path())
+                .collect();
+            matches.sort();
+            if let Some(found) = matches.into_iter().next() {
+                return Some(found);
             }
         }
     }
@@ -1897,6 +1911,113 @@ end.
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
         assert_eq!(lines, ["A 30", "11", "1 9", "5", "3"]);
+    }
+
+    #[test]
+    fn short_strings_under_h_minus() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$H-}
+type
+  TName = record Name: string[10]; Age: Byte; end;
+var
+  s, t: string;
+  five: string[5];
+  r: TName;
+  p: PString;
+procedure Shout(var x: string);
+begin
+  x := x + '!'
+end;
+function Twice(x: string): string;
+begin
+  x[1] := UpCase(x[1]);
+  Twice := x + x
+end;
+begin
+  s := 'hello';
+  writeln(ord(s[0]), ' ', length(s), ' ', s);
+  five := 'truncated';
+  writeln(five, ' ', ord(five[0]));
+  s[0] := #4;
+  writeln(s);
+  Shout(s);
+  writeln(s);
+  t := Twice('ab');
+  writeln(t, ' ', s = 'hell!');
+  r.Name := 'Ada Lovelace';
+  r.Age := 36;
+  writeln(r.Name, ' ', r.Age);
+  GetMem(p, 6);
+  p^[0] := #3;
+  p^[1] := 'x'; p^[2] := 'y'; p^[3] := 'z';
+  writeln(p^, ' ', length(p^));
+  Delete(s, 1, 1);
+  Insert('>', s, 1);
+  writeln(s, ' ', copy(s, 2, 3), ' ', pos('l', s));
+  writeln(SizeOf(five), ' ', SizeOf(s))
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "5 5 hello",
+                "trunc 5",
+                "hell",
+                "hell!",
+                "AbAb true",
+                "Ada Lovela 36",
+                "xyz 3",
+                ">ell! ell 3",
+                "6 256"
+            ]
+        );
+    }
+
+    #[test]
+    fn system_routines_and_untyped_files() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type TBuf = array[0..7] of Byte;
+var
+  a, b: TBuf;
+  p: PChar;
+  f: file;
+  w: Word;
+  n, done: LongInt;
+begin
+  FillChar(a, SizeOf(a), 3);
+  Move(a, b, 4);
+  writeln(b[0] + b[3], ' ', b[4]);
+  GetMem(p, 4);
+  p[0] := 'o'; p[1] := 'k'; p[2] := #0;
+  writeln(p[0], p[1]);
+  FreeMem(p, 4);
+  w := $1234;
+  writeln(Hi(w), ' ', Lo(w), ' ', Swap(w) = $3412);
+  writeln(ParamCount >= 0, ' ', length(ParamStr(0)) > 0);
+  Assign(f, '/tmp/bruto_blockio_test.bin');
+  Rewrite(f, 1);
+  n := 1234567;
+  BlockWrite(f, n, SizeOf(n));
+  Close(f);
+  n := 0;
+  Reset(f, 1);
+  BlockRead(f, n, SizeOf(n), done);
+  Close(f);
+  writeln(n, ' ', done);
+  System.Halt(0);
+  writeln('not reached')
+end.
+",
+        );
+        let _ = std::fs::remove_file("/tmp/bruto_blockio_test.bin");
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["6 0", "ok", "18 52 true", "true true", "1234567 4"]);
     }
 
     #[test]

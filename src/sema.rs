@@ -94,6 +94,16 @@ impl UnitQualifiers {
     fn is_unit(&self, expr: &Expr) -> bool {
         matches!(expr, Expr::Var(name, _) if self.units.contains(name))
     }
+
+    /// `System.X` must reach the built-in even where a method or routine
+    /// named X would otherwise win, so it keeps a `system.` prefix that
+    /// code generation understands. Other units' qualifiers just go.
+    fn qualified(&self, unit: &Expr, name: &str) -> String {
+        match unit {
+            Expr::Var(u, _) if u == "system" => format!("system.{name}"),
+            _ => name.to_string(),
+        }
+    }
 }
 
 impl Rename for UnitQualifiers {
@@ -107,14 +117,14 @@ impl Rename for UnitQualifiers {
                 record,
                 field,
                 span,
-            } if self.is_unit(record) => Expr::Var(field.clone(), *span),
+            } if self.is_unit(record) => Expr::Var(self.qualified(record, field), *span),
             Expr::MethodCall {
                 object,
                 method,
                 args,
                 span,
             } if self.is_unit(object) => Expr::Call {
-                name: method.clone(),
+                name: self.qualified(object, method),
                 args: std::mem::take(args),
                 span: *span,
             },
@@ -133,7 +143,7 @@ impl Rename for UnitQualifiers {
             && self.is_unit(object)
         {
             *stmt = Statement::ProcCall {
-                name: method.clone(),
+                name: self.qualified(object, method),
                 args: std::mem::take(args),
                 span: *span,
             };
@@ -216,6 +226,18 @@ struct ConstEnv {
     type_bounds: HashMap<String, (i64, i64)>,
 }
 
+/// The four basic types that are keywords in Bruto's lexer, by name.
+fn basic_type(name: &str) -> Option<PascalType> {
+    Some(match name {
+        "integer" => PascalType::Integer,
+        "real" => PascalType::Real,
+        "char" => PascalType::Char,
+        "boolean" => PascalType::Boolean,
+        "string" => PascalType::String,
+        _ => return None,
+    })
+}
+
 /// The size in bytes of a built-in type, for `sizeof` in constants.
 fn builtin_size(name: &str) -> Option<i64> {
     Some(match name {
@@ -233,7 +255,28 @@ fn builtin_size(name: &str) -> Option<i64> {
 /// FPC's fixed-width integers or `Pointer`.
 pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
     let sized = |bits, signed| PascalType::SizedInt { bits, signed };
+    // `PByte`, `PChar`, `PString`, `PPointer`...: a pointer to a built-in.
+    if let Some(target) = name.strip_prefix('p')
+        && !target.is_empty()
+        && name != "pointer"
+        && let Some(target) = basic_type(target).or_else(|| builtin_type(target))
+    {
+        return Some(PascalType::Pointer(Box::new(target)));
+    }
     Some(match name {
+        "ansichar" => PascalType::Char,
+        "widechar" | "unicodechar" => sized(16, false),
+        "shortstring" => PascalType::ShortString { max: 255 },
+        "ansistring" | "rawbytestring" | "unicodestring" | "widestring" => PascalType::String,
+        "single" | "double" | "extended" | "currency" | "comp" => PascalType::Real,
+        // A file variable is one pointer to the runtime's file record;
+        // seen as FPC's `FileRec` / `TextRec`, that pointer is the handle.
+        "filerec" | "textrec" => PascalType::Record {
+            fields: vec![("handle".to_string(), PascalType::Integer)],
+            variant: None,
+            object: None,
+        },
+        "bytebool" | "wordbool" | "longbool" => PascalType::Boolean,
         "shortint" | "int8" => sized(8, true),
         "byte" | "uint8" => sized(8, false),
         "smallint" | "int16" => sized(16, true),
@@ -479,6 +522,7 @@ impl ConstEnv {
             | PascalType::Enum { .. }
             | PascalType::Subrange { .. }
             | PascalType::SizedInt { .. }
+            | PascalType::ShortString { .. }
             | PascalType::Untyped => {}
             PascalType::Named(name) => {
                 if !self.user_types.contains(name)

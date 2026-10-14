@@ -172,6 +172,7 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
         PascalType::Named(name) => *name = n.rename(name),
         PascalType::Integer
         | PascalType::Untyped
+        | PascalType::ShortString { .. }
         | PascalType::SizedInt { .. }
         | PascalType::Real
         | PascalType::String

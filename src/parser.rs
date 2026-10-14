@@ -293,6 +293,9 @@ struct Lexer {
     directives: Directives,
     /// Upper-case conditional symbols.
     defines: HashSet<String>,
+    /// Whether `string` means `ShortString` here: `{$H-}`, or a
+    /// `{$mode}` (objfpc, fpc, tp) whose strings are short.
+    short_strings: bool,
     /// `{$DEFINE NAME := text}` macros: upper-case name -> replacement.
     macros: std::collections::HashMap<String, String>,
     conditions: Vec<Condition>,
@@ -353,6 +356,7 @@ impl Lexer {
             directives: Directives::default(),
             defines: predefined_symbols().into_iter().map(String::from).collect(),
             macros: std::collections::HashMap::new(),
+            short_strings: false,
             conditions: Vec::new(),
             include_dirs: options.include_dirs.clone(),
             error: None,
@@ -478,6 +482,13 @@ impl Lexer {
                 self.defines.remove(&symbol);
             }
             "error" | "fatal" => self.fail(format!("{{$error}} {rest}"), span),
+            // FPC's default modes use short strings; Delphi mode doesn't.
+            "mode" => match first_word(rest).as_str() {
+                "OBJFPC" | "FPC" | "TP" | "MACPAS" | "ISO" => self.short_strings = true,
+                "DELPHI" | "DELPHIUNICODE" => self.short_strings = false,
+                _ => {}
+            },
+            "longstrings" => self.short_strings = first_word(rest) == "OFF",
             "include" => self.include(rest, span),
             "i" if !rest.starts_with(['+', '-']) => self.include(rest, span),
             // One-letter switches, possibly several: `{$R+,Q-}`.
@@ -489,6 +500,7 @@ impl Lexer {
                     }
                     let on = e[1] == b'+';
                     match e[0].to_ascii_uppercase() {
+                        b'H' => self.short_strings = !on,
                         b'R' => self.directives.range_check = on,
                         b'Q' => self.directives.overflow_check = on,
                         b'I' => self.directives.io_check = on,
@@ -1111,6 +1123,8 @@ struct Decls {
 
 pub struct Parser {
     tokens: Vec<(Tok, Span)>,
+    /// For each token, whether `string` meant `ShortString` there.
+    short_strings: Vec<bool>,
     pos: usize,
     pub directives: Directives,
     /// A preprocessing error, reported by the first `parse_*` call.
@@ -1127,16 +1141,19 @@ impl Parser {
     pub fn with_options(source: &str, options: &ParseOptions) -> Self {
         let mut lexer = Lexer::new(source, options);
         let mut tokens = Vec::new();
+        let mut short_strings = Vec::new();
         loop {
             let (tok, span) = lexer.next_token();
             let is_eof = tok == Tok::Eof;
             tokens.push((tok, span));
+            short_strings.push(lexer.short_strings);
             if is_eof {
                 break;
             }
         }
         Self {
             tokens,
+            short_strings,
             pos: 0,
             directives: lexer.directives,
             lex_error: lexer.error,
@@ -1821,14 +1838,22 @@ impl Parser {
                 Ok(PascalType::Real)
             }
             Tok::TyString => {
+                let short = self.short_strings[self.pos];
                 self.advance();
-                // Optional length: `string[N]` — accepted but treated as plain string
+                // `string[N]` is always a short string of at most N
+                // characters (255 when N isn't a plain number).
                 if *self.peek() == Tok::LBracket {
                     self.advance();
-                    let _n = self.parse_const_bound()?;
+                    let n = self.parse_const_bound()?;
                     self.expect(&Tok::RBracket)?;
+                    let max = n.as_int().filter(|n| (1..=255).contains(n)).unwrap_or(255);
+                    return Ok(PascalType::ShortString { max: max as u32 });
                 }
-                Ok(PascalType::String)
+                Ok(if short {
+                    PascalType::ShortString { max: 255 }
+                } else {
+                    PascalType::String
+                })
             }
             Tok::TyBoolean => {
                 self.advance();
@@ -1837,6 +1862,15 @@ impl Parser {
             Tok::TyChar => {
                 self.advance();
                 Ok(PascalType::Char)
+            }
+            // `PString` points at whatever `string` means here.
+            Tok::Ident(name)
+                if name.eq_ignore_ascii_case("pstring") && self.short_strings[self.pos] =>
+            {
+                self.advance();
+                Ok(PascalType::Pointer(Box::new(PascalType::ShortString {
+                    max: 255,
+                })))
             }
             Tok::Ident(name) => {
                 let mut name = name.clone();
