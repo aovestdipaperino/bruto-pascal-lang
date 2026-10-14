@@ -118,6 +118,7 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
         }
         PascalType::Named(name) => *name = n.rename(name),
         PascalType::Integer
+        | PascalType::Untyped
         | PascalType::SizedInt { .. }
         | PascalType::Real
         | PascalType::String
@@ -305,6 +306,10 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
         Statement::Exit {
             value: Some(value), ..
         } => rewrite_expr(value, n),
+        Statement::PlaceAssignment { target, expr, .. } => {
+            rewrite_expr(target, n);
+            rewrite_expr(expr, n);
+        }
         Statement::Exit { value: None, .. }
         | Statement::Break { .. }
         | Statement::Continue { .. }
@@ -321,7 +326,7 @@ fn rewrite_expr<R: Rename>(e: &mut Expr, n: &R) {
             rewrite_expr(right, n);
         }
         Expr::UnaryOp { operand, .. } => rewrite_expr(operand, n),
-        Expr::Deref(inner, _) => rewrite_expr(inner, n),
+        Expr::Deref(inner, _) | Expr::AddrOf(inner, _) => rewrite_expr(inner, n),
         Expr::Call { name, args, .. } => {
             *name = n.rename(name);
             for a in args {

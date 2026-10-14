@@ -164,6 +164,9 @@ pub enum PascalType {
     },
     /// A named type alias (resolved to canonical type during compilation)
     Named(String),
+    /// What an untyped `Pointer` points to. It has no size or value of its
+    /// own; it only appears as `Pointer(Box::new(Untyped))`.
+    Untyped,
     /// Array whose bounds are constant expressions (`array[0..Max-1] of T`).
     /// The semantic pass folds the bounds and turns it into `Array`; code
     /// generation never sees it.
@@ -390,6 +393,12 @@ pub enum Statement {
         body: Block,
         span: Span,
     },
+    /// Assignment to any place expression, e.g. `PRec(p)^.Id := 7`.
+    PlaceAssignment {
+        target: Expr,
+        expr: Expr,
+        span: Span,
+    },
     /// `exit` or `exit(value)`: leave the current routine, optionally
     /// setting a function's result first.
     Exit {
@@ -452,6 +461,7 @@ impl Statement {
             | Self::Label { span, .. }
             | Self::With { span, .. }
             | Self::Exit { span, .. }
+            | Self::PlaceAssignment { span, .. }
             | Self::Break { span }
             | Self::Continue { span }
             | Self::ChainedAssignment { span, .. } => *span,
@@ -521,6 +531,8 @@ pub enum Expr {
     },
     /// `nil` pointer literal
     Nil(Span),
+    /// Address of a variable, element, field or routine: `@x`
+    AddrOf(Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -541,6 +553,7 @@ impl Expr {
             Self::BinOp { span, .. }
             | Self::UnaryOp { span, .. }
             | Self::Deref(_, span)
+            | Self::AddrOf(_, span)
             | Self::Call { span, .. }
             | Self::Index { span, .. }
             | Self::FieldAccess { span, .. }

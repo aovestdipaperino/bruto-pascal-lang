@@ -115,6 +115,7 @@ enum Tok {
     Dot,
     DotDot,
     Caret,
+    At,
     // End of input
     Eof,
 }
@@ -206,6 +207,7 @@ impl fmt::Display for Tok {
             Tok::Comma => write!(f, "','"),
             Tok::Dot => write!(f, "'.'"),
             Tok::Caret => write!(f, "'^'"),
+            Tok::At => write!(f, "'@'"),
             Tok::Eof => write!(f, "end of file"),
         }
     }
@@ -556,6 +558,7 @@ impl Lexer {
             ',' => Tok::Comma,
             '.' => Tok::Dot,
             '^' => Tok::Caret,
+            '@' => Tok::At,
             _ => {
                 // Unknown character — return as identifier for error recovery
                 return (Tok::Ident(ch.to_string()), span);
@@ -1072,6 +1075,12 @@ impl Parser {
         if *self.peek() == Tok::KwRecord {
             return self.parse_record_type();
         }
+        // Procedural type: `procedure(params)` or `function(params): T`.
+        if matches!(self.peek(), Tok::KwProcedure | Tok::KwFunction) {
+            let is_func = *self.peek() == Tok::KwFunction;
+            self.advance();
+            return self.parse_proc_signature(is_func);
+        }
         match self.peek() {
             Tok::TyInteger => {
                 self.advance();
@@ -1390,31 +1399,11 @@ impl Parser {
             let is_func = *self.peek() == Tok::KwFunction;
             self.advance();
             let (pname, _) = self.expect_ident()?;
-            let mut params: Vec<PascalType> = Vec::new();
-            if *self.peek() == Tok::LParen {
-                self.advance();
-                if *self.peek() != Tok::RParen {
-                    params.push(self.parse_proc_param_type()?);
-                    while *self.peek() == Tok::Semi {
-                        self.advance();
-                        params.push(self.parse_proc_param_type()?);
-                    }
-                }
-                self.expect(&Tok::RParen)?;
-            }
-            let return_type = if is_func {
-                self.expect(&Tok::Colon)?;
-                Some(Box::new(self.parse_type()?))
-            } else {
-                None
-            };
+            let ty = self.parse_proc_signature(is_func)?;
             return Ok(ParamGroup {
                 mode: ParamMode::Value,
                 names: vec![pname],
-                ty: PascalType::Proc {
-                    params,
-                    return_type,
-                },
+                ty,
             });
         }
 
@@ -1437,20 +1426,50 @@ impl Parser {
         Ok(ParamGroup { mode, names, ty })
     }
 
-    /// Parse a parameter-of-procedural type: just the type, ignoring names.
-    /// Used inside the parens of `procedure p(name: T; ...)`.
-    fn parse_proc_param_type(&mut self) -> Result<PascalType, ParseError> {
-        // `var name: T` or `name: T` — we capture only the type.
+    /// Parse the rest of a procedural type after `procedure` / `function`
+    /// (and the name, for a procedural parameter): `[(params)] [: T]`.
+    /// Only the parameter types are kept.
+    fn parse_proc_signature(&mut self, is_func: bool) -> Result<PascalType, ParseError> {
+        let mut params: Vec<PascalType> = Vec::new();
+        if *self.peek() == Tok::LParen {
+            self.advance();
+            if *self.peek() != Tok::RParen {
+                params.extend(self.parse_proc_param_types()?);
+                while *self.peek() == Tok::Semi {
+                    self.advance();
+                    params.extend(self.parse_proc_param_types()?);
+                }
+            }
+            self.expect(&Tok::RParen)?;
+        }
+        let return_type = if is_func {
+            self.expect(&Tok::Colon)?;
+            Some(Box::new(self.parse_type()?))
+        } else {
+            None
+        };
+        Ok(PascalType::Proc {
+            params,
+            return_type,
+        })
+    }
+
+    /// Parse one parameter group inside a procedural type, `[var] a, b: T`,
+    /// returning `T` once per name.
+    fn parse_proc_param_types(&mut self) -> Result<Vec<PascalType>, ParseError> {
         if *self.peek() == Tok::Var {
             self.advance();
         }
+        let mut count = 1;
         let _ = self.expect_ident()?;
         while *self.peek() == Tok::Comma {
             self.advance();
             let _ = self.expect_ident()?;
+            count += 1;
         }
         self.expect(&Tok::Colon)?;
-        self.parse_type()
+        let ty = self.parse_type()?;
+        Ok(vec![ty; count])
     }
 
     // ── block ────────────────────────────────────────────
@@ -1691,6 +1710,14 @@ impl Parser {
                 }
             }
             self.expect(&Tok::RParen)?;
+            // `Cast(x)^.Field := value` and the like: a call (usually a type
+            // cast) followed by postfix operators is an assignment target.
+            if matches!(self.peek(), Tok::Caret | Tok::Dot | Tok::LBracket) {
+                let target = self.parse_postfix(Expr::Call { name, args, span }, span)?;
+                self.expect(&Tok::Assign)?;
+                let expr = self.parse_expr()?;
+                return Ok(Statement::PlaceAssignment { target, expr, span });
+            }
             return Ok(Statement::ProcCall { name, args, span });
         }
 
@@ -2125,7 +2152,52 @@ impl Parser {
                     span,
                 })
             }
+            Tok::At => {
+                let span = self.span();
+                self.advance();
+                let operand = self.parse_primary()?;
+                Ok(Expr::AddrOf(Box::new(operand), span))
+            }
             _ => self.parse_primary(),
+        }
+    }
+
+    /// Apply any postfix operators to `expr`: `[i]` (or `[i, j]`),
+    /// `.field` and `^`.
+    fn parse_postfix(&mut self, mut expr: Expr, span: Span) -> Result<Expr, ParseError> {
+        loop {
+            match self.peek() {
+                Tok::LBracket => {
+                    self.advance();
+                    loop {
+                        let index = self.parse_expr()?;
+                        expr = Expr::Index {
+                            array: Box::new(expr),
+                            index: Box::new(index),
+                            span,
+                        };
+                        if *self.peek() != Tok::Comma {
+                            break;
+                        }
+                        self.advance();
+                    }
+                    self.expect(&Tok::RBracket)?;
+                }
+                Tok::Dot => {
+                    self.advance();
+                    let (field, _) = self.expect_ident()?;
+                    expr = Expr::FieldAccess {
+                        record: Box::new(expr),
+                        field,
+                        span,
+                    };
+                }
+                Tok::Caret => {
+                    self.advance();
+                    expr = Expr::Deref(Box::new(expr), span);
+                }
+                _ => return Ok(expr),
+            }
         }
     }
 
@@ -2195,7 +2267,7 @@ impl Parser {
             Tok::Ident(name) => {
                 let span = self.span();
                 self.advance();
-                let mut expr = if *self.peek() == Tok::LParen {
+                let expr = if *self.peek() == Tok::LParen {
                     // Function call
                     self.advance();
                     let mut args = Vec::new();
@@ -2211,55 +2283,7 @@ impl Parser {
                 } else {
                     Expr::Var(name, span)
                 };
-                // Postfix operators: [i], .field, ^
-                loop {
-                    match self.peek() {
-                        Tok::LBracket => {
-                            self.advance();
-                            let index = self.parse_expr()?;
-                            if *self.peek() == Tok::Comma {
-                                let mut expr_so_far = Expr::Index {
-                                    array: Box::new(expr),
-                                    index: Box::new(index),
-                                    span,
-                                };
-                                while *self.peek() == Tok::Comma {
-                                    self.advance();
-                                    let next_index = self.parse_expr()?;
-                                    expr_so_far = Expr::Index {
-                                        array: Box::new(expr_so_far),
-                                        index: Box::new(next_index),
-                                        span,
-                                    };
-                                }
-                                self.expect(&Tok::RBracket)?;
-                                expr = expr_so_far;
-                            } else {
-                                self.expect(&Tok::RBracket)?;
-                                expr = Expr::Index {
-                                    array: Box::new(expr),
-                                    index: Box::new(index),
-                                    span,
-                                };
-                            }
-                        }
-                        Tok::Dot => {
-                            self.advance();
-                            let (field, _) = self.expect_ident()?;
-                            expr = Expr::FieldAccess {
-                                record: Box::new(expr),
-                                field,
-                                span,
-                            };
-                        }
-                        Tok::Caret => {
-                            self.advance();
-                            expr = Expr::Deref(Box::new(expr), span);
-                        }
-                        _ => break,
-                    }
-                }
-                Ok(expr)
+                self.parse_postfix(expr, span)
             }
             Tok::LParen => {
                 self.advance();

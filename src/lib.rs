@@ -538,6 +538,7 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         | ast::Statement::FieldAssignment { span, .. }
         | ast::Statement::ProcCall { span, .. }
         | ast::Statement::Exit { span, .. }
+        | ast::Statement::PlaceAssignment { span, .. }
         | ast::Statement::Break { span }
         | ast::Statement::Continue { span }
         | ast::Statement::ChainedAssignment { span, .. } => {
@@ -1368,6 +1369,109 @@ end.
         );
         assert!(ok);
         assert_eq!(out.trim(), "1.0 2.0 3.0");
+    }
+
+    #[test]
+    fn address_of_and_untyped_pointers() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type TRec = record Id: integer; Tag: Byte; end;
+  PRec = ^TRec;
+  PInt = ^integer;
+  TProc = procedure(n: integer);
+var x: integer;
+  arr: array[1..3] of integer;
+  r: TRec;
+  p: Pointer;
+  pi: PInt;
+  addr: PtrUInt;
+  cb: TProc;
+procedure Show(n: integer);
+begin
+  writeln('show ', n)
+end;
+begin
+  x := 5;
+  pi := @x;
+  pi^ := pi^ + 1;
+  writeln(x);
+  pi := @arr[2];
+  pi^ := 42;
+  writeln(arr[2]);
+  p := @r;
+  PRec(p)^.Id := 7;
+  PRec(p)^.Tag := 300;
+  writeln(r.Id, ' ', r.Tag);
+  addr := PtrUInt(@x);
+  pi := PInt(Pointer(addr));
+  writeln(pi^);
+  writeln(Assigned(p), ' ', Assigned(nil));
+  p := nil;
+  writeln(Assigned(p));
+  cb := @Show;
+  cb(9);
+  writeln(Byte(300), ' ', ShortInt(200), ' ', LongInt(4294967297), ' ', Word(-1))
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "6",
+                "42",
+                "7 44",
+                "6",
+                "true false",
+                "false",
+                "show 9",
+                "44 -56 1 65535"
+            ]
+        );
+    }
+
+    #[test]
+    fn untyped_pointer_dereference_is_an_error() {
+        let src = "program T;\nvar p: Pointer; x: integer;\nbegin\n  p := @x;\n  x := p^\nend.\n";
+        let err = match MiniPascal.build(src) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("untyped pointer"), "{err}");
+    }
+
+    #[test]
+    fn string_indexing_reads_and_writes_characters() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type TRec = record Name: string; end;
+var s, t: string;
+  r: TRec;
+  i, vowels: integer;
+  c: char;
+begin
+  s := 'hello';
+  t := s;
+  writeln(s[1], s[5]);
+  s[1] := 'H';
+  writeln(s, ' ', t);
+  vowels := 0;
+  for i := 1 to length(s) do
+    if s[i] in ['a', 'e', 'i', 'o', 'u'] then inc(vowels);
+  writeln(vowels);
+  r.Name := 'abc';
+  r.Name[2] := 'X';
+  writeln(r.Name);
+  c := s[2];
+  writeln(ord(c));
+  if (s[1] = 'H') and (c <> 'q') and ('e' = c) then writeln('compare')
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["ho", "Hello hello", "2", "aXc", "101", "compare"]);
     }
 
     #[test]

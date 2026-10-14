@@ -195,6 +195,7 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
         PascalType::Named(_)
         | PascalType::Integer
         | PascalType::SizedInt { .. }
+        | PascalType::Untyped
         | PascalType::Real
         | PascalType::String
         | PascalType::Boolean

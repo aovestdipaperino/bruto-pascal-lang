@@ -126,8 +126,9 @@ struct ConstEnv {
     user_types: HashSet<String>,
 }
 
-/// The built-in integer type a (lower-case) name stands for, if any.
-pub(crate) fn builtin_integer_type(name: &str) -> Option<PascalType> {
+/// The built-in type a (lower-case) name stands for, if it is one of
+/// FPC's fixed-width integers or `Pointer`.
+pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
     let sized = |bits, signed| PascalType::SizedInt { bits, signed };
     Some(match name {
         "shortint" | "int8" => sized(8, true),
@@ -138,6 +139,7 @@ pub(crate) fn builtin_integer_type(name: &str) -> Option<PascalType> {
         "longword" | "cardinal" | "dword" | "uint32" => sized(32, false),
         "qword" | "uint64" | "ptruint" | "sizeuint" | "nativeuint" => sized(64, false),
         "int64" | "ptrint" | "sizeint" | "nativeint" => PascalType::Integer,
+        "pointer" | "codepointer" => PascalType::Pointer(Box::new(PascalType::Untyped)),
         _ => return None,
     })
 }
@@ -264,10 +266,11 @@ impl ConstEnv {
             | PascalType::Char
             | PascalType::Enum { .. }
             | PascalType::Subrange { .. }
-            | PascalType::SizedInt { .. } => {}
+            | PascalType::SizedInt { .. }
+            | PascalType::Untyped => {}
             PascalType::Named(name) => {
                 if !self.user_types.contains(name)
-                    && let Some(builtin) = builtin_integer_type(name)
+                    && let Some(builtin) = builtin_type(name)
                 {
                     *ty = builtin;
                 }
