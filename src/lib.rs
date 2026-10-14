@@ -6,6 +6,8 @@ pub mod obfuscate;
 pub mod parser;
 mod pascal_syntax;
 pub mod prof_runtime;
+mod rename;
+pub mod sema;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -535,6 +537,9 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         | ast::Statement::MultiIndexAssignment { span, .. }
         | ast::Statement::FieldAssignment { span, .. }
         | ast::Statement::ProcCall { span, .. }
+        | ast::Statement::Exit { span, .. }
+        | ast::Statement::Break { span }
+        | ast::Statement::Continue { span }
         | ast::Statement::ChainedAssignment { span, .. } => {
             lines.insert(span.line as usize);
         }
@@ -899,6 +904,516 @@ mod tests {
         );
         assert!(ok);
         assert_eq!(out.trim(), "30");
+    }
+
+    #[test]
+    fn procedures_see_program_globals() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+const Step = 2;
+  Greeting = 'hi';
+type Point = record x, y: integer; end;
+var counter: integer;
+  name: string;
+  origin: Point;
+  table: array[1..3] of integer;
+procedure Bump;
+begin
+  counter := counter + Step
+end;
+function Doubled: integer;
+begin
+  Doubled := counter * Step
+end;
+procedure Outer;
+  procedure Inner;
+  begin
+    counter := counter + 100
+  end;
+begin
+  Inner
+end;
+procedure Fill;
+var i: integer;
+begin
+  for i := 1 to 3 do table[i] := i * 10;
+  origin.x := 7;
+  name := Greeting + '!'
+end;
+begin
+  writeln(length(name));
+  Bump;
+  writeln(counter);
+  writeln(Doubled);
+  Outer;
+  writeln(counter);
+  Fill;
+  writeln(table[1] + table[2] + table[3]);
+  writeln(origin.x, origin.y);
+  writeln(name)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["0", "2", "4", "102", "60", "70", "hi!"]);
+    }
+
+    #[test]
+    fn named_constants_in_bounds_and_procedures() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+const MaxItems = 5;
+  Last = MaxItems - 1;
+type Buffer = array[0..Last] of integer;
+  Small = 1..MaxItems;
+var buf: Buffer;
+  s: Small;
+procedure Fill;
+var i: integer;
+begin
+  for i := 0 to Last do buf[i] := i * MaxItems
+end;
+function Total: integer;
+var i, t: integer;
+begin
+  t := 0;
+  for i := low(buf) to high(buf) do t := t + buf[i];
+  Total := t
+end;
+begin
+  Fill;
+  writeln(Total);
+  writeln(high(buf));
+  s := MaxItems;
+  writeln(s)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["50", "4", "5"]);
+    }
+
+    #[test]
+    fn identifiers_are_case_insensitive() {
+        let (ok, out) = build_and_run_source(
+            "Program T;
+Const MaxLen = 3;
+Type TPoint = Record X, Y: Integer; End;
+Var Pt: TPoint;
+  Count: Integer;
+  S: String;
+  Buf: Array[1..MAXLEN] Of Integer;
+Procedure Bump;
+Begin
+  COUNT := count + 1
+End;
+Function Twice(N: Integer): Integer;
+Begin
+  TWICE := n * 2
+End;
+Begin
+  S := 'abc';
+  WriteLn(Length(s));
+  Inc(Count);
+  bump;
+  BUMP;
+  WriteLn(count);
+  PT.x := 3;
+  With pt Do Y := 4;
+  WriteLn(Pt.X + pt.y);
+  WriteLn(Ord('A'));
+  buf[MaxLen] := twice(21);
+  WriteLn(BUF[3])
+End.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["3", "3", "7", "65", "42"]);
+    }
+
+    #[test]
+    fn break_and_continue_in_every_loop_kind() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+var i, j, sum: integer;
+begin
+  sum := 0;
+  for i := 1 to 10 do
+  begin
+    if i mod 2 = 0 then continue;
+    if i > 7 then break;
+    sum := sum + i
+  end;
+  writeln(sum);
+  i := 0;
+  sum := 0;
+  while true do
+  begin
+    i := i + 1;
+    if i = 3 then continue;
+    if i > 5 then break;
+    sum := sum + i
+  end;
+  writeln(sum);
+  i := 0;
+  repeat
+    i := i + 1;
+    if i < 4 then continue;
+    break
+  until false;
+  writeln(i);
+  sum := 0;
+  for i := 1 to 3 do
+    for j := 1 to 3 do
+    begin
+      if j = 2 then break;
+      sum := sum + 10 * i + j
+    end;
+  writeln(sum)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["16", "12", "4", "63"]);
+    }
+
+    #[test]
+    fn exit_leaves_the_current_routine() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+var hits: integer;
+function Find(target: integer): integer;
+var i: integer;
+begin
+  Find := -1;
+  for i := 1 to 100 do
+    if i * i = target then exit(i);
+  hits := hits + 1
+end;
+procedure Note(n: integer);
+begin
+  if n < 0 then exit;
+  writeln('note ', n)
+end;
+function Sign(n: integer): integer;
+begin
+  Sign := 0;
+  if n > 0 then begin Sign := 1; exit end;
+  if n < 0 then Sign := -1
+end;
+begin
+  writeln(Find(49));
+  writeln(Find(50));
+  writeln(hits);
+  Note(-1);
+  Note(2);
+  writeln(Sign(5), Sign(-5));
+  exit;
+  writeln('unreachable')
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["7", "-1", "1", "note 2", "1-1"]);
+    }
+
+    #[test]
+    fn misplaced_break_and_exit_value_are_errors() {
+        for (src, msg) in [
+            ("program T;\nbegin\n  break\nend.\n", "inside a loop"),
+            (
+                "program T;\nprocedure P;\nbegin\n  exit(1)\nend;\nbegin\n  P\nend.\n",
+                "only allowed in a function",
+            ),
+        ] {
+            let err = match MiniPascal.build(src) {
+                Ok(_) => panic!("expected an error for {src:?}"),
+                Err(e) => e,
+            };
+            assert!(err.contains(msg), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_variable_may_be_called_exit() {
+        let (ok, out) = build_and_run_source(
+            "program T;\nvar exit: integer;\nbegin\n  exit := 3;\n  writeln(exit)\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "3");
+    }
+
+    #[test]
+    fn bitwise_operators_and_real_negation() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+const Mask = $0F shl 4;
+var a, b: integer;
+  f: boolean;
+  r: real;
+  buf: array[0..Mask shr 4] of integer;
+begin
+  a := $F0;
+  b := $3C;
+  writeln(a and b);
+  writeln(a or b);
+  writeln(a xor b);
+  writeln(1 shl 10);
+  writeln(1024 shr 3);
+  writeln(not 0);
+  writeln(Mask, ' ', high(buf));
+  f := true;
+  writeln(f xor false);
+  writeln(not f);
+  r := 2.5;
+  writeln(-r:4:1);
+  writeln((a and b) = $30)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "48", "252", "204", "1024", "128", "-1", "240 15", "true", "false", "-2.5", "true"
+            ]
+        );
+    }
+
+    #[test]
+    fn boolean_and_or_short_circuit() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type PNode = ^integer;
+var p: PNode;
+  calls: integer;
+function Touch(result: boolean): boolean;
+begin
+  calls := calls + 1;
+  Touch := result
+end;
+begin
+  p := nil;
+  if (p <> nil) and (p^ > 0) then writeln('deref') else writeln('safe');
+  if Touch(false) and Touch(true) then writeln('x');
+  if Touch(true) or Touch(true) then writeln('or');
+  writeln(calls);
+  writeln((1 < 2) and (3 > 2))
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["safe", "or", "2", "true"]);
+    }
+
+    #[test]
+    fn long_loops_do_not_grow_the_stack() {
+        // Every block's `end` marker and every set-literal temporary used to
+        // take a fresh stack slot per iteration, overflowing the stack.
+        let (ok, out) = build_and_run_source(
+            "program T;
+var i, n: integer;
+begin
+  n := 0;
+  for i := 1 to 3000000 do
+  begin
+    if (i mod 7) in [1, 3] then n := n + 1
+  end;
+  writeln(n)
+end.
+",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "857144");
+    }
+
+    #[test]
+    fn sized_integers_wrap_at_their_width() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+var b: Byte; si: ShortInt; w: Word; sm: SmallInt; li: LongInt; lw: LongWord;
+begin
+  b := 255; b := b + 1; writeln(b);
+  si := 127; si := si + 1; writeln(si);
+  w := 0; w := w - 1; writeln(w);
+  sm := -32768; sm := sm - 1; writeln(sm);
+  li := 2147483647; li := li + 1; writeln(li);
+  lw := 0; lw := lw - 1; writeln(lw);
+  b := 200; writeln(b + b);
+  si := -5; writeln(si * 3);
+  b := 250; inc(b, 10); writeln(b);
+  w := 1; dec(w, 2); writeln(w)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "0",
+                "-128",
+                "65535",
+                "32767",
+                "-2147483648",
+                "4294967295",
+                "400",
+                "-15",
+                "4",
+                "65535"
+            ]
+        );
+    }
+
+    #[test]
+    fn sized_integer_layout_and_bounds() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type Sw_Integer = LongInt;
+  TPair = record Lo: Byte; Hi: Word; Count: LongInt; end;
+  TBytes = array[0..3] of Byte;
+var p: TPair;
+  bytes: TBytes;
+  n: Sw_Integer;
+  b: Byte;
+  total: integer;
+begin
+  writeln(sizeof(Byte), ' ', sizeof(Word), ' ', sizeof(LongInt), ' ', sizeof(QWord));
+  writeln(sizeof(bytes), ' ', sizeof(TPair), ' ', sizeof(n));
+  writeln(low(ShortInt), ' ', high(ShortInt), ' ', high(Word), ' ', high(LongWord));
+  p.Lo := 300;
+  p.Hi := 70000;
+  p.Count := -1;
+  writeln(p.Lo, ' ', p.Hi, ' ', p.Count);
+  bytes[2] := 257;
+  writeln(bytes[2]);
+  total := 0;
+  for b := 250 to 255 do total := total + 1;
+  writeln(total, ' ', b);
+  total := 0;
+  for b := 3 downto 0 do total := total + b;
+  writeln(total)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "1 2 4 8",
+                "4 8 4",
+                "-128 127 65535 4294967295",
+                "44 4464 -1",
+                "1",
+                "6 255",
+                "6"
+            ]
+        );
+    }
+
+    #[test]
+    fn sized_integers_cross_routine_boundaries() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+var w: Word;
+function Low8(x: integer): Byte;
+begin
+  Low8 := x
+end;
+procedure Bump(var v: Word; by: Word);
+begin
+  v := v + by
+end;
+function Half(r: real): real;
+begin
+  Half := r / 2
+end;
+begin
+  writeln(Low8(511));
+  w := 65535;
+  Bump(w, 2);
+  writeln(w);
+  writeln(Half(5):3:1)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["255", "1", "2.5"]);
+    }
+
+    #[test]
+    fn integers_assigned_to_reals_are_converted() {
+        // Storing an integer into a real slot used to copy its raw bits,
+        // so `r := 1` read back as 0.0.
+        let (ok, out) = build_and_run_source(
+            "program T;
+type TPt = record x: real; end;
+var r: real; a: array[1..2] of real; p: TPt;
+begin
+  r := 1;
+  a[1] := 2;
+  p.x := 3;
+  writeln(r:3:1, ' ', a[1]:3:1, ' ', p.x:3:1)
+end.
+",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "1.0 2.0 3.0");
+    }
+
+    #[test]
+    fn bare_function_name_is_a_call() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+function Title: string;
+begin
+  Title := 'Free Vision'
+end;
+function Half: real;
+begin
+  Half := 0.5
+end;
+begin
+  writeln(Title);
+  writeln(Half:4:2)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["Free Vision", "0.50"]);
+    }
+
+    #[test]
+    fn local_shadows_program_global() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+var x: integer;
+procedure P;
+var x: integer;
+begin
+  x := 5;
+  writeln(x)
+end;
+begin
+  x := 1;
+  P;
+  writeln(x)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["5", "1"]);
     }
 
     #[test]

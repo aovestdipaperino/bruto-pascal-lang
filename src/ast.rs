@@ -104,7 +104,15 @@ pub struct VarDecl {
 /// Supported types in Mini-Pascal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PascalType {
+    /// The 64-bit signed integer (`integer`, `int64`, `ptrint`, ...).
     Integer,
+    /// A fixed-width integer other than the 64-bit signed one: `byte`,
+    /// `word`, `longint`, `qword` and so on. Stored at its real width;
+    /// widened to 64 bits as soon as it is loaded into an expression.
+    SizedInt {
+        bits: u32,
+        signed: bool,
+    },
     Real,
     String,
     Boolean,
@@ -156,6 +164,105 @@ pub enum PascalType {
     },
     /// A named type alias (resolved to canonical type during compilation)
     Named(String),
+    /// Array whose bounds are constant expressions (`array[0..Max-1] of T`).
+    /// The semantic pass folds the bounds and turns it into `Array`; code
+    /// generation never sees it.
+    ArrayExpr {
+        lo: ConstExpr,
+        hi: ConstExpr,
+        elem: Box<PascalType>,
+    },
+    /// Subrange whose bounds are constant expressions (`1..MaxItems`),
+    /// folded into `Subrange` by the semantic pass.
+    SubrangeExpr {
+        lo: ConstExpr,
+        hi: ConstExpr,
+    },
+}
+
+/// A compile-time integer expression used where the language needs a
+/// constant: array and subrange bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstExpr {
+    Int(i64),
+    Char(u8),
+    /// A named constant or enumeration value.
+    Name(String),
+    Neg(Box<ConstExpr>),
+    Binary(ConstOp, Box<ConstExpr>, Box<ConstExpr>),
+    /// `ord`, `chr`, `succ`, `pred` or `abs` applied to a constant.
+    Call(String, Box<ConstExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+}
+
+impl ConstExpr {
+    /// Convert a parsed expression into a constant expression, or `None`
+    /// if it uses anything a constant can't contain.
+    pub fn from_expr(expr: &Expr) -> Option<ConstExpr> {
+        Some(match expr {
+            Expr::IntLit(n, _) => ConstExpr::Int(*n),
+            Expr::CharLit(c, _) => ConstExpr::Char(*c),
+            Expr::StrLit(s, _) if s.len() == 1 => ConstExpr::Char(s.as_bytes()[0]),
+            Expr::Var(name, _) => ConstExpr::Name(name.clone()),
+            Expr::UnaryOp {
+                op: UnaryOp::Neg,
+                operand,
+                ..
+            } => ConstExpr::Neg(Box::new(ConstExpr::from_expr(operand)?)),
+            Expr::BinOp {
+                op, left, right, ..
+            } => {
+                let op = match op {
+                    BinOp::Add => ConstOp::Add,
+                    BinOp::Sub => ConstOp::Sub,
+                    BinOp::Mul => ConstOp::Mul,
+                    BinOp::Div => ConstOp::Div,
+                    BinOp::Mod => ConstOp::Mod,
+                    BinOp::And => ConstOp::And,
+                    BinOp::Or => ConstOp::Or,
+                    BinOp::Xor => ConstOp::Xor,
+                    BinOp::Shl => ConstOp::Shl,
+                    BinOp::Shr => ConstOp::Shr,
+                    _ => return None,
+                };
+                ConstExpr::Binary(
+                    op,
+                    Box::new(ConstExpr::from_expr(left)?),
+                    Box::new(ConstExpr::from_expr(right)?),
+                )
+            }
+            Expr::Call { name, args, .. } if args.len() == 1 => {
+                let lower = name.to_ascii_lowercase();
+                if !matches!(lower.as_str(), "ord" | "chr" | "succ" | "pred" | "abs") {
+                    return None;
+                }
+                ConstExpr::Call(lower, Box::new(ConstExpr::from_expr(&args[0])?))
+            }
+            _ => return None,
+        })
+    }
+
+    /// The literal value, if this is a bare integer.
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            ConstExpr::Int(n) => Some(*n),
+            ConstExpr::Neg(inner) => inner.as_int().map(|n| -n),
+            _ => None,
+        }
+    }
 }
 
 /// Variant part of a record type: `case tag: type of ...`
@@ -283,6 +390,20 @@ pub enum Statement {
         body: Block,
         span: Span,
     },
+    /// `exit` or `exit(value)`: leave the current routine, optionally
+    /// setting a function's result first.
+    Exit {
+        value: Option<Expr>,
+        span: Span,
+    },
+    /// `break`: leave the innermost loop.
+    Break {
+        span: Span,
+    },
+    /// `continue`: start the innermost loop's next iteration.
+    Continue {
+        span: Span,
+    },
     /// Chained LValue assignment: a[i].field := expr, p^.next := expr, etc.
     ChainedAssignment {
         target: String,
@@ -330,6 +451,9 @@ impl Statement {
             | Self::Goto { span, .. }
             | Self::Label { span, .. }
             | Self::With { span, .. }
+            | Self::Exit { span, .. }
+            | Self::Break { span }
+            | Self::Continue { span }
             | Self::ChainedAssignment { span, .. } => *span,
             Self::Block(b) => b.span,
         }
@@ -440,9 +564,12 @@ pub enum BinOp {
     Gt,
     Lte,
     Gte,
-    And,
+    And, // logical on booleans, bitwise on integers (also Or, Xor, Not)
     Or,
-    In, // element membership: x in S
+    Xor,
+    Shl,
+    Shr, // logical shift, as in FPC
+    In,  // element membership: x in S
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

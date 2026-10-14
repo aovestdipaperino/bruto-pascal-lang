@@ -46,6 +46,9 @@ enum Tok {
     KwRead,
     KwDiv,
     KwMod,
+    KwXor,
+    KwShl,
+    KwShr,
     KwAnd,
     KwOr,
     KwNot,
@@ -133,6 +136,9 @@ impl fmt::Display for Tok {
             Tok::KwReadLn => write!(f, "'readln'"),
             Tok::KwDiv => write!(f, "'div'"),
             Tok::KwMod => write!(f, "'mod'"),
+            Tok::KwXor => write!(f, "'xor'"),
+            Tok::KwShl => write!(f, "'shl'"),
+            Tok::KwShr => write!(f, "'shr'"),
             Tok::KwAnd => write!(f, "'and'"),
             Tok::KwOr => write!(f, "'or'"),
             Tok::KwNot => write!(f, "'not'"),
@@ -455,6 +461,9 @@ impl Lexer {
                 "readln" => Tok::KwReadLn,
                 "div" => Tok::KwDiv,
                 "mod" => Tok::KwMod,
+                "xor" => Tok::KwXor,
+                "shl" => Tok::KwShl,
+                "shr" => Tok::KwShr,
                 "and" => Tok::KwAnd,
                 "or" => Tok::KwOr,
                 "not" => Tok::KwNot,
@@ -999,11 +1008,18 @@ impl Parser {
         if *self.peek() == Tok::LParen {
             return self.parse_enum_type();
         }
-        if matches!(self.peek(), Tok::IntLit(_) | Tok::Minus) {
-            let lo = self.parse_int_literal()?;
+        // Subrange: starts with a number, a sign, or a constant name
+        // followed by `..`.
+        let starts_subrange = match self.peek() {
+            Tok::IntLit(_) | Tok::Minus => true,
+            Tok::Ident(_) => matches!(self.tokens.get(self.pos + 1), Some((Tok::DotDot, _))),
+            _ => false,
+        };
+        if starts_subrange {
+            let lo = self.parse_const_bound()?;
             self.expect(&Tok::DotDot)?;
-            let hi = self.parse_int_literal()?;
-            return Ok(PascalType::Subrange { lo, hi });
+            let hi = self.parse_const_bound()?;
+            return Ok(Self::make_subrange(lo, hi));
         }
         if *self.peek() == Tok::KwSet {
             self.advance();
@@ -1118,32 +1134,51 @@ impl Parser {
         self.expect(&Tok::LBracket)?;
 
         let mut dimensions = Vec::new();
-        let lo = self.parse_int_literal()?;
-        self.expect(&Tok::DotDot)?;
-        let hi = self.parse_int_literal()?;
-        dimensions.push((lo, hi));
-
-        while *self.peek() == Tok::Comma {
-            self.advance();
-            let lo = self.parse_int_literal()?;
+        loop {
+            let lo = self.parse_const_bound()?;
             self.expect(&Tok::DotDot)?;
-            let hi = self.parse_int_literal()?;
+            let hi = self.parse_const_bound()?;
             dimensions.push((lo, hi));
+            if *self.peek() != Tok::Comma {
+                break;
+            }
+            self.advance();
         }
         self.expect(&Tok::RBracket)?;
         self.expect(&Tok::KwOf)?;
         let elem = self.parse_type()?;
 
-        // Build nested array types from innermost to outermost
+        // Build nested array types from innermost to outermost. Literal
+        // bounds give a plain `Array`; anything else is folded later by
+        // the semantic pass.
         let mut result = elem;
         for (lo, hi) in dimensions.into_iter().rev() {
-            result = PascalType::Array {
-                lo,
-                hi,
-                elem: Box::new(result),
+            let elem = Box::new(result);
+            result = match (lo.as_int(), hi.as_int()) {
+                (Some(lo), Some(hi)) => PascalType::Array { lo, hi, elem },
+                _ => PascalType::ArrayExpr { lo, hi, elem },
             };
         }
         Ok(result)
+    }
+
+    /// Parse one bound of an array or subrange: a constant expression
+    /// such as `10`, `Max` or `Max - 1`.
+    fn parse_const_bound(&mut self) -> Result<ConstExpr, ParseError> {
+        let span = self.span();
+        let expr = self.parse_additive()?;
+        ConstExpr::from_expr(&expr).ok_or_else(|| ParseError {
+            message: "expected a constant expression".into(),
+            span,
+        })
+    }
+
+    /// Build a subrange type from two parsed bounds.
+    fn make_subrange(lo: ConstExpr, hi: ConstExpr) -> PascalType {
+        match (lo.as_int(), hi.as_int()) {
+            (Some(lo), Some(hi)) => PascalType::Subrange { lo, hi },
+            _ => PascalType::SubrangeExpr { lo, hi },
+        }
     }
 
     fn parse_int_literal(&mut self) -> Result<i64, ParseError> {
@@ -1503,11 +1538,50 @@ impl Parser {
                     }),
                 }
             }
+            Tok::Ident(_) if self.at_flow_statement() => self.parse_flow_statement(),
             Tok::Ident(_) => self.parse_ident_statement(),
             _ => Err(ParseError {
                 message: format!("expected statement, found {}", self.peek()),
                 span: self.span(),
             }),
+        }
+    }
+
+    /// `exit`, `break` and `continue` are predeclared procedures in Turbo
+    /// Pascal rather than reserved words, so a variable may still be
+    /// called `exit`; treat them as statements only when not assigned to.
+    fn at_flow_statement(&self) -> bool {
+        let Tok::Ident(name) = self.peek() else {
+            return false;
+        };
+        let is_flow = ["exit", "break", "continue"]
+            .iter()
+            .any(|k| name.eq_ignore_ascii_case(k));
+        let assigned = matches!(
+            self.tokens.get(self.pos + 1),
+            Some((Tok::Assign | Tok::LBracket | Tok::Dot | Tok::Caret, _))
+        );
+        is_flow && !assigned
+    }
+
+    /// `exit`, `exit(value)`, `break` or `continue`.
+    fn parse_flow_statement(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        let (name, _) = self.expect_ident()?;
+        match name.to_ascii_lowercase().as_str() {
+            "break" => Ok(Statement::Break { span }),
+            "continue" => Ok(Statement::Continue { span }),
+            _ => {
+                let mut value = None;
+                if *self.peek() == Tok::LParen {
+                    self.advance();
+                    if *self.peek() != Tok::RParen {
+                        value = Some(self.parse_expr()?);
+                    }
+                    self.expect(&Tok::RParen)?;
+                }
+                Ok(Statement::Exit { value, span })
+            }
         }
     }
 
@@ -1987,6 +2061,7 @@ impl Parser {
                 Tok::Plus => BinOp::Add,
                 Tok::Minus => BinOp::Sub,
                 Tok::KwOr => BinOp::Or,
+                Tok::KwXor => BinOp::Xor,
                 _ => break,
             };
             let span = self.span();
@@ -2011,6 +2086,8 @@ impl Parser {
                 Tok::KwDiv => BinOp::Div,
                 Tok::KwMod => BinOp::Mod,
                 Tok::KwAnd => BinOp::And,
+                Tok::KwShl => BinOp::Shl,
+                Tok::KwShr => BinOp::Shr,
                 _ => break,
             };
             let span = self.span();

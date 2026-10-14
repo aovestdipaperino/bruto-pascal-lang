@@ -37,6 +37,7 @@ use inkwell::module::Module;
 use inkwell::values::{InstructionOpcode, Operand};
 
 use crate::ast::*;
+use crate::rename::{Rename, rewrite_program};
 
 // ───────────────────────── identifier renaming ─────────────────────────
 
@@ -79,9 +80,18 @@ impl Namer {
 
 /// Rename every user-defined identifier in `program` in place.
 pub fn rename_identifiers(program: &mut Program) {
+    // Pascal names are case-insensitive: fold them first so `Count` and
+    // `count` get the same replacement.
+    crate::sema::fold_identifier_case(program);
     let mut namer = Namer::new();
     collect_program(program, &mut namer);
     rewrite_program(program, &namer);
+}
+
+impl Rename for Namer {
+    fn rename(&self, name: &str) -> String {
+        self.lookup(name).to_string()
+    }
 }
 
 fn collect_program(program: &Program, n: &mut Namer) {
@@ -157,6 +167,7 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
             }
         }
         PascalType::Array { elem, .. }
+        | PascalType::ArrayExpr { elem, .. }
         | PascalType::Pointer(elem)
         | PascalType::Set { elem }
         | PascalType::File { elem } => collect_type(elem, n),
@@ -183,326 +194,13 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
         // References and primitives introduce no new names.
         PascalType::Named(_)
         | PascalType::Integer
+        | PascalType::SizedInt { .. }
         | PascalType::Real
         | PascalType::String
         | PascalType::Boolean
         | PascalType::Char
-        | PascalType::Subrange { .. } => {}
-    }
-}
-
-fn rewrite_program(program: &mut Program, n: &Namer) {
-    program.name = n.lookup(&program.name).to_string();
-    for c in &mut program.consts {
-        c.name = n.lookup(&c.name).to_string();
-        if let Some(ty) = &mut c.ty {
-            rewrite_type(ty, n);
-        }
-        rewrite_expr(&mut c.value, n);
-    }
-    for td in &mut program.type_decls {
-        td.name = n.lookup(&td.name).to_string();
-        rewrite_type(&mut td.ty, n);
-    }
-    for v in &mut program.vars {
-        for name in &mut v.names {
-            *name = n.lookup(name).to_string();
-        }
-        rewrite_type(&mut v.ty, n);
-    }
-    for p in &mut program.procedures {
-        rewrite_proc(p, n);
-    }
-    rewrite_block(&mut program.body, n);
-}
-
-fn rewrite_proc(p: &mut ProcDecl, n: &Namer) {
-    p.name = n.lookup(&p.name).to_string();
-    for group in &mut p.params {
-        for name in &mut group.names {
-            *name = n.lookup(name).to_string();
-        }
-        rewrite_type(&mut group.ty, n);
-    }
-    if let Some(rt) = &mut p.return_type {
-        rewrite_type(rt, n);
-    }
-    for v in &mut p.vars {
-        for name in &mut v.names {
-            *name = n.lookup(name).to_string();
-        }
-        rewrite_type(&mut v.ty, n);
-    }
-    for np in &mut p.nested_procs {
-        rewrite_proc(np, n);
-    }
-    rewrite_block(&mut p.body, n);
-}
-
-fn rewrite_type(ty: &mut PascalType, n: &Namer) {
-    match ty {
-        PascalType::Enum { name, values } => {
-            *name = n.lookup(name).to_string();
-            for v in values {
-                *v = n.lookup(v).to_string();
-            }
-        }
-        PascalType::Record { fields, variant } => {
-            for (fname, fty) in fields {
-                *fname = n.lookup(fname).to_string();
-                rewrite_type(fty, n);
-            }
-            if let Some(var) = variant {
-                var.tag_name = n.lookup(&var.tag_name).to_string();
-                rewrite_type(&mut var.tag_type, n);
-                for (_vals, vfields) in &mut var.variants {
-                    for (fname, fty) in vfields {
-                        *fname = n.lookup(fname).to_string();
-                        rewrite_type(fty, n);
-                    }
-                }
-            }
-        }
-        PascalType::Array { elem, .. }
-        | PascalType::Pointer(elem)
-        | PascalType::Set { elem }
-        | PascalType::File { elem } => rewrite_type(elem, n),
-        PascalType::ConformantArray {
-            lo_name,
-            hi_name,
-            elem,
-        } => {
-            *lo_name = n.lookup(lo_name).to_string();
-            *hi_name = n.lookup(hi_name).to_string();
-            rewrite_type(elem, n);
-        }
-        PascalType::Proc {
-            params,
-            return_type,
-        } => {
-            for p in params {
-                rewrite_type(p, n);
-            }
-            if let Some(rt) = return_type {
-                rewrite_type(rt, n);
-            }
-        }
-        PascalType::Named(name) => *name = n.lookup(name).to_string(),
-        PascalType::Integer
-        | PascalType::Real
-        | PascalType::String
-        | PascalType::Boolean
-        | PascalType::Char
-        | PascalType::Subrange { .. } => {}
-    }
-}
-
-fn rewrite_block(block: &mut Block, n: &Namer) {
-    for s in &mut block.statements {
-        rewrite_stmt(s, n);
-    }
-}
-
-fn rewrite_stmts(stmts: &mut [Statement], n: &Namer) {
-    for s in stmts {
-        rewrite_stmt(s, n);
-    }
-}
-
-fn rewrite_stmt(s: &mut Statement, n: &Namer) {
-    match s {
-        Statement::Assignment { target, expr, .. } => {
-            *target = n.lookup(target).to_string();
-            rewrite_expr(expr, n);
-        }
-        Statement::DerefAssignment { target, expr, .. } => {
-            *target = n.lookup(target).to_string();
-            rewrite_expr(expr, n);
-        }
-        Statement::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            rewrite_expr(condition, n);
-            rewrite_block(then_branch, n);
-            if let Some(eb) = else_branch {
-                rewrite_block(eb, n);
-            }
-        }
-        Statement::While {
-            condition, body, ..
-        } => {
-            rewrite_expr(condition, n);
-            rewrite_block(body, n);
-        }
-        Statement::For {
-            var,
-            from,
-            to,
-            body,
-            ..
-        } => {
-            *var = n.lookup(var).to_string();
-            rewrite_expr(from, n);
-            rewrite_expr(to, n);
-            rewrite_block(body, n);
-        }
-        Statement::RepeatUntil {
-            body, condition, ..
-        } => {
-            rewrite_stmts(body, n);
-            rewrite_expr(condition, n);
-        }
-        Statement::WriteLn { args, .. } | Statement::Write { args, .. } => {
-            for a in args {
-                rewrite_expr(&mut a.expr, n);
-                if let Some(w) = &mut a.width {
-                    rewrite_expr(w, n);
-                }
-                if let Some(p) = &mut a.precision {
-                    rewrite_expr(p, n);
-                }
-            }
-        }
-        Statement::ReadLn { targets, .. } => {
-            for t in targets {
-                *t = n.lookup(t).to_string();
-            }
-        }
-        Statement::Block(b) => rewrite_block(b, n),
-        Statement::New { target, .. } | Statement::Dispose { target, .. } => {
-            *target = n.lookup(target).to_string();
-        }
-        Statement::IndexAssignment {
-            target,
-            index,
-            expr,
-            ..
-        } => {
-            *target = n.lookup(target).to_string();
-            rewrite_expr(index, n);
-            rewrite_expr(expr, n);
-        }
-        Statement::MultiIndexAssignment {
-            target,
-            indices,
-            expr,
-            ..
-        } => {
-            *target = n.lookup(target).to_string();
-            for i in indices {
-                rewrite_expr(i, n);
-            }
-            rewrite_expr(expr, n);
-        }
-        Statement::FieldAssignment {
-            target,
-            field,
-            expr,
-            ..
-        } => {
-            *target = n.lookup(target).to_string();
-            *field = n.lookup(field).to_string();
-            rewrite_expr(expr, n);
-        }
-        Statement::ProcCall { name, args, .. } => {
-            *name = n.lookup(name).to_string();
-            for a in args {
-                rewrite_expr(a, n);
-            }
-        }
-        Statement::Case {
-            expr,
-            branches,
-            else_branch,
-            ..
-        } => {
-            rewrite_expr(expr, n);
-            for b in branches {
-                for v in &mut b.values {
-                    match v {
-                        CaseValue::Single(e) => rewrite_expr(e, n),
-                        CaseValue::Range(a, c) => {
-                            rewrite_expr(a, n);
-                            rewrite_expr(c, n);
-                        }
-                    }
-                }
-                rewrite_stmts(&mut b.body, n);
-            }
-            if let Some(eb) = else_branch {
-                rewrite_stmts(eb, n);
-            }
-        }
-        Statement::With {
-            record_var, body, ..
-        } => {
-            *record_var = n.lookup(record_var).to_string();
-            rewrite_block(body, n);
-        }
-        Statement::ChainedAssignment {
-            target,
-            chain,
-            expr,
-            ..
-        } => {
-            *target = n.lookup(target).to_string();
-            for step in chain {
-                match step {
-                    LValueAccess::Field(f) => *f = n.lookup(f).to_string(),
-                    LValueAccess::Index(e) => rewrite_expr(e, n),
-                    LValueAccess::Deref => {}
-                }
-            }
-            rewrite_expr(expr, n);
-        }
-        // No identifiers to rewrite.
-        Statement::Goto { .. } | Statement::Label { .. } => {}
-    }
-}
-
-fn rewrite_expr(e: &mut Expr, n: &Namer) {
-    match e {
-        Expr::Var(name, _) => *name = n.lookup(name).to_string(),
-        Expr::BinOp { left, right, .. } => {
-            rewrite_expr(left, n);
-            rewrite_expr(right, n);
-        }
-        Expr::UnaryOp { operand, .. } => rewrite_expr(operand, n),
-        Expr::Deref(inner, _) => rewrite_expr(inner, n),
-        Expr::Call { name, args, .. } => {
-            *name = n.lookup(name).to_string();
-            for a in args {
-                rewrite_expr(a, n);
-            }
-        }
-        Expr::Index { array, index, .. } => {
-            rewrite_expr(array, n);
-            rewrite_expr(index, n);
-        }
-        Expr::FieldAccess { record, field, .. } => {
-            rewrite_expr(record, n);
-            *field = n.lookup(field).to_string();
-        }
-        Expr::SetConstructor { elements, .. } => {
-            for el in elements {
-                match el {
-                    SetElement::Single(e) => rewrite_expr(e, n),
-                    SetElement::Range(a, b) => {
-                        rewrite_expr(a, n);
-                        rewrite_expr(b, n);
-                    }
-                }
-            }
-        }
-        Expr::IntLit(..)
-        | Expr::RealLit(..)
-        | Expr::CharLit(..)
-        | Expr::StrLit(..)
-        | Expr::BoolLit(..)
-        | Expr::Nil(_) => {}
+        | PascalType::Subrange { .. }
+        | PascalType::SubrangeExpr { .. } => {}
     }
 }
 

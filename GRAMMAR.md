@@ -95,7 +95,7 @@ structured-type  ::= array-type
                    | conformant-array
 
 array-type       ::= "array" "[" range { "," range } "]" "of" type
-range            ::= INT_LIT ".." INT_LIT
+range            ::= const-expr ".." const-expr
 record-type      ::= "record" field-list "end"
 field-list       ::= [ field-decl { ";" field-decl } ]
                      [ ( ";" )? variant-part ]
@@ -107,7 +107,12 @@ set-type         ::= "set" "of" type
 file-type        ::= "file" "of" type | "text"
 
 enum-type        ::= "(" IDENT { "," IDENT } ")"
-subrange-type    ::= INT_LIT ".." INT_LIT
+subrange-type    ::= const-expr ".." const-expr
+
+const-expr       ::= additive                     -- folded at compile time:
+                                                  -- literals, untyped constants,
+                                                  -- enum values, + - * div mod,
+                                                  -- unary -, ord/chr/succ/pred/abs
 
 conformant-array ::= "array" "[" IDENT ".." IDENT ":" type "]" "of" type
 ```
@@ -132,6 +137,7 @@ stmt             ::= [ INT_LIT ":" ]            -- label prefix
                      | case-stmt
                      | with-stmt
                      | goto-stmt
+                     | flow-stmt
                      | new-stmt
                      | dispose-stmt
                      | write-stmt
@@ -155,6 +161,8 @@ case-branch      ::= case-value { "," case-value } ":" stmt
 case-value       ::= expr [ ".." expr ]
 with-stmt        ::= "with" IDENT "do" stmt
 goto-stmt        ::= "goto" INT_LIT
+flow-stmt        ::= "break" | "continue"
+                   | "exit" [ "(" [ expr ] ")" ]   -- value only in functions
 new-stmt         ::= "new"     "(" IDENT ")"
 dispose-stmt     ::= "dispose" "(" IDENT ")"
 
@@ -173,8 +181,8 @@ multiplicative   ::= unary { mul-op unary }
 unary            ::= [ "-" | "not" ] primary
 
 rel-op           ::= "=" | "<>" | "<" | ">" | "<=" | ">=" | "in"
-add-op           ::= "+" | "-" | "or"
-mul-op           ::= "*" | "/" | "div" | "mod" | "and"
+add-op           ::= "+" | "-" | "or" | "xor"
+mul-op           ::= "*" | "/" | "div" | "mod" | "and" | "shl" | "shr"
 
 primary          ::= INT_LIT | REAL_LIT | CHAR_LIT | STR_LIT
                    | "true" | "false" | "nil"
