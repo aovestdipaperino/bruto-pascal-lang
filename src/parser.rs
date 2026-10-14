@@ -19,7 +19,9 @@
 ///   unary        = ["-" | "not"] primary
 ///   primary      = INT_LIT | STR_LIT | "true" | "false" | IDENT | "(" expr ")"
 use crate::ast::*;
+use std::collections::HashSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 // ── Token types ──────────────────────────────────────────
 
@@ -223,11 +225,7 @@ pub struct ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "line {}:{}: {}",
-            self.span.line, self.span.column, self.message
-        )
+        write!(f, "{}: {}", self.span.describe(), self.message)
     }
 }
 
@@ -242,27 +240,116 @@ pub struct Directives {
     pub io_check: bool,       // {$I+}  (default true in Turbo Pascal; we keep false to be lenient)
 }
 
-struct Lexer {
+/// One source being read: the program or unit, or a file it includes.
+struct Frame {
     chars: Vec<char>,
     pos: usize,
     line: u32,
     col: u32,
+    file: u32,
+    dir: Option<PathBuf>,
+}
+
+/// One open `{$IF...}` / `{$IFDEF...}` group.
+struct Condition {
+    /// Whether tokens in the current branch are compiled.
+    active: bool,
+    /// Whether some branch of this group has already been taken.
+    taken: bool,
+    /// Whether the enclosing code is active at all.
+    parent_active: bool,
+    /// Where the group's `{$IF...}` is, for "missing {$ENDIF}".
+    opened_at: Span,
+}
+
+/// Where and how to read a source file.
+#[derive(Debug, Clone, Default)]
+pub struct ParseOptions {
+    /// The file being parsed, for `{$I}` lookups relative to it and for
+    /// debug info; `None` for the main program held in memory.
+    pub file: Option<PathBuf>,
+    /// Extra directories searched by `{$I file}`.
+    pub include_dirs: Vec<PathBuf>,
+}
+
+struct Lexer {
+    // The frame being read.
+    chars: Vec<char>,
+    pos: usize,
+    line: u32,
+    col: u32,
+    file: u32,
+    dir: Option<PathBuf>,
+    /// Frames suspended by `{$I}`, resumed when the include ends.
+    suspended: Vec<Frame>,
     directives: Directives,
+    /// Upper-case conditional symbols.
+    defines: HashSet<String>,
+    conditions: Vec<Condition>,
+    include_dirs: Vec<PathBuf>,
+    /// The first preprocessing error (missing include, `{$error}`, ...).
+    error: Option<ParseError>,
+}
+
+/// The conditional symbols FPC would define for the host, plus `BRUTO`.
+fn predefined_symbols() -> Vec<&'static str> {
+    let mut symbols = vec![
+        "FPC",
+        "BRUTO",
+        "CPU64",
+        "ENDIAN_LITTLE",
+        "FPC_LITTLE_ENDIAN",
+    ];
+    if cfg!(unix) {
+        symbols.push("UNIX");
+    }
+    if cfg!(target_os = "macos") {
+        symbols.extend(["DARWIN", "BSD"]);
+    }
+    if cfg!(target_os = "linux") {
+        symbols.push("LINUX");
+    }
+    if cfg!(windows) {
+        symbols.extend(["WINDOWS", "MSWINDOWS", "WIN64"]);
+    }
+    if cfg!(target_arch = "x86_64") {
+        symbols.extend(["CPUX86_64", "CPUAMD64", "CPUX64"]);
+    }
+    if cfg!(target_arch = "aarch64") {
+        symbols.push("CPUAARCH64");
+    }
+    symbols
 }
 
 impl Lexer {
-    fn new(source: &str) -> Self {
+    fn new(source: &str, options: &ParseOptions) -> Self {
+        let file = options
+            .file
+            .as_deref()
+            .map(crate::source_map::intern)
+            .unwrap_or(crate::source_map::MAIN_FILE);
         Self {
             chars: source.chars().collect(),
             pos: 0,
             line: 1,
             col: 1,
+            file,
+            dir: options
+                .file
+                .as_deref()
+                .and_then(|f| f.parent())
+                .map(Path::to_path_buf),
+            suspended: Vec::new(),
             directives: Directives::default(),
+            defines: predefined_symbols().into_iter().map(String::from).collect(),
+            conditions: Vec::new(),
+            include_dirs: options.include_dirs.clone(),
+            error: None,
         }
     }
 
     fn span(&self) -> Span {
-        Span::new(self.line, self.col)
+        Span::in_file(self.line, self.col, self.file)
     }
 
     fn peek(&self) -> char {
@@ -283,26 +370,222 @@ impl Lexer {
         ch
     }
 
-    fn handle_directive(&mut self, body: &str) {
-        // A directive looks like `$R+`, `$Q-`, `$I+`, possibly with multiple
-        // entries separated by commas, e.g. `$R+,Q+`.
+    /// Whether tokens at the current position are compiled (not inside a
+    /// false `{$IFDEF}` branch).
+    fn active(&self) -> bool {
+        self.conditions.last().is_none_or(|c| c.active)
+    }
+
+    fn fail(&mut self, message: impl Into<String>, span: Span) {
+        if self.error.is_none() {
+            self.error = Some(ParseError {
+                message: message.into(),
+                span,
+            });
+        }
+    }
+
+    /// Handle the body of a `{$...}` or `(*$...*)` comment.
+    fn handle_directive(&mut self, body: &str, span: Span) {
+        // Only `{$` with nothing in between starts a directive;
+        // `{ $ifdef X }` is an ordinary comment.
+        let Some(body) = body.strip_prefix('$') else {
+            return;
+        };
         let body = body.trim();
-        if !body.starts_with('$') {
+        let name_len = body
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(body.len());
+        let name = body[..name_len].to_ascii_lowercase();
+        let rest = body[name_len..].trim();
+        let first_word = |s: &str| -> String {
+            s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase()
+        };
+
+        // Conditionals are tracked even inside inactive branches, so their
+        // nesting stays right.
+        match name.as_str() {
+            "ifdef" | "ifndef" | "if" => {
+                let parent_active = self.active();
+                let holds = parent_active
+                    && match name.as_str() {
+                        "ifdef" => self.defines.contains(&first_word(rest)),
+                        "ifndef" => !self.defines.contains(&first_word(rest)),
+                        _ => self.eval_condition(rest, span),
+                    };
+                self.conditions.push(Condition {
+                    active: holds,
+                    taken: holds,
+                    parent_active,
+                    opened_at: span,
+                });
+                return;
+            }
+            "elseif" | "elif" | "else" => {
+                let is_else = name == "else";
+                let Some(top) = self.conditions.last() else {
+                    self.fail(format!("{{${name}}} without a matching {{$IF}}"), span);
+                    return;
+                };
+                let could_take = top.parent_active && !top.taken;
+                let holds = could_take && (is_else || self.eval_condition(rest, span));
+                let top = self.conditions.last_mut().unwrap();
+                top.active = holds;
+                top.taken |= holds;
+                return;
+            }
+            "endif" | "ifend" => {
+                if self.conditions.pop().is_none() {
+                    self.fail("{$ENDIF} without a matching {$IF}", span);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if !self.active() {
             return;
         }
-        for entry in body[1..].split(',') {
-            let e = entry.trim();
-            if e.len() < 2 {
-                continue;
+
+        match name.as_str() {
+            "define" => {
+                let symbol = first_word(rest);
+                if !symbol.is_empty() {
+                    self.defines.insert(symbol);
+                }
             }
-            let kind = e.as_bytes()[0].to_ascii_uppercase();
-            let sign = e.as_bytes()[1];
-            let on = sign == b'+';
-            match kind {
-                b'R' => self.directives.range_check = on,
-                b'Q' => self.directives.overflow_check = on,
-                b'I' => self.directives.io_check = on,
-                _ => {}
+            "undef" => {
+                self.defines.remove(&first_word(rest));
+            }
+            "error" | "fatal" => self.fail(format!("{{$error}} {rest}"), span),
+            "include" => self.include(rest, span),
+            "i" if !rest.starts_with(['+', '-']) => self.include(rest, span),
+            // One-letter switches, possibly several: `{$R+,Q-}`.
+            _ if name.len() == 1 => {
+                for entry in body.split(',') {
+                    let e = entry.trim().as_bytes();
+                    if e.len() < 2 {
+                        continue;
+                    }
+                    let on = e[1] == b'+';
+                    match e[0].to_ascii_uppercase() {
+                        b'R' => self.directives.range_check = on,
+                        b'Q' => self.directives.overflow_check = on,
+                        b'I' => self.directives.io_check = on,
+                        _ => {}
+                    }
+                }
+            }
+            // `{$mode}`, `{$H-}`-style long switches, `{$codepage}`,
+            // `{$inline}`, `{$warning}` and the rest don't change how
+            // Bruto compiles.
+            _ => {}
+        }
+    }
+
+    /// `{$I name}`: start reading the named file; the current one resumes
+    /// when it ends.
+    fn include(&mut self, rest: &str, span: Span) {
+        let name = rest.trim().trim_matches('\'').trim();
+        if name.is_empty() || name.starts_with('%') {
+            // `{$I %DATE%}` and friends insert compiler information; not
+            // supported, and nothing Free Vision needs.
+            return;
+        }
+        let Some(path) = self.find_include(name) else {
+            self.fail(format!("include file '{name}' not found"), span);
+            return;
+        };
+        let source = match crate::source_map::read_source(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                self.fail(format!("can't read include file '{name}': {e}"), span);
+                return;
+            }
+        };
+        if self.suspended.len() >= 64 {
+            self.fail("include files nested too deeply", span);
+            return;
+        }
+        let frame = Frame {
+            chars: std::mem::replace(&mut self.chars, source.chars().collect()),
+            pos: std::mem::replace(&mut self.pos, 0),
+            line: std::mem::replace(&mut self.line, 1),
+            col: std::mem::replace(&mut self.col, 1),
+            file: std::mem::replace(&mut self.file, crate::source_map::intern(&path)),
+            dir: std::mem::replace(&mut self.dir, path.parent().map(Path::to_path_buf)),
+        };
+        self.suspended.push(frame);
+    }
+
+    /// Look for an include file next to the current file, then in the
+    /// include directories, then in the working directory. A name without
+    /// an extension also matches `.inc`, `.pp` and `.pas`.
+    fn find_include(&self, name: &str) -> Option<PathBuf> {
+        let candidates: Vec<String> = if Path::new(name).extension().is_some() {
+            vec![name.to_string()]
+        } else {
+            ["", ".inc", ".pp", ".pas"]
+                .iter()
+                .map(|ext| format!("{name}{ext}"))
+                .collect()
+        };
+        let dirs = self
+            .dir
+            .iter()
+            .chain(self.include_dirs.iter())
+            .cloned()
+            .chain(std::iter::once(PathBuf::from(".")));
+        for dir in dirs {
+            for candidate in &candidates {
+                let path = dir.join(candidate);
+                if path.is_file() {
+                    return Some(path);
+                }
+                // Case-insensitive match, for sources written on DOS.
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        if entry
+                            .file_name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(candidate)
+                        {
+                            return Some(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resume the file that included the one that just ended.
+    fn resume_includer(&mut self) -> bool {
+        let Some(frame) = self.suspended.pop() else {
+            return false;
+        };
+        self.chars = frame.chars;
+        self.pos = frame.pos;
+        self.line = frame.line;
+        self.col = frame.col;
+        self.file = frame.file;
+        self.dir = frame.dir;
+        true
+    }
+
+    /// Evaluate a `{$IF}` / `{$ELSEIF}` expression: `defined(X)`,
+    /// `undefined(X)`, `declared(X)` (always false), `not`, `and`, `or`,
+    /// parentheses, numbers, the FPC version symbols and comparisons.
+    fn eval_condition(&mut self, text: &str, span: Span) -> bool {
+        let tokens = condition_tokens(text);
+        let mut pos = 0;
+        match eval_or(&tokens, &mut pos, &self.defines) {
+            Some(v) if pos == tokens.len() => v != 0,
+            _ => {
+                self.fail(format!("can't evaluate {{$IF {text}}}"), span);
+                false
             }
         }
     }
@@ -325,22 +608,37 @@ impl Lexer {
                 continue;
             }
 
-            // Block comment: { }   (also `{$X+/-}` directives)
+            // Block comment: { } (also `{$...}` directives). Braces nest, as
+            // in FPC's default mode, so a commented-out block may itself
+            // contain `{ }` comments and directives, which are ignored.
             if self.peek() == '{' {
+                let span = self.span();
                 self.advance();
                 let mut body = String::new();
-                while self.pos < self.chars.len() && self.peek() != '}' {
+                let mut depth = 1;
+                while self.pos < self.chars.len() {
+                    match self.peek() {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
                     body.push(self.advance());
                 }
                 if self.pos < self.chars.len() {
                     self.advance();
                 }
-                self.handle_directive(&body);
+                self.handle_directive(&body, span);
                 continue;
             }
 
-            // Block comment: (* *)   (also `(*$X+/-*)` directives)
+            // Block comment: (* *)   (also `(*$...*)` directives)
             if self.peek() == '(' && self.chars.get(self.pos + 1) == Some(&'*') {
+                let span = self.span();
                 self.advance();
                 self.advance();
                 let mut body = String::new();
@@ -355,7 +653,7 @@ impl Lexer {
                     }
                     body.push(self.advance());
                 }
-                self.handle_directive(&body);
+                self.handle_directive(&body, span);
                 continue;
             }
 
@@ -364,22 +662,46 @@ impl Lexer {
     }
 
     fn next_token(&mut self) -> (Tok, Span) {
-        self.skip_whitespace_and_comments();
-
-        let span = self.span();
-
-        if self.pos >= self.chars.len() {
-            return (Tok::Eof, span);
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.pos >= self.chars.len() {
+                if self.resume_includer() {
+                    continue;
+                }
+                let span = self.span();
+                if let Some(open) = self.conditions.last() {
+                    let at = open.opened_at.describe();
+                    self.fail(
+                        format!("missing {{$ENDIF}} for the {{$IF...}} at {at}"),
+                        span,
+                    );
+                }
+                return (Tok::Eof, span);
+            }
+            let token = self.lex_token();
+            // Tokens in a false conditional branch are read (so strings and
+            // comments are skipped correctly) and dropped.
+            if self.active() {
+                return token;
+            }
         }
+    }
+
+    /// Read one token; whitespace and comments have been skipped.
+    fn lex_token(&mut self) -> (Tok, Span) {
+        let span = self.span();
 
         let ch = self.peek();
 
-        // String literal
+        // String literal (it can't span lines)
         if ch == '\'' {
             self.advance();
             let mut s = String::new();
             loop {
-                if self.pos >= self.chars.len() {
+                if self.pos >= self.chars.len() || self.peek() == '\n' {
+                    if self.active() {
+                        self.fail("unterminated string", span);
+                    }
                     break;
                 }
                 if self.peek() == '\'' {
@@ -570,15 +892,150 @@ impl Lexer {
 
 // ── Parser ───────────────────────────────────────────────
 
+/// A token of a `{$IF}` expression.
+#[derive(Debug, Clone, PartialEq)]
+enum CondTok {
+    Word(String),
+    Num(i64),
+    Op(String),
+}
+
+fn condition_tokens(text: &str) -> Vec<CondTok> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            out.push(CondTok::Word(word.to_ascii_uppercase()));
+        } else if c.is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let digits: String = chars[start..i].iter().collect();
+            out.push(CondTok::Num(digits.parse().unwrap_or(0)));
+        } else {
+            let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
+            if ["<=", ">=", "<>"].contains(&two.as_str()) {
+                out.push(CondTok::Op(two));
+                i += 2;
+            } else {
+                out.push(CondTok::Op(c.to_string()));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn eval_or(t: &[CondTok], pos: &mut usize, defs: &HashSet<String>) -> Option<i64> {
+    let mut v = eval_and(t, pos, defs)?;
+    while t.get(*pos) == Some(&CondTok::Word("OR".into())) {
+        *pos += 1;
+        let r = eval_and(t, pos, defs)?;
+        v = ((v != 0) || (r != 0)) as i64;
+    }
+    Some(v)
+}
+
+fn eval_and(t: &[CondTok], pos: &mut usize, defs: &HashSet<String>) -> Option<i64> {
+    let mut v = eval_not(t, pos, defs)?;
+    while t.get(*pos) == Some(&CondTok::Word("AND".into())) {
+        *pos += 1;
+        let r = eval_not(t, pos, defs)?;
+        v = ((v != 0) && (r != 0)) as i64;
+    }
+    Some(v)
+}
+
+fn eval_not(t: &[CondTok], pos: &mut usize, defs: &HashSet<String>) -> Option<i64> {
+    if t.get(*pos) == Some(&CondTok::Word("NOT".into())) {
+        *pos += 1;
+        return Some((eval_not(t, pos, defs)? == 0) as i64);
+    }
+    let l = eval_primary(t, pos, defs)?;
+    let Some(CondTok::Op(op)) = t.get(*pos) else {
+        return Some(l);
+    };
+    let op = op.clone();
+    if !["=", "<>", "<", ">", "<=", ">="].contains(&op.as_str()) {
+        return Some(l);
+    }
+    *pos += 1;
+    let r = eval_primary(t, pos, defs)?;
+    Some(match op.as_str() {
+        "=" => l == r,
+        "<>" => l != r,
+        "<" => l < r,
+        ">" => l > r,
+        "<=" => l <= r,
+        _ => l >= r,
+    } as i64)
+}
+
+fn eval_primary(t: &[CondTok], pos: &mut usize, defs: &HashSet<String>) -> Option<i64> {
+    let tok = t.get(*pos)?.clone();
+    *pos += 1;
+    match tok {
+        CondTok::Num(n) => Some(n),
+        CondTok::Op(op) if op == "(" => {
+            let v = eval_or(t, pos, defs)?;
+            (t.get(*pos) == Some(&CondTok::Op(")".into()))).then(|| *pos += 1)?;
+            Some(v)
+        }
+        CondTok::Word(w) if matches!(w.as_str(), "DEFINED" | "UNDEFINED" | "DECLARED") => {
+            (t.get(*pos) == Some(&CondTok::Op("(".into()))).then(|| *pos += 1)?;
+            let Some(CondTok::Word(symbol)) = t.get(*pos).cloned() else {
+                return None;
+            };
+            *pos += 1;
+            (t.get(*pos) == Some(&CondTok::Op(")".into()))).then(|| *pos += 1)?;
+            Some(match w.as_str() {
+                "DEFINED" => defs.contains(&symbol) as i64,
+                "UNDEFINED" => !defs.contains(&symbol) as i64,
+                // Bruto can't see declarations while preprocessing.
+                _ => 0,
+            })
+        }
+        CondTok::Word(w) => Some(match w.as_str() {
+            "TRUE" => 1,
+            "FALSE" => 0,
+            // FPC 3.2.2 is the dialect Bruto follows.
+            "FPC_VERSION" => 3,
+            "FPC_RELEASE" => 2,
+            "FPC_PATCH" => 2,
+            "FPC_FULLVERSION" => 30202,
+            _ => 0,
+        }),
+        CondTok::Op(_) => None,
+    }
+}
+
 pub struct Parser {
     tokens: Vec<(Tok, Span)>,
     pos: usize,
     pub directives: Directives,
+    /// A preprocessing error, reported by the first `parse_*` call.
+    lex_error: Option<ParseError>,
 }
 
 impl Parser {
     pub fn new(source: &str) -> Self {
-        let mut lexer = Lexer::new(source);
+        Self::with_options(source, &ParseOptions::default())
+    }
+
+    /// Parse `source`, read from `options.file` if given, resolving
+    /// `{$I}` includes relative to it and to `options.include_dirs`.
+    pub fn with_options(source: &str, options: &ParseOptions) -> Self {
+        let mut lexer = Lexer::new(source, options);
         let mut tokens = Vec::new();
         loop {
             let (tok, span) = lexer.next_token();
@@ -592,7 +1049,19 @@ impl Parser {
             tokens,
             pos: 0,
             directives: lexer.directives,
+            lex_error: lexer.error,
         }
+    }
+
+    /// The preprocessing error found while reading the source, if any
+    /// (also returned by the first `parse_*` call).
+    pub fn preprocessing_error(&self) -> Option<&ParseError> {
+        self.lex_error.as_ref()
+    }
+
+    /// How many tokens the preprocessed source produced.
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
     }
 
     fn peek(&self) -> &Tok {
@@ -640,6 +1109,9 @@ impl Parser {
     // ── program ──────────────────────────────────────────
 
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
+        if let Some(e) = self.lex_error.take() {
+            return Err(e);
+        }
         let span = self.span();
         self.expect(&Tok::Program)?;
         let (name, _) = self.expect_ident()?;
@@ -734,6 +1206,9 @@ impl Parser {
     /// in the implementation. A bare initialization block (`initialization
     /// stmts end.`) or trailing `begin ... end.` is supported.
     pub fn parse_unit(&mut self) -> Result<Unit, ParseError> {
+        if let Some(e) = self.lex_error.take() {
+            return Err(e);
+        }
         let span = self.span();
         self.expect(&Tok::KwUnit)?;
         let (name, _) = self.expect_ident()?;

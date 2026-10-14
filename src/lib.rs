@@ -8,6 +8,7 @@ mod pascal_syntax;
 pub mod prof_runtime;
 mod rename;
 pub mod sema;
+pub mod source_map;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -253,7 +254,13 @@ impl PascalBuildJob {
             return BuildPhase::Failed(format!("Failed to write source: {e}"));
         }
 
-        let mut parser = Parser::new(&source);
+        let mut parser = Parser::with_options(
+            &source,
+            &parser::ParseOptions {
+                file: None,
+                include_dirs: self.search_dirs.clone(),
+            },
+        );
         let mut program = match parser.parse_program() {
             Ok(p) => p,
             Err(e) => return BuildPhase::Failed(format!("Parse error: {e}")),
@@ -466,9 +473,15 @@ fn load_unit_recursive(
 
     let path = find_unit_file(name, search_dirs)
         .ok_or_else(|| format!("unit '{name}' not found on search path"))?;
-    let source = std::fs::read_to_string(&path)
+    let source = source_map::read_source(&path)
         .map_err(|e| format!("failed to read unit '{name}' at {}: {e}", path.display()))?;
-    let mut parser = Parser::new(&source);
+    let mut parser = Parser::with_options(
+        &source,
+        &parser::ParseOptions {
+            file: Some(path.clone()),
+            include_dirs: search_dirs.to_vec(),
+        },
+    );
     let unit = parser
         .parse_unit()
         .map_err(|e| format!("parse error in unit '{name}' ({}): {e}", path.display()))?;
@@ -515,13 +528,21 @@ fn capitalize(name: &str) -> String {
     }
 }
 
+/// Record `span`'s line as breakpoint-eligible, if it is in the program's
+/// own file rather than a unit or an included file.
+fn insert_line(lines: &mut HashSet<usize>, span: ast::Span) {
+    if span.file == source_map::MAIN_FILE {
+        lines.insert(span.line as usize);
+    }
+}
+
 /// Collect lines where codegen emits debug locations (i.e. executable lines).
 fn collect_block_lines(block: &ast::Block, lines: &mut HashSet<usize>) {
     for stmt in &block.statements {
         collect_stmt_lines(stmt, lines);
     }
     // `end` keyword is breakpoint-eligible (codegen emits a debug alloca there)
-    lines.insert(block.end_span.line as usize);
+    insert_line(lines, block.end_span);
 }
 
 fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
@@ -542,7 +563,7 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         | ast::Statement::Break { span }
         | ast::Statement::Continue { span }
         | ast::Statement::ChainedAssignment { span, .. } => {
-            lines.insert(span.line as usize);
+            insert_line(lines, *span);
         }
         ast::Statement::If {
             condition: _,
@@ -550,7 +571,7 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
             else_branch,
             span,
         } => {
-            lines.insert(span.line as usize); // the `if` condition line
+            insert_line(lines, *span); // the `if` condition line
             collect_block_lines(then_branch, lines);
             if let Some(eb) = else_branch {
                 collect_block_lines(eb, lines);
@@ -561,15 +582,15 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
             body,
             span,
         } => {
-            lines.insert(span.line as usize);
+            insert_line(lines, *span);
             collect_block_lines(body, lines);
         }
         ast::Statement::For { body, span, .. } => {
-            lines.insert(span.line as usize);
+            insert_line(lines, *span);
             collect_block_lines(body, lines);
         }
         ast::Statement::RepeatUntil { body, span, .. } => {
-            lines.insert(span.line as usize);
+            insert_line(lines, *span);
             for stmt in body {
                 collect_stmt_lines(stmt, lines);
             }
@@ -580,7 +601,7 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
             span,
             ..
         } => {
-            lines.insert(span.line as usize);
+            insert_line(lines, *span);
             for branch in branches {
                 for stmt in &branch.body {
                     collect_stmt_lines(stmt, lines);
@@ -593,10 +614,10 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
             }
         }
         ast::Statement::Goto { span, .. } | ast::Statement::Label { span, .. } => {
-            lines.insert(span.line as usize);
+            insert_line(lines, *span);
         }
         ast::Statement::With { body, span, .. } => {
-            lines.insert(span.line as usize);
+            insert_line(lines, *span);
             collect_block_lines(body, lines);
         }
         ast::Statement::Block(block) => {
@@ -2069,6 +2090,205 @@ end.
             captured.contains("pi=3") && captured.contains("sq=49"),
             "unexpected output: {captured}"
         );
+    }
+
+    /// Write `files` into a fresh temp directory, build `main` from there
+    /// and run it. Returns (exited successfully, captured output).
+    fn build_and_run_in_dir(dir_name: &str, files: &[(&str, &[u8])], main: &str) -> (bool, String) {
+        let tmp = std::env::temp_dir().join(dir_name);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        for (name, body) in files {
+            std::fs::write(tmp.join(name), body).unwrap();
+        }
+        let main_path = tmp.join("Main.pas");
+        std::fs::write(&main_path, main).unwrap();
+        let result = MiniPascal
+            .build_job_at(main, Some(&main_path))
+            .as_mut()
+            .poll_to_done();
+        let _ = std::fs::remove_dir_all(&tmp);
+        let result = result.expect("build failed");
+        let _ = std::fs::remove_file(&result.console_capture_path);
+        let status = std::process::Command::new(&result.exe_path)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run failed");
+        let captured = std::fs::read_to_string(&result.console_capture_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&result.exe_path);
+        let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
+        let _ = std::fs::remove_file(&result.console_capture_path);
+        (status.success(), captured)
+    }
+
+    #[test]
+    fn conditional_compilation() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$DEFINE Verbose}
+{$IFDEF verbose}
+const Mode = 'verbose';
+{$ELSE}
+const Mode = 'quiet';
+{$ENDIF}
+begin
+  writeln(Mode);
+  {$IFNDEF FPC} this is not Pascal {$ENDIF}
+  {$IFDEF BRUTO} writeln('bruto'); {$ENDIF}
+  {$IF defined(FPC) and not defined(Nope)}
+  writeln('if');
+  {$ELSEIF defined(FPC)}
+  writeln('elseif skipped');
+  {$ELSE}
+  writeln('else skipped');
+  {$ENDIF}
+  {$IF FPC_FULLVERSION >= 30200} writeln('version'); {$IFEND}
+  {$IFDEF Nope}
+    {$IFDEF FPC} writeln('nested in false branch'); {$ENDIF}
+    writeln('unterminated string
+  {$ELSE}
+    writeln('outer else');
+  {$ENDIF}
+  {$UNDEF Verbose}
+  {$IFDEF Verbose} writeln('still defined'); {$ENDIF}
+  { a commented-out block { with a nested comment } and {$IFDEF X} a
+    directive, all ignored }
+  { $ifdef Nope  -- a space after the brace makes this a plain comment }
+  writeln('done')
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            ["verbose", "bruto", "if", "version", "outer else", "done"]
+        );
+    }
+
+    #[test]
+    fn include_files() {
+        let (ok, out) = build_and_run_in_dir(
+            "bruto_pascal_include_test",
+            &[
+                // Found without its extension and with a different case;
+                // carries a code page 437 byte (0xB3) in a comment.
+                (
+                    "Consts.INC",
+                    b"const Greeting = 'hello from consts'; { \xb3 }\n",
+                ),
+                (
+                    "body.inc",
+                    b"{$I consts}\nprocedure Show;\nbegin\n  writeln(Greeting)\nend;\n",
+                ),
+            ],
+            "program Main;\n{$I body.inc}\nbegin\n  Show\nend.\n",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "hello from consts");
+    }
+
+    #[test]
+    fn preprocessor_errors_are_reported() {
+        for (src, msg) in [
+            (
+                "program T;\n{$error unsupported target}\nbegin\nend.\n",
+                "unsupported target",
+            ),
+            (
+                "program T;\n{$I nowhere.inc}\nbegin\nend.\n",
+                "'nowhere.inc' not found",
+            ),
+            (
+                "program T;\n{$IFDEF FPC}\nbegin\nend.\n",
+                "missing {$ENDIF}",
+            ),
+            ("program T;\n{$ENDIF}\nbegin\nend.\n", "without a matching"),
+            (
+                "program T;\n{$IFDEF Nope}{$error not here}{$ENDIF}\nbegin\n  {$error here}\nend.\n",
+                "line 4",
+            ),
+        ] {
+            let err = match MiniPascal.build(src) {
+                Ok(_) => panic!("expected an error for {src:?}"),
+                Err(e) => e,
+            };
+            assert!(err.contains(msg), "{err}");
+        }
+    }
+
+    #[test]
+    fn included_code_gets_its_own_debug_file() {
+        let tmp = std::env::temp_dir().join("bruto_pascal_include_dwarf");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("helper.inc"),
+            "procedure Helper;\nbegin\n  writeln('x')\nend;\n",
+        )
+        .unwrap();
+        let source = "program Main;\n{$I helper.inc}\nbegin\n  Helper\nend.\n";
+        let mut parser = Parser::with_options(
+            source,
+            &parser::ParseOptions {
+                file: None,
+                include_dirs: vec![tmp.clone()],
+            },
+        );
+        let program = parser.parse_program().expect("parse");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let context = Context::create();
+        let mut cg = CodeGen::new(&context, "/tmp/Main.pas");
+        cg.compile(&program).expect("codegen");
+        let ir = cg.print_ir();
+        assert!(ir.contains(r#"!DIFile(filename: "helper.inc""#), "{ir}");
+        assert!(
+            ir.contains(r#"!DISubprogram(name: "Helper""#),
+            "missing Helper subprogram"
+        );
+    }
+
+    /// Run the preprocessor over Free Vision's sources. Needs a checkout of
+    /// FPC's `packages/fv/src` (and `packages/rtl-extra/src/inc` for
+    /// `objects.pp`):
+    /// `FV_SRC=/path/to/fpc FV_SRC_EXTRA=... cargo test -- --ignored free_vision`
+    #[test]
+    #[ignore]
+    fn free_vision_sources_preprocess_cleanly() {
+        let fv = PathBuf::from(std::env::var("FV_SRC").expect("set FV_SRC to packages/fv/src"));
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&fv)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                name.ends_with(".pas") && !name.starts_with('u')
+            })
+            .collect();
+        if let Ok(extra) = std::env::var("FV_SRC_EXTRA") {
+            files.push(PathBuf::from(extra).join("objects.pp"));
+        }
+        files.sort();
+        let mut failures = Vec::new();
+        for path in &files {
+            let source = source_map::read_source(path).unwrap();
+            let parser = Parser::with_options(
+                &source,
+                &parser::ParseOptions {
+                    file: Some(path.clone()),
+                    include_dirs: vec![fv.clone()],
+                },
+            );
+            match parser.preprocessing_error() {
+                Some(e) => failures.push(format!("{}: {e}", path.display())),
+                None => println!("{}: {} tokens", path.display(), parser.token_count()),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     fn ir_for(source: &str, instrument: bool) -> (String, Vec<String>) {

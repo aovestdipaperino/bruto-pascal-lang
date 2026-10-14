@@ -34,7 +34,7 @@ pub struct CodeGenError {
 impl fmt::Display for CodeGenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(span) = self.span {
-            write!(f, "line {}:{}: {}", span.line, span.column, self.message)
+            write!(f, "{}: {}", span.describe(), self.message)
         } else {
             write!(f, "{}", self.message)
         }
@@ -81,6 +81,14 @@ pub struct CodeGen<'ctx> {
     // current routine's locals (see `lookup_var`).
     global_vars: HashMap<String, PointerValue<'ctx>>,
     global_types: HashMap<String, PascalType>,
+
+    // Debug-info files other than the main one (units, `{$I}` includes),
+    // by source-map id, and lexical-block scopes used when a routine's
+    // code comes from a different file than the routine itself.
+    di_files: std::cell::RefCell<HashMap<u32, DIFile<'ctx>>>,
+    file_scopes: std::cell::RefCell<HashMap<(String, u32), DIScope<'ctx>>>,
+    // The file the current routine's DISubprogram belongs to.
+    scope_file: u32,
 
     // Identifiers are lower-cased by the semantic pass; this maps each back
     // to the spelling the user wrote, for debug info and watch metadata.
@@ -193,6 +201,9 @@ impl<'ctx> CodeGen<'ctx> {
             global_vars: HashMap::new(),
             global_types: HashMap::new(),
             display_names: HashMap::new(),
+            di_files: std::cell::RefCell::new(HashMap::new()),
+            file_scopes: std::cell::RefCell::new(HashMap::new()),
+            scope_file: crate::source_map::MAIN_FILE,
             saved_scopes: Vec::new(),
             type_defs: HashMap::new(),
             enum_values: HashMap::new(),
@@ -451,11 +462,11 @@ impl<'ctx> CodeGen<'ctx> {
         // any procedure is compiled, so every routine can reach them.
         for c in &program.consts {
             let ty = self.const_decl_type(c);
-            self.declare_global(&c.name, &ty, c.span.line);
+            self.declare_global(&c.name, &ty, c.span);
         }
         for var_decl in &program.vars {
             for name in &var_decl.names {
-                self.declare_global(name, &var_decl.ty, var_decl.span.line);
+                self.declare_global(name, &var_decl.ty, var_decl.span);
             }
         }
 
@@ -814,8 +825,47 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// The debug-info file for a source-map id.
+    fn di_file_for(&self, file: u32) -> DIFile<'ctx> {
+        let Some(path) = crate::source_map::path_of(file) else {
+            return self.di_file;
+        };
+        *self.di_files.borrow_mut().entry(file).or_insert_with(|| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let dir = path
+                .parent()
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.di_builder.create_file(&name, &dir)
+        })
+    }
+
+    /// The scope for a location in `file` inside the current routine: the
+    /// routine itself, or a lexical block naming `file` when the code came
+    /// from somewhere else (an include file inside a routine body, say).
+    fn scope_for_file(&self, scope: DIScope<'ctx>, file: u32) -> DIScope<'ctx> {
+        if file == self.scope_file {
+            return scope;
+        }
+        let key = (
+            self.current_fn
+                .map(|f| f.get_name().to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            file,
+        );
+        *self.file_scopes.borrow_mut().entry(key).or_insert_with(|| {
+            self.di_builder
+                .create_lexical_block(scope, self.di_file_for(file), 0, 0)
+                .as_debug_info_scope()
+        })
+    }
+
     fn set_debug_loc(&self, span: Span) {
         if let Some(scope) = self.current_scope {
+            let scope = self.scope_for_file(scope, span.file);
             let loc = self.di_builder.create_debug_location(
                 self.context,
                 span.line,
@@ -906,7 +956,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let di_var = self.di_builder.create_auto_variable(
                     di_sub.as_debug_info_scope(),
                     &self.display(name),
-                    self.di_file,
+                    self.di_file_for(decl.span.file),
                     decl.span.line,
                     di_type,
                     true,
@@ -986,7 +1036,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// zero-initialised (strings start as `''`), with DWARF so the
     /// debugger can show it. Called before any procedure is compiled so
     /// every routine can reach it.
-    fn declare_global(&mut self, name: &str, ty: &PascalType, line: u32) {
+    fn declare_global(&mut self, name: &str, ty: &PascalType, span: Span) {
         let resolved = self.resolve_type(ty);
         let llvm_ty = self.llvm_type_for(&resolved);
         let symbol = format!("pascal.{name}");
@@ -1003,8 +1053,8 @@ impl<'ctx> CodeGen<'ctx> {
                 self.compile_unit.as_debug_info_scope(),
                 &self.display(name),
                 "",
-                self.di_file,
-                line,
+                self.di_file_for(span.file),
+                span.line,
                 di_type,
                 true,
                 None,
@@ -1197,8 +1247,9 @@ impl<'ctx> CodeGen<'ctx> {
             .di_builder
             .create_basic_type("integer", 64, 0x05, DIFlags::ZERO)
             .unwrap();
+        let proc_file = self.di_file_for(proc.span.file);
         let di_fn_type = self.di_builder.create_subroutine_type(
-            self.di_file,
+            proc_file,
             proc.return_type.as_ref().map(|_| di_i64.as_type()),
             &[],
             DIFlags::ZERO,
@@ -1207,7 +1258,7 @@ impl<'ctx> CodeGen<'ctx> {
             self.compile_unit.as_debug_info_scope(),
             &self.display(&proc.name),
             None,
-            self.di_file,
+            proc_file,
             proc.span.line,
             di_fn_type,
             true,
@@ -1226,10 +1277,12 @@ impl<'ctx> CodeGen<'ctx> {
         let saved_types = std::mem::take(&mut self.var_types);
         let saved_fn = self.current_fn;
         let saved_scope = self.current_scope;
+        let saved_scope_file = self.scope_file;
         self.saved_scopes.push((saved_vars, saved_types));
 
         self.current_fn = Some(func);
         self.current_scope = Some(di_sub.as_debug_info_scope());
+        self.scope_file = proc.span.file;
         self.set_debug_loc(proc.span);
         let proc_name = proc.name.clone();
         self.emit_prof_enter(&proc_name, proc.span.line)?;
@@ -1371,6 +1424,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.var_types = restored_types;
         self.current_fn = saved_fn;
         self.current_scope = saved_scope;
+        self.scope_file = saved_scope_file;
 
         Ok(())
     }

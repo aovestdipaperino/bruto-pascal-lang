@@ -1,16 +1,32 @@
 /// AST types for Mini-Pascal.
 ///
 /// Every node carries a `Span` for error reporting and DWARF debug info generation.
-/// Source location (1-based line and column).
+/// Source location (1-based line and column), plus the file it is in:
+/// 0 for the program being compiled, otherwise an id from
+/// [`crate::source_map`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Span {
     pub line: u32,
     pub column: u32,
+    pub file: u32,
 }
 
 impl Span {
     pub fn new(line: u32, column: u32) -> Self {
-        Self { line, column }
+        Self {
+            line,
+            column,
+            file: crate::source_map::MAIN_FILE,
+        }
+    }
+
+    pub fn in_file(line: u32, column: u32, file: u32) -> Self {
+        Self { line, column, file }
+    }
+
+    /// `line L:C`, plus the file name when it isn't the main program.
+    pub fn describe(&self) -> String {
+        crate::source_map::describe(self.line, self.column, self.file)
     }
 }
 
