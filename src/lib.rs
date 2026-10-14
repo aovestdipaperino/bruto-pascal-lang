@@ -560,6 +560,8 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         | ast::Statement::ProcCall { span, .. }
         | ast::Statement::Exit { span, .. }
         | ast::Statement::PlaceAssignment { span, .. }
+        | ast::Statement::MethodCall { span, .. }
+        | ast::Statement::Inherited { span, .. }
         | ast::Statement::Break { span }
         | ast::Statement::Continue { span }
         | ast::Statement::ChainedAssignment { span, .. } => {
@@ -1493,6 +1495,227 @@ end.
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
         assert_eq!(lines, ["ho", "Hello hello", "2", "aXc", "101", "compare"]);
+    }
+
+    #[test]
+    fn routine_declaration_parts() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+var total: integer;
+const Base = 10;
+type TSmall = 0..9;
+var extra: TSmall;
+procedure Nothing;
+begin
+end;
+function Scaled(n: integer): integer;
+type TPair = record a, b: integer; end;
+const Factor = 3;
+var p: TPair;
+  function Twice(x: integer): integer;
+  begin
+    Twice := x * 2
+  end;
+const Offset = Base + 1;
+begin
+  p.a := n * Factor;
+  p.b := Offset;
+  Scaled := Twice(p.a) + p.b
+end;
+begin
+  Nothing;
+  extra := 4;
+  total := Scaled(extra);
+  writeln(total)
+end.
+",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "35");
+    }
+
+    #[test]
+    fn object_types_with_virtual_methods() {
+        let (ok, out) = build_and_run_source(
+            "program Shapes;
+type
+  PShape = ^TShape;
+  TShape = object
+    Name: string;
+    constructor Init(AName: string);
+    function Area: real; virtual;
+    procedure Describe;
+    destructor Done; virtual;
+  end;
+  PCircle = ^TCircle;
+  TCircle = object(TShape)
+    Radius: real;
+    constructor Init(AName: string; R: real);
+    function Area: real; virtual;
+    destructor Done; virtual;
+  end;
+  TCounter = object
+    Count: LongInt;
+    procedure Bump;
+    function Twice: integer;
+  end;
+var
+  s: PShape;
+  c: TCircle;
+  k: TCounter;
+  disposed: integer;
+
+constructor TShape.Init(AName: string);
+begin
+  Name := AName
+end;
+function TShape.Area: real;
+begin
+  Area := 0
+end;
+procedure TShape.Describe;
+begin
+  writeln(Name, ' area ', Area:5:2)
+end;
+destructor TShape.Done;
+begin
+  disposed := disposed + 1
+end;
+constructor TCircle.Init(AName: string; R: real);
+begin
+  inherited Init(AName);
+  Radius := R
+end;
+function TCircle.Area: real;
+begin
+  Area := 3 * Radius * Radius
+end;
+destructor TCircle.Done;
+begin
+  writeln('circle done');
+  inherited Done
+end;
+procedure TCounter.Bump;
+begin
+  Inc(Count)
+end;
+function TCounter.Twice: integer;
+begin
+  Bump;
+  Twice := Self.Count * 2
+end;
+begin
+  s := New(PCircle, Init('big', 2));
+  s^.Describe;
+  writeln(s^.Area:5:2);
+  Dispose(s, Done);
+  writeln(disposed);
+  c.Init('small', 1);
+  c.Describe;
+  New(s, Init('plain'));
+  s^.Describe;
+  writeln(TypeOf(s^) = TypeOf(TShape), ' ', TypeOf(c) = TypeOf(TCircle));
+  k.Count := 1;
+  writeln(k.Twice);
+  writeln(SizeOf(TCounter))
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "big area 12.00",
+                "12.00",
+                "circle done",
+                "1",
+                "small area  3.00",
+                "plain area  0.00",
+                "true true",
+                "4",
+                "4"
+            ]
+        );
+    }
+
+    #[test]
+    fn methods_named_like_builtins_and_abstract_methods() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TStream = object
+    Total: integer;
+    constructor Init;
+    procedure Write(n: integer); virtual;
+    function Read: integer; virtual;
+    procedure Copy3(n: integer);
+    procedure Show; virtual; abstract;
+  end;
+constructor TStream.Init;
+begin
+  Total := 0
+end;
+procedure TStream.Write(n: integer);
+begin
+  Total := Total + n
+end;
+function TStream.Read: integer;
+begin
+  Read := Total
+end;
+procedure TStream.Copy3(n: integer);
+begin
+  Write(n); Write(n); Write(n)
+end;
+var s: TStream;
+begin
+  s.Init;
+  s.Write(5);
+  s.Copy3(2);
+  writeln(s.Read);
+  s.Show
+end.
+",
+        );
+        assert!(!ok, "calling an abstract method should stop the program");
+        assert_eq!(out.trim(), "11");
+    }
+
+    #[test]
+    fn self_referencing_pointer_types() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  PNode = ^TNode;
+  TNode = record
+    Value: integer;
+    Next: PNode;
+  end;
+var head, n: PNode;
+  i, sum: integer;
+begin
+  head := nil;
+  for i := 1 to 4 do
+  begin
+    new(n);
+    n^.Value := i;
+    n^.Next := head;
+    head := n
+  end;
+  sum := 0;
+  n := head;
+  while n <> nil do
+  begin
+    sum := sum + n^.Value;
+    n := n^.Next
+  end;
+  writeln(sum, ' ', head^.Next^.Value)
+end.
+",
+        );
+        assert!(ok);
+        assert_eq!(out.trim(), "10 3");
     }
 
     #[test]

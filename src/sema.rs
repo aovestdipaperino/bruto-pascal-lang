@@ -118,7 +118,7 @@ fn fold_constant_bounds(program: &Program) -> Result<Program, SemaError> {
     Ok(out)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ConstEnv {
     /// Integer value of every foldable untyped constant and enum value.
     values: HashMap<String, i64>,
@@ -199,6 +199,38 @@ impl ConstEnv {
     }
 
     fn resolve_proc(&self, proc: &mut ProcDecl) -> Result<(), SemaError> {
+        // Local types and constants are visible in this routine only.
+        let mut local;
+        let env = if proc.consts.is_empty() && proc.type_decls.is_empty() {
+            self
+        } else {
+            local = self.clone();
+            for td in &proc.type_decls {
+                local.user_types.insert(td.name.clone());
+                local.add_enum_values(&td.ty);
+            }
+            for c in &proc.consts {
+                if c.ty.is_none()
+                    && let Some(value) =
+                        ConstExpr::from_expr(&c.value).and_then(|e| local.eval(&e).ok())
+                {
+                    local.values.insert(c.name.clone(), value);
+                }
+            }
+            for td in &mut proc.type_decls {
+                local.resolve_type(&mut td.ty, td.span)?;
+            }
+            for c in &mut proc.consts {
+                if let Some(ty) = &mut c.ty {
+                    local.resolve_type(ty, c.span)?;
+                }
+            }
+            &local
+        };
+        env.resolve_proc_body(proc)
+    }
+
+    fn resolve_proc_body(&self, proc: &mut ProcDecl) -> Result<(), SemaError> {
         let span = proc.span;
         for group in &mut proc.params {
             self.resolve_type(&mut group.ty, span)?;
@@ -218,6 +250,19 @@ impl ConstEnv {
     /// Rewrite `ty` in place, folding every constant-expression bound.
     fn resolve_type(&self, ty: &mut PascalType, span: Span) -> Result<(), SemaError> {
         match ty {
+            PascalType::Object(obj) => {
+                for (_, t) in &mut obj.fields {
+                    self.resolve_type(t, span)?;
+                }
+                for m in &mut obj.methods {
+                    for group in &mut m.params {
+                        self.resolve_type(&mut group.ty, m.span)?;
+                    }
+                    if let Some(rt) = &mut m.return_type {
+                        self.resolve_type(rt, m.span)?;
+                    }
+                }
+            }
             PascalType::ArrayExpr { lo, hi, elem } => {
                 let lo = self.eval_at(lo, span)?;
                 let hi = self.eval_at(hi, span)?;
@@ -235,7 +280,9 @@ impl ConstEnv {
             | PascalType::Set { elem }
             | PascalType::File { elem }
             | PascalType::ConformantArray { elem, .. } => self.resolve_type(elem, span)?,
-            PascalType::Record { fields, variant } => {
+            PascalType::Record {
+                fields, variant, ..
+            } => {
                 for (_, t) in fields {
                     self.resolve_type(t, span)?;
                 }

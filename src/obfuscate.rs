@@ -119,6 +119,13 @@ fn collect_program(program: &Program, n: &mut Namer) {
 
 fn collect_proc(p: &ProcDecl, n: &mut Namer) {
     n.declare(&p.name);
+    for c in &p.consts {
+        n.declare(&c.name);
+    }
+    for td in &p.type_decls {
+        n.declare(&td.name);
+        collect_type(&td.ty, n);
+    }
     for group in &p.params {
         for name in &group.names {
             n.declare(name);
@@ -144,13 +151,30 @@ fn collect_proc(p: &ProcDecl, n: &mut Namer) {
 /// (`Named`) are not declared here — the matching `type` declaration is.
 fn collect_type(ty: &PascalType, n: &mut Namer) {
     match ty {
+        PascalType::Object(obj) => {
+            for (fname, fty) in &obj.fields {
+                n.declare(fname);
+                collect_type(fty, n);
+            }
+            for m in &obj.methods {
+                n.declare(&m.name);
+                for group in &m.params {
+                    for name in &group.names {
+                        n.declare(name);
+                    }
+                    collect_type(&group.ty, n);
+                }
+            }
+        }
         PascalType::Enum { name, values } => {
             n.declare(name);
             for v in values {
                 n.declare(v);
             }
         }
-        PascalType::Record { fields, variant } => {
+        PascalType::Record {
+            fields, variant, ..
+        } => {
             for (fname, fty) in fields {
                 n.declare(fname);
                 collect_type(fty, n);

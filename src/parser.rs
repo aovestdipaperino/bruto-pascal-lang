@@ -77,6 +77,10 @@ enum Tok {
     KwImplementation,
     KwUses,
     KwInitialization,
+    KwObject,
+    KwConstructor,
+    KwDestructor,
+    KwInherited,
     TyReal,
     TyChar,
     TyText,
@@ -175,6 +179,10 @@ impl fmt::Display for Tok {
             Tok::KwImplementation => write!(f, "'implementation'"),
             Tok::KwUses => write!(f, "'uses'"),
             Tok::KwInitialization => write!(f, "'initialization'"),
+            Tok::KwObject => write!(f, "'object'"),
+            Tok::KwConstructor => write!(f, "'constructor'"),
+            Tok::KwDestructor => write!(f, "'destructor'"),
+            Tok::KwInherited => write!(f, "'inherited'"),
             Tok::TyReal => write!(f, "'real'"),
             Tok::TyChar => write!(f, "'char'"),
             Tok::KwArray => write!(f, "'array'"),
@@ -821,6 +829,10 @@ impl Lexer {
                 "implementation" => Tok::KwImplementation,
                 "uses" => Tok::KwUses,
                 "initialization" => Tok::KwInitialization,
+                "object" => Tok::KwObject,
+                "constructor" => Tok::KwConstructor,
+                "destructor" => Tok::KwDestructor,
+                "inherited" => Tok::KwInherited,
                 "array" => Tok::KwArray,
                 "of" => Tok::KwOf,
                 "record" => Tok::KwRecord,
@@ -1019,6 +1031,16 @@ fn eval_primary(t: &[CondTok], pos: &mut usize, defs: &HashSet<String>) -> Optio
     }
 }
 
+/// The declarations of a program, unit section or routine.
+#[derive(Default)]
+struct Decls {
+    labels: Vec<i64>,
+    consts: Vec<ConstDecl>,
+    type_decls: Vec<TypeDecl>,
+    vars: Vec<VarDecl>,
+    procedures: Vec<ProcDecl>,
+}
+
 pub struct Parser {
     tokens: Vec<(Tok, Span)>,
     pos: usize,
@@ -1092,6 +1114,32 @@ impl Parser {
         }
     }
 
+    /// The name of a keyword token that FPC code also uses as an
+    /// identifier (a method or function name).
+    fn soft_keyword(tok: &Tok) -> Option<&'static str> {
+        Some(match tok {
+            Tok::KwWrite => "write",
+            Tok::KwWriteLn => "writeln",
+            Tok::KwRead => "read",
+            Tok::KwReadLn => "readln",
+            Tok::KwNew => "new",
+            Tok::KwDispose => "dispose",
+            _ => return None,
+        })
+    }
+
+    /// A member name after `.` or a routine name: an identifier, or one of
+    /// the words Bruto treats as keywords that FPC code also uses as
+    /// method names (`TStream.Write`, `TStream.Read`, ...).
+    fn expect_member_name(&mut self) -> Result<(String, Span), ParseError> {
+        let Some(word) = Self::soft_keyword(self.peek()) else {
+            return self.expect_ident();
+        };
+        let span = self.span();
+        self.advance();
+        Ok((word.to_string(), span))
+    }
+
     fn expect_ident(&mut self) -> Result<(String, Span), ParseError> {
         match self.peek().clone() {
             Tok::Ident(name) => {
@@ -1136,34 +1184,7 @@ impl Parser {
             Vec::new()
         };
 
-        let labels = if *self.peek() == Tok::KwLabel {
-            self.parse_label_section()?
-        } else {
-            Vec::new()
-        };
-
-        let consts = if *self.peek() == Tok::Const {
-            self.parse_const_section()?
-        } else {
-            Vec::new()
-        };
-
-        let type_decls = if *self.peek() == Tok::KwType {
-            self.parse_type_section()?
-        } else {
-            Vec::new()
-        };
-
-        let vars = if *self.peek() == Tok::Var {
-            self.parse_var_section()?
-        } else {
-            Vec::new()
-        };
-
-        let mut procedures = Vec::new();
-        while *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
-            procedures.push(self.parse_proc_decl()?);
-        }
+        let decls = self.parse_decls(false)?;
 
         let body = self.parse_block()?;
         self.expect(&Tok::Dot)?;
@@ -1171,14 +1192,47 @@ impl Parser {
         Ok(Program {
             name,
             uses,
-            labels,
-            consts,
-            type_decls,
-            vars,
-            procedures,
+            labels: decls.labels,
+            consts: decls.consts,
+            type_decls: decls.type_decls,
+            vars: decls.vars,
+            procedures: decls.procedures,
             body,
             span,
         })
+    }
+
+    /// Whether the next token starts a routine: `procedure`, `function`,
+    /// `constructor` or `destructor`.
+    fn at_routine(&self) -> bool {
+        matches!(
+            self.peek(),
+            Tok::KwProcedure | Tok::KwFunction | Tok::KwConstructor | Tok::KwDestructor
+        )
+    }
+
+    /// Parse a declaration part: `label`, `const`, `type` and `var`
+    /// sections and routines, in any order and as often as they appear.
+    /// With `headers_only` (a unit interface), routines are headers.
+    fn parse_decls(&mut self, headers_only: bool) -> Result<Decls, ParseError> {
+        let mut decls = Decls::default();
+        loop {
+            match self.peek() {
+                Tok::KwLabel => decls.labels.extend(self.parse_label_section()?),
+                Tok::Const => decls.consts.extend(self.parse_const_section()?),
+                Tok::KwType => decls.type_decls.extend(self.parse_type_section()?),
+                Tok::Var => decls.vars.extend(self.parse_var_section()?),
+                _ if self.at_routine() => {
+                    let routine = if headers_only {
+                        self.parse_proc_header()?
+                    } else {
+                        self.parse_proc_decl()?
+                    };
+                    decls.procedures.push(routine);
+                }
+                _ => return Ok(decls),
+            }
+        }
     }
 
     /// Parse `uses A, B, C;` (Borland/Delphi style). Unit names are
@@ -1222,26 +1276,7 @@ impl Parser {
             Vec::new()
         };
 
-        let interface_consts = if *self.peek() == Tok::Const {
-            self.parse_const_section()?
-        } else {
-            Vec::new()
-        };
-        let interface_types = if *self.peek() == Tok::KwType {
-            self.parse_type_section()?
-        } else {
-            Vec::new()
-        };
-        let interface_vars = if *self.peek() == Tok::Var {
-            self.parse_var_section()?
-        } else {
-            Vec::new()
-        };
-
-        let mut interface_proc_headers = Vec::new();
-        while *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
-            interface_proc_headers.push(self.parse_proc_header()?);
-        }
+        let interface = self.parse_decls(true)?;
 
         self.expect(&Tok::KwImplementation)?;
 
@@ -1256,26 +1291,15 @@ impl Parser {
             }
         }
 
-        let impl_consts = if *self.peek() == Tok::Const {
-            self.parse_const_section()?
-        } else {
-            Vec::new()
-        };
-        let impl_types = if *self.peek() == Tok::KwType {
-            self.parse_type_section()?
-        } else {
-            Vec::new()
-        };
-        let impl_vars = if *self.peek() == Tok::Var {
-            self.parse_var_section()?
-        } else {
-            Vec::new()
-        };
-
-        let mut procedures = Vec::new();
-        while *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
-            procedures.push(self.parse_proc_decl()?);
-        }
+        let implementation = self.parse_decls(false)?;
+        let interface_consts = interface.consts;
+        let interface_types = interface.type_decls;
+        let interface_vars = interface.vars;
+        let interface_proc_headers = interface.procedures;
+        let impl_consts = implementation.consts;
+        let impl_types = implementation.type_decls;
+        let impl_vars = implementation.vars;
+        let procedures = implementation.procedures;
 
         // Optional unit initialization block. Accepts both Turbo Pascal
         // (`begin ... end.`) and Delphi (`initialization ... end.`)
@@ -1326,40 +1350,88 @@ impl Parser {
         })
     }
 
-    /// Parse just the header of a procedure/function declaration —
-    /// `procedure Name(params); ` or `function Name(params): T;`. Used
-    /// for unit interface sections, where bodies are deferred to the
-    /// implementation block.
-    fn parse_proc_header(&mut self) -> Result<ProcDecl, ParseError> {
+    /// Parse a routine heading: `procedure Name(params);`,
+    /// `function Name(params): T;`, `constructor` / `destructor`, or a
+    /// method implementation's `procedure TFoo.Name(...)`, followed by any
+    /// calling-convention modifiers (`inline;`, `cdecl;`, ...), which are
+    /// accepted and ignored.
+    fn parse_routine_heading(&mut self) -> Result<ProcDecl, ParseError> {
         let span = self.span();
-        let is_function = *self.peek() == Tok::KwFunction;
+        let kind = match self.peek() {
+            Tok::KwProcedure => RoutineKind::Procedure,
+            Tok::KwFunction => RoutineKind::Function,
+            Tok::KwConstructor => RoutineKind::Constructor,
+            Tok::KwDestructor => RoutineKind::Destructor,
+            _ => {
+                return Err(ParseError {
+                    message: format!("expected a procedure or function, found {}", self.peek()),
+                    span,
+                });
+            }
+        };
         self.advance();
-        let (name, _) = self.expect_ident()?;
+        let (first, _) = self.expect_member_name()?;
+        let (owner, name) = if *self.peek() == Tok::Dot {
+            self.advance();
+            let (method, _) = self.expect_member_name()?;
+            (Some(first), method)
+        } else {
+            (None, first)
+        };
         let params = if *self.peek() == Tok::LParen {
             self.parse_param_list()?
         } else {
             Vec::new()
         };
-        let return_type = if is_function {
-            self.expect(&Tok::Colon)?;
+        // A method or forward-declared function may leave out its result
+        // type where it is implemented.
+        let return_type = if kind == RoutineKind::Function && *self.peek() == Tok::Colon {
+            self.advance();
             Some(self.parse_type()?)
         } else {
             None
         };
         self.expect(&Tok::Semi)?;
-        Ok(ProcDecl {
-            name,
-            params,
-            return_type,
-            vars: Vec::new(),
-            nested_procs: Vec::new(),
-            body: Block {
-                statements: Vec::new(),
-                span,
-                end_span: span,
-            },
-            span,
-        })
+        self.skip_routine_modifiers(&[
+            "inline",
+            "overload",
+            "cdecl",
+            "register",
+            "stdcall",
+            "pascal",
+            "far",
+            "near",
+            "export",
+            "reintroduce",
+            "static",
+        ])?;
+        let mut decl = ProcDecl::header(name, kind, params, return_type, span);
+        decl.owner = owner;
+        Ok(decl)
+    }
+
+    /// Skip `modifier;` pairs whose (lower-case) name is in `names`.
+    /// Returns the ones found.
+    fn skip_routine_modifiers(&mut self, names: &[&str]) -> Result<Vec<String>, ParseError> {
+        let mut found = Vec::new();
+        while let Tok::Ident(word) = self.peek() {
+            let lower = word.to_ascii_lowercase();
+            if !names.contains(&lower.as_str()) {
+                break;
+            }
+            self.advance();
+            self.expect(&Tok::Semi)?;
+            found.push(lower);
+        }
+        Ok(found)
+    }
+
+    /// Parse just the header of a routine, as in a unit's interface
+    /// section, where the body comes later in the implementation.
+    fn parse_proc_header(&mut self) -> Result<ProcDecl, ParseError> {
+        let mut decl = self.parse_routine_heading()?;
+        decl.is_forward = true;
+        Ok(decl)
     }
 
     // ── label section ────────────────────────────────────
@@ -1550,6 +1622,9 @@ impl Parser {
         if *self.peek() == Tok::KwRecord {
             return self.parse_record_type();
         }
+        if *self.peek() == Tok::KwObject {
+            return self.parse_object_type();
+        }
         // Procedural type: `procedure(params)` or `function(params): T`.
         if matches!(self.peek(), Tok::KwProcedure | Tok::KwFunction) {
             let is_func = *self.peek() == Tok::KwFunction;
@@ -1684,6 +1759,85 @@ impl Parser {
         }
     }
 
+    /// `object [(Parent)] fields and method headers end`, with optional
+    /// `private` / `public` / `protected` sections (accepted, not
+    /// enforced).
+    fn parse_object_type(&mut self) -> Result<PascalType, ParseError> {
+        self.expect(&Tok::KwObject)?;
+        let parent = if *self.peek() == Tok::LParen {
+            self.advance();
+            let (parent, _) = self.expect_ident()?;
+            self.expect(&Tok::RParen)?;
+            Some(parent)
+        } else {
+            None
+        };
+        let mut obj = ObjectType {
+            parent,
+            fields: Vec::new(),
+            methods: Vec::new(),
+        };
+        loop {
+            match self.peek().clone() {
+                Tok::End => {
+                    self.advance();
+                    break;
+                }
+                _ if self.at_routine() => {
+                    let heading = self.parse_routine_heading()?;
+                    let mods = self.skip_routine_modifiers(&[
+                        "virtual",
+                        "abstract",
+                        "inline",
+                        "overload",
+                        "static",
+                        "reintroduce",
+                        "cdecl",
+                    ])?;
+                    obj.methods.push(MethodHeader {
+                        name: heading.name,
+                        kind: heading.kind,
+                        params: heading.params,
+                        return_type: heading.return_type,
+                        is_virtual: mods.iter().any(|m| m == "virtual"),
+                        is_abstract: mods.iter().any(|m| m == "abstract"),
+                        span: heading.span,
+                    });
+                }
+                Tok::Ident(word)
+                    if matches!(
+                        word.to_ascii_lowercase().as_str(),
+                        "private" | "public" | "protected" | "published" | "strict"
+                    ) && !matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some((Tok::Colon | Tok::Comma, _))
+                    ) =>
+                {
+                    self.advance();
+                }
+                Tok::Ident(_) => {
+                    let decl = self.parse_var_decl()?;
+                    for name in decl.names {
+                        obj.fields.push((name, decl.ty.clone()));
+                    }
+                    if *self.peek() == Tok::Semi {
+                        self.advance();
+                    }
+                }
+                _ => {
+                    return Err(ParseError {
+                        message: format!(
+                            "expected a field or method in object, found {}",
+                            self.peek()
+                        ),
+                        span: self.span(),
+                    });
+                }
+            }
+        }
+        Ok(PascalType::Object(Box::new(obj)))
+    }
+
     fn parse_record_type(&mut self) -> Result<PascalType, ParseError> {
         self.expect(&Tok::KwRecord)?;
         let mut fields = Vec::new();
@@ -1713,7 +1867,11 @@ impl Parser {
             }
         }
         self.expect(&Tok::End)?;
-        Ok(PascalType::Record { fields, variant })
+        Ok(PascalType::Record {
+            fields,
+            variant,
+            object: None,
+        })
     }
 
     fn parse_variant_part(&mut self) -> Result<RecordVariant, ParseError> {
@@ -1785,69 +1943,24 @@ impl Parser {
     // ── procedure / function ──────────────────────────────
 
     fn parse_proc_decl(&mut self) -> Result<ProcDecl, ParseError> {
-        let span = self.span();
-        let is_function = *self.peek() == Tok::KwFunction;
-        self.advance(); // consume 'procedure' or 'function'
-        let (name, _) = self.expect_ident()?;
-
-        let params = if *self.peek() == Tok::LParen {
-            self.parse_param_list()?
-        } else {
-            Vec::new()
-        };
-
-        let return_type = if is_function {
-            self.expect(&Tok::Colon)?;
-            Some(self.parse_type()?)
-        } else {
-            None
-        };
-
-        self.expect(&Tok::Semi)?;
+        let mut decl = self.parse_routine_heading()?;
 
         // Forward declaration: procedure Foo; forward;
         if *self.peek() == Tok::KwForward {
             self.advance();
             self.expect(&Tok::Semi)?;
-            return Ok(ProcDecl {
-                name,
-                params,
-                return_type,
-                vars: Vec::new(),
-                nested_procs: Vec::new(),
-                body: Block {
-                    statements: Vec::new(),
-                    span,
-                    end_span: span,
-                },
-                span,
-            });
+            decl.is_forward = true;
+            return Ok(decl);
         }
 
-        let vars = if *self.peek() == Tok::Var {
-            self.parse_var_section()?
-        } else {
-            Vec::new()
-        };
-
-        // Nested procedures/functions
-        let mut nested_procs = Vec::new();
-        while *self.peek() == Tok::KwProcedure || *self.peek() == Tok::KwFunction {
-            nested_procs.push(self.parse_proc_decl()?);
-        }
-
-        let body = self.parse_block()?;
+        let decls = self.parse_decls(false)?;
+        decl.consts = decls.consts;
+        decl.type_decls = decls.type_decls;
+        decl.vars = decls.vars;
+        decl.nested_procs = decls.procedures;
+        decl.body = self.parse_block()?;
         self.expect(&Tok::Semi)?;
-
-        Ok(ProcDecl {
-            name,
-            params,
-            return_type,
-            vars,
-            nested_procs,
-            body,
-            span,
-        })
+        Ok(decl)
     }
 
     fn parse_param_list(&mut self) -> Result<Vec<ParamGroup>, ParseError> {
@@ -1988,18 +2101,25 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         // Check for label: N: statement
-        if let Tok::IntLit(n) = self.peek().clone() {
-            if self
+        if let Tok::IntLit(n) = self.peek().clone()
+            && self
                 .tokens
                 .get(self.pos + 1)
                 .map(|(t, _)| t == &Tok::Colon)
                 .unwrap_or(false)
-            {
-                let span = self.span();
-                self.advance(); // consume number
-                self.advance(); // consume colon
-                return Ok(Statement::Label { label: n, span });
-            }
+        {
+            let span = self.span();
+            self.advance(); // consume number
+            self.advance(); // consume colon
+            return Ok(Statement::Label { label: n, span });
+        }
+
+        // `Read := x` / `Write := y`: a function whose name Bruto treats as
+        // a keyword, assigning its result.
+        if matches!(self.tokens.get(self.pos + 1), Some((Tok::Assign, _)))
+            && let Some(word) = Self::soft_keyword(self.peek())
+        {
+            self.tokens[self.pos].0 = Tok::Ident(word.to_string());
         }
 
         match self.peek() {
@@ -2011,6 +2131,16 @@ impl Parser {
             Tok::KwWrite => self.parse_write(false),
             Tok::KwWriteLn => self.parse_write(true),
             Tok::KwReadLn => self.parse_readln(),
+            Tok::KwRead => {
+                let span = self.span();
+                self.advance();
+                let args = self.parse_call_args()?;
+                Ok(Statement::ProcCall {
+                    name: "read".to_string(),
+                    args,
+                    span,
+                })
+            }
             Tok::KwNew => self.parse_new(),
             Tok::KwDispose => self.parse_dispose(),
             Tok::KwCase => self.parse_case(),
@@ -2033,6 +2163,13 @@ impl Parser {
                 }
             }
             Tok::Ident(_) if self.at_flow_statement() => self.parse_flow_statement(),
+            Tok::KwInherited => {
+                let span = self.span();
+                self.advance();
+                let (method, _) = self.expect_member_name()?;
+                let args = self.parse_call_args()?;
+                Ok(Statement::Inherited { method, args, span })
+            }
             Tok::Ident(_) => self.parse_ident_statement(),
             _ => Err(ParseError {
                 message: format!("expected statement, found {}", self.peek()),
@@ -2089,7 +2226,18 @@ impl Parser {
             match self.peek() {
                 Tok::Dot => {
                     self.advance();
-                    let (field, _) = self.expect_ident()?;
+                    let (field, _) = self.expect_member_name()?;
+                    // `obj.Method(args)` as a statement.
+                    if *self.peek() == Tok::LParen {
+                        let object = Self::chain_to_expr(&name, chain, span);
+                        let args = self.parse_call_args()?;
+                        return Ok(Statement::MethodCall {
+                            object,
+                            method: field,
+                            args,
+                            span,
+                        });
+                    }
                     chain.push(LValueAccess::Field(field));
                 }
                 Tok::LBracket => {
@@ -2173,6 +2321,19 @@ impl Parser {
             });
         }
 
+        // `obj.Method` or `p^.Done` with no arguments: a method call.
+        if let Some(LValueAccess::Field(_)) = chain.last() {
+            let Some(LValueAccess::Field(method)) = chain.pop() else {
+                unreachable!()
+            };
+            return Ok(Statement::MethodCall {
+                object: Self::chain_to_expr(&name, chain, span),
+                method,
+                args: Vec::new(),
+                span,
+            });
+        }
+
         // Procedure call (chain should be empty for proc calls)
         if *self.peek() == Tok::LParen {
             self.advance();
@@ -2189,6 +2350,36 @@ impl Parser {
             // cast) followed by postfix operators is an assignment target.
             if matches!(self.peek(), Tok::Caret | Tok::Dot | Tok::LBracket) {
                 let target = self.parse_postfix(Expr::Call { name, args, span }, span)?;
+                if *self.peek() != Tok::Assign {
+                    // `PGroup(Owner)^.Lock` and the like: a method call.
+                    return match target {
+                        Expr::MethodCall {
+                            object,
+                            method,
+                            args,
+                            span,
+                        } => Ok(Statement::MethodCall {
+                            object: *object,
+                            method,
+                            args,
+                            span,
+                        }),
+                        Expr::FieldAccess {
+                            record,
+                            field,
+                            span,
+                        } => Ok(Statement::MethodCall {
+                            object: *record,
+                            method: field,
+                            args: Vec::new(),
+                            span,
+                        }),
+                        _ => Err(ParseError {
+                            message: format!("expected ':=', found {}", self.peek()),
+                            span: self.span(),
+                        }),
+                    };
+                }
                 self.expect(&Tok::Assign)?;
                 let expr = self.parse_expr()?;
                 return Ok(Statement::PlaceAssignment { target, expr, span });
@@ -2202,6 +2393,27 @@ impl Parser {
             args: Vec::new(),
             span,
         })
+    }
+
+    /// Rebuild `name` plus postfix accesses as an expression.
+    fn chain_to_expr(name: &str, chain: Vec<LValueAccess>, span: Span) -> Expr {
+        let mut expr = Expr::Var(name.to_string(), span);
+        for access in chain {
+            expr = match access {
+                LValueAccess::Field(field) => Expr::FieldAccess {
+                    record: Box::new(expr),
+                    field,
+                    span,
+                },
+                LValueAccess::Index(index) => Expr::Index {
+                    array: Box::new(expr),
+                    index: Box::new(index),
+                    span,
+                },
+                LValueAccess::Deref => Expr::Deref(Box::new(expr), span),
+            };
+        }
+        expr
     }
 
     fn parse_if(&mut self) -> Result<Statement, ParseError> {
@@ -2439,8 +2651,13 @@ impl Parser {
         self.advance(); // consume 'new'
         self.expect(&Tok::LParen)?;
         let (target, _) = self.expect_ident()?;
+        let constructor = self.parse_optional_method_arg()?;
         self.expect(&Tok::RParen)?;
-        Ok(Statement::New { target, span })
+        Ok(Statement::New {
+            target,
+            constructor,
+            span,
+        })
     }
 
     fn parse_dispose(&mut self) -> Result<Statement, ParseError> {
@@ -2448,8 +2665,42 @@ impl Parser {
         self.advance(); // consume 'dispose'
         self.expect(&Tok::LParen)?;
         let (target, _) = self.expect_ident()?;
+        let destructor = self.parse_optional_method_arg()?;
         self.expect(&Tok::RParen)?;
-        Ok(Statement::Dispose { target, span })
+        Ok(Statement::Dispose {
+            target,
+            destructor,
+            span,
+        })
+    }
+
+    /// The `, Init(args)` / `, Done` part of `new` and `dispose`.
+    fn parse_optional_method_arg(&mut self) -> Result<Option<(String, Vec<Expr>)>, ParseError> {
+        if *self.peek() != Tok::Comma {
+            return Ok(None);
+        }
+        self.advance();
+        let (method, _) = self.expect_ident()?;
+        let args = self.parse_call_args()?;
+        Ok(Some((method, args)))
+    }
+
+    /// `(args)` if present, else no arguments.
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut args = Vec::new();
+        if *self.peek() != Tok::LParen {
+            return Ok(args);
+        }
+        self.advance();
+        if *self.peek() != Tok::RParen {
+            args.push(self.parse_expr()?);
+            while *self.peek() == Tok::Comma {
+                self.advance();
+                args.push(self.parse_expr()?);
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(args)
     }
 
     fn parse_write(&mut self, is_writeln: bool) -> Result<Statement, ParseError> {
@@ -2660,11 +2911,20 @@ impl Parser {
                 }
                 Tok::Dot => {
                     self.advance();
-                    let (field, _) = self.expect_ident()?;
-                    expr = Expr::FieldAccess {
-                        record: Box::new(expr),
-                        field,
-                        span,
+                    let (field, _) = self.expect_member_name()?;
+                    expr = if *self.peek() == Tok::LParen {
+                        Expr::MethodCall {
+                            object: Box::new(expr),
+                            method: field,
+                            args: self.parse_call_args()?,
+                            span,
+                        }
+                    } else {
+                        Expr::FieldAccess {
+                            record: Box::new(expr),
+                            field,
+                            span,
+                        }
                     };
                 }
                 Tok::Caret => {
@@ -2712,6 +2972,24 @@ impl Parser {
                 let span = self.span();
                 self.advance();
                 Ok(Expr::Nil(span))
+            }
+            Tok::KwInherited => {
+                let span = self.span();
+                self.advance();
+                let (method, _) = self.expect_member_name()?;
+                let args = self.parse_call_args()?;
+                Ok(Expr::Inherited { method, args, span })
+            }
+            // `New(PType, Init(args))`: the function form of new.
+            Tok::KwNew => {
+                let span = self.span();
+                self.advance();
+                let args = self.parse_call_args()?;
+                Ok(Expr::Call {
+                    name: "new".to_string(),
+                    args,
+                    span,
+                })
             }
             Tok::TyInteger | Tok::TyReal | Tok::TyChar | Tok::TyBoolean
                 if self

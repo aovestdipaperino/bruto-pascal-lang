@@ -38,6 +38,20 @@ pub(crate) fn rewrite_program<R: Rename>(program: &mut Program, n: &R) {
 
 fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
     p.name = n.rename(&p.name);
+    if let Some(owner) = &mut p.owner {
+        *owner = n.rename(owner);
+    }
+    for c in &mut p.consts {
+        c.name = n.rename(&c.name);
+        if let Some(ty) = &mut c.ty {
+            rewrite_type(ty, n);
+        }
+        rewrite_expr(&mut c.value, n);
+    }
+    for td in &mut p.type_decls {
+        td.name = n.rename(&td.name);
+        rewrite_type(&mut td.ty, n);
+    }
     for group in &mut p.params {
         for name in &mut group.names {
             *name = n.rename(name);
@@ -61,13 +75,36 @@ fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
 
 fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
     match ty {
+        PascalType::Object(obj) => {
+            if let Some(parent) = &mut obj.parent {
+                *parent = n.rename(parent);
+            }
+            for (fname, fty) in &mut obj.fields {
+                *fname = n.rename(fname);
+                rewrite_type(fty, n);
+            }
+            for m in &mut obj.methods {
+                m.name = n.rename(&m.name);
+                for group in &mut m.params {
+                    for name in &mut group.names {
+                        *name = n.rename(name);
+                    }
+                    rewrite_type(&mut group.ty, n);
+                }
+                if let Some(rt) = &mut m.return_type {
+                    rewrite_type(rt, n);
+                }
+            }
+        }
         PascalType::Enum { name, values } => {
             *name = n.rename(name);
             for v in values {
                 *v = n.rename(v);
             }
         }
-        PascalType::Record { fields, variant } => {
+        PascalType::Record {
+            fields, variant, ..
+        } => {
             for (fname, fty) in fields {
                 *fname = n.rename(fname);
                 rewrite_type(fty, n);
@@ -155,6 +192,24 @@ fn rewrite_stmts<R: Rename>(stmts: &mut [Statement], n: &R) {
 
 fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
     match s {
+        Statement::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } => {
+            rewrite_expr(object, n);
+            *method = n.rename(method);
+            for a in args {
+                rewrite_expr(a, n);
+            }
+        }
+        Statement::Inherited { method, args, .. } => {
+            *method = n.rename(method);
+            for a in args {
+                rewrite_expr(a, n);
+            }
+        }
         Statement::Assignment { target, expr, .. } => {
             *target = n.rename(target);
             rewrite_expr(expr, n);
@@ -216,8 +271,23 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
             }
         }
         Statement::Block(b) => rewrite_block(b, n),
-        Statement::New { target, .. } | Statement::Dispose { target, .. } => {
+        Statement::New {
+            target,
+            constructor: method,
+            ..
+        }
+        | Statement::Dispose {
+            target,
+            destructor: method,
+            ..
+        } => {
             *target = n.rename(target);
+            if let Some((name, args)) = method {
+                *name = n.rename(name);
+                for a in args {
+                    rewrite_expr(a, n);
+                }
+            }
         }
         Statement::IndexAssignment {
             target,
@@ -320,6 +390,24 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
 
 fn rewrite_expr<R: Rename>(e: &mut Expr, n: &R) {
     match e {
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } => {
+            rewrite_expr(object, n);
+            *method = n.rename(method);
+            for a in args {
+                rewrite_expr(a, n);
+            }
+        }
+        Expr::Inherited { method, args, .. } => {
+            *method = n.rename(method);
+            for a in args {
+                rewrite_expr(a, n);
+            }
+        }
         Expr::Var(name, _) => *name = n.rename(name),
         Expr::BinOp { left, right, .. } => {
             rewrite_expr(left, n);

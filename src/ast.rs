@@ -4,7 +4,7 @@
 /// Source location (1-based line and column), plus the file it is in:
 /// 0 for the program being compiled, otherwise an id from
 /// [`crate::source_map`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Span {
     pub line: u32,
     pub column: u32,
@@ -90,7 +90,7 @@ pub enum ParamMode {
 }
 
 /// A single parameter group: `a, b: integer` or `var x: integer`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamGroup {
     pub mode: ParamMode,
     pub names: Vec<String>,
@@ -103,10 +103,56 @@ pub struct ProcDecl {
     pub name: String,
     pub params: Vec<ParamGroup>,
     pub return_type: Option<PascalType>, // None = procedure, Some = function
+    pub kind: RoutineKind,
+    /// The object type a method implementation belongs to: `TFoo` in
+    /// `procedure TFoo.Bar;`.
+    pub owner: Option<String>,
+    /// A `forward` declaration or a unit interface header: no body here.
+    pub is_forward: bool,
+    pub consts: Vec<ConstDecl>,
+    pub type_decls: Vec<TypeDecl>,
     pub vars: Vec<VarDecl>,
     pub nested_procs: Vec<ProcDecl>,
     pub body: Block,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineKind {
+    Procedure,
+    Function,
+    Constructor,
+    Destructor,
+}
+
+impl ProcDecl {
+    /// A routine with just its header: no declarations and an empty body.
+    pub fn header(
+        name: String,
+        kind: RoutineKind,
+        params: Vec<ParamGroup>,
+        return_type: Option<PascalType>,
+        span: Span,
+    ) -> Self {
+        Self {
+            name,
+            params,
+            return_type,
+            kind,
+            owner: None,
+            is_forward: false,
+            consts: Vec::new(),
+            type_decls: Vec::new(),
+            vars: Vec::new(),
+            nested_procs: Vec::new(),
+            body: Block {
+                statements: Vec::new(),
+                span,
+                end_span: span,
+            },
+            span,
+        }
+    }
 }
 
 /// Variable declaration: `name1, name2 : type`
@@ -143,7 +189,13 @@ pub enum PascalType {
         fields: Vec<(String, PascalType)>,
         /// Optional variant part: (tag_name, tag_type, variants)
         variant: Option<Box<RecordVariant>>,
+        /// For the record an `object` type lowers to, the object type's
+        /// name, so its methods can be found.
+        object: Option<String>,
     },
+    /// An `object` type as declared. Code generation lowers it to a
+    /// `Record` (with `object` set) plus a method table.
+    Object(Box<ObjectType>),
     /// Enumerated type: (val1, val2, val3)
     Enum {
         /// The type name (e.g., "Color") — set during type section parsing
@@ -284,6 +336,27 @@ impl ConstExpr {
     }
 }
 
+/// A Turbo Pascal `object` type declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectType {
+    pub parent: Option<String>,
+    /// The object's own fields, in declaration order.
+    pub fields: Vec<(String, PascalType)>,
+    pub methods: Vec<MethodHeader>,
+}
+
+/// A method declared in an object type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodHeader {
+    pub name: String,
+    pub kind: RoutineKind,
+    pub params: Vec<ParamGroup>,
+    pub return_type: Option<PascalType>,
+    pub is_virtual: bool,
+    pub is_abstract: bool,
+    pub span: Span,
+}
+
 /// Variant part of a record type: `case tag: type of ...`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordVariant {
@@ -351,12 +424,29 @@ pub enum Statement {
         expr: Expr,
         span: Span,
     },
+    /// `new(p)`, or `new(p, Init(args))` to construct an object.
     New {
         target: String,
+        constructor: Option<(String, Vec<Expr>)>,
         span: Span,
     },
+    /// `dispose(p)`, or `dispose(p, Done)` to destroy an object first.
     Dispose {
         target: String,
+        destructor: Option<(String, Vec<Expr>)>,
+        span: Span,
+    },
+    /// A method call statement: `obj.Method(args)`, `p^.Done`.
+    MethodCall {
+        object: Expr,
+        method: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    /// `inherited Method(args)` as a statement.
+    Inherited {
+        method: String,
+        args: Vec<Expr>,
         span: Span,
     },
     /// Array index assignment: `a[i] := expr`
@@ -478,6 +568,8 @@ impl Statement {
             | Self::With { span, .. }
             | Self::Exit { span, .. }
             | Self::PlaceAssignment { span, .. }
+            | Self::MethodCall { span, .. }
+            | Self::Inherited { span, .. }
             | Self::Break { span }
             | Self::Continue { span }
             | Self::ChainedAssignment { span, .. } => *span,
@@ -549,6 +641,19 @@ pub enum Expr {
     Nil(Span),
     /// Address of a variable, element, field or routine: `@x`
     AddrOf(Box<Expr>, Span),
+    /// A method call: `obj.Method(args)`, `p^.Method`.
+    MethodCall {
+        object: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    /// `inherited Method(args)`: the parent type's method, called on Self.
+    Inherited {
+        method: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -570,6 +675,8 @@ impl Expr {
             | Self::UnaryOp { span, .. }
             | Self::Deref(_, span)
             | Self::AddrOf(_, span)
+            | Self::MethodCall { span, .. }
+            | Self::Inherited { span, .. }
             | Self::Call { span, .. }
             | Self::Index { span, .. }
             | Self::FieldAccess { span, .. }
