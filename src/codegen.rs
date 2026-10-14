@@ -131,6 +131,8 @@ pub struct CodeGen<'ctx> {
     loop_targets: Vec<(BasicBlock<'ctx>, BasicBlock<'ctx>)>,
     // How many pointers `create_debug_type` is currently inside.
     debug_pointer_depth: std::cell::Cell<u32>,
+    // Objects named by enclosing `with` statements, innermost last.
+    with_objects: Vec<(String, PointerValue<'ctx>)>,
     // Object types (lowered to records) and the method being compiled.
     objects: HashMap<String, objects::ObjectInfo>,
     current_object: Option<String>,
@@ -227,6 +229,7 @@ impl<'ctx> CodeGen<'ctx> {
             end_bp_slots: HashMap::new(),
             debug_pointer_depth: std::cell::Cell::new(0),
             objects: HashMap::new(),
+            with_objects: Vec::new(),
             current_object: None,
             method_context: None,
             current_function: None,
@@ -490,7 +493,21 @@ impl<'ctx> CodeGen<'ctx> {
         }
         for var_decl in &program.vars {
             for name in &var_decl.names {
-                self.declare_global(name, &var_decl.ty, var_decl.span);
+                match &var_decl.absolute {
+                    // A global `absolute` variable shares its target's global.
+                    Some(target) => {
+                        let address = *self.global_vars.get(target).ok_or_else(|| {
+                            CodeGenError::new(
+                                format!("undefined variable '{target}'"),
+                                Some(var_decl.span),
+                            )
+                        })?;
+                        let ty = self.resolve_type(&var_decl.ty);
+                        self.global_vars.insert(name.clone(), address);
+                        self.global_types.insert(name.clone(), ty);
+                    }
+                    None => self.declare_global(name, &var_decl.ty, var_decl.span),
+                }
             }
         }
 
@@ -911,6 +928,19 @@ impl<'ctx> CodeGen<'ctx> {
         self.set_debug_loc(decl.span);
         let resolved_ty = self.resolve_type(&decl.ty);
 
+        // `absolute`: no storage of its own, just another view of the
+        // target's.
+        if let Some(target) = &decl.absolute {
+            let address = *self.lookup_var(target).ok_or_else(|| {
+                CodeGenError::new(format!("undefined variable '{target}'"), Some(decl.span))
+            })?;
+            for name in &decl.names {
+                self.variables.insert(name.clone(), address);
+                self.var_types.insert(name.clone(), resolved_ty.clone());
+            }
+            return Ok(());
+        }
+
         for name in &decl.names {
             let llvm_ty = self.llvm_type_for(&resolved_ty);
             let alloca = self
@@ -1037,6 +1067,9 @@ impl<'ctx> CodeGen<'ctx> {
                 "char" => Some(PascalType::Char),
                 "boolean" => Some(PascalType::Boolean),
                 "string" => Some(PascalType::String),
+                "text" => Some(PascalType::File {
+                    elem: Box::new(PascalType::Char),
+                }),
                 _ => None,
             })
     }
@@ -1097,6 +1130,23 @@ impl<'ctx> CodeGen<'ctx> {
         self.record_metadata(name, &resolved);
     }
 
+    /// A string literal as a private constant: one byte per character
+    /// (Pascal strings are byte strings, so `#129` is the byte 129, not a
+    /// UTF-8 sequence), NUL-terminated.
+    fn string_literal(&self, text: &str) -> PointerValue<'ctx> {
+        let bytes: Vec<u8> = text
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .collect();
+        let value = self.context.const_string(&bytes, true);
+        let global = self.module.add_global(value.get_type(), None, "str_lit");
+        global.set_linkage(Linkage::Private);
+        global.set_constant(true);
+        global.set_unnamed_addr(true);
+        global.set_initializer(&value);
+        global.as_pointer_value()
+    }
+
     /// Pointer to a shared, empty NUL-terminated string, usable as a
     /// constant initializer.
     fn empty_string_constant(&self) -> BasicValueEnum<'ctx> {
@@ -1142,7 +1192,10 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some(v) = variant {
                     parts.push(format!("__tag={}", d(&v.tag_name)));
                     for (vals, vfields) in &v.variants {
-                        let val_str: Vec<String> = vals.iter().map(|v| v.to_string()).collect();
+                        let val_str: Vec<String> = vals
+                            .iter()
+                            .map(|v| v.as_int().unwrap_or(0).to_string())
+                            .collect();
                         let f_str: Vec<String> = vfields
                             .iter()
                             .map(|(n, t)| format!("{}={}", d(n), type_short(t)))
@@ -1169,6 +1222,81 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// Store a typed constant's value into `slot`: a plain expression, or a
+    /// record / array initializer filled in field by field.
+    fn store_initializer(
+        &mut self,
+        slot: PointerValue<'ctx>,
+        value: &Expr,
+        ty: &PascalType,
+    ) -> Result<(), CodeGenError> {
+        let resolved = self.resolve_type(ty);
+        let err = |e: inkwell::builder::BuilderError| {
+            CodeGenError::new(e.to_string(), Some(value.span()))
+        };
+        match (value, &resolved) {
+            (
+                Expr::RecordInit {
+                    fields: inits,
+                    span,
+                },
+                PascalType::Record { fields, .. },
+            ) => {
+                let record_ty = self.llvm_type_for(&resolved);
+                for (name, init) in inits {
+                    let index = fields.iter().position(|(n, _)| n == name).ok_or_else(|| {
+                        CodeGenError::new(
+                            format!("no field '{}' in this record", self.display(name)),
+                            Some(*span),
+                        )
+                    })?;
+                    let field_ty = fields[index].1.clone();
+                    let addr = self
+                        .builder
+                        .build_struct_gep(record_ty, slot, index as u32, "init_field")
+                        .map_err(err)?;
+                    self.store_initializer(addr, init, &field_ty)?;
+                }
+                Ok(())
+            }
+            (Expr::ArrayInit { elements, span }, PascalType::Array { lo, hi, elem }) => {
+                if elements.len() as i64 != hi - lo + 1 {
+                    return Err(CodeGenError::new(
+                        format!(
+                            "the array has {} elements but {} values are given",
+                            hi - lo + 1,
+                            elements.len()
+                        ),
+                        Some(*span),
+                    ));
+                }
+                let array_ty = self.llvm_type_for(&resolved);
+                let i64_ty = self.context.i64_type();
+                for (i, init) in elements.iter().enumerate() {
+                    let addr = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(
+                                array_ty,
+                                slot,
+                                &[i64_ty.const_zero(), i64_ty.const_int(i as u64, false)],
+                                "init_elem",
+                            )
+                            .map_err(err)?
+                    };
+                    self.store_initializer(addr, init, elem)?;
+                }
+                Ok(())
+            }
+            (Expr::RecordInit { span, .. } | Expr::ArrayInit { span, .. }, _) => Err(
+                CodeGenError::new("this value doesn't match the constant's type", Some(*span)),
+            ),
+            _ => {
+                let val = self.compile_expr(value)?;
+                self.store_value(slot, val, &resolved, value.span())
+            }
+        }
+    }
+
     /// A constant declared inside a routine: a local slot holding its value.
     fn compile_local_const(&mut self, c: &ConstDecl) -> Result<(), CodeGenError> {
         self.set_debug_loc(c.span);
@@ -1176,8 +1304,7 @@ impl<'ctx> CodeGen<'ctx> {
         let slot = self
             .entry_alloca(self.llvm_type_for(&ty), &c.name)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?;
-        let val = self.compile_expr(&c.value)?;
-        self.store_value(slot, val, &ty, c.span)?;
+        self.store_initializer(slot, &c.value, &ty)?;
         self.variables.insert(c.name.clone(), slot);
         self.var_types.insert(c.name.clone(), ty);
         Ok(())
@@ -1187,6 +1314,16 @@ impl<'ctx> CodeGen<'ctx> {
     /// `declare_global` created for it.
     fn compile_const_decl(&mut self, c: &ConstDecl) -> Result<(), CodeGenError> {
         self.set_debug_loc(c.span);
+        if matches!(c.value, Expr::RecordInit { .. } | Expr::ArrayInit { .. }) {
+            let ty = self.const_decl_type(c);
+            let slot = *self.global_vars.get(&c.name).ok_or_else(|| {
+                CodeGenError::new(
+                    format!("constant '{}' was not declared", c.name),
+                    Some(c.span),
+                )
+            })?;
+            return self.store_initializer(slot, &c.value, &ty);
+        }
         let val = self.compile_expr(&c.value)?;
         let ty = self.const_decl_type(c);
         let alloca = *self.global_vars.get(&c.name).ok_or_else(|| {
@@ -1455,6 +1592,12 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
             self.variables.insert(proc.name.clone(), alloca);
             self.var_types.insert(proc.name.clone(), ret_ty.clone());
+            // `Result` names the same variable (FPC's objfpc and Delphi
+            // modes), unless a parameter is called that.
+            if !self.variables.contains_key("result") {
+                self.variables.insert("result".to_string(), alloca);
+                self.var_types.insert("result".to_string(), ret_ty.clone());
+            }
         }
 
         // Local types, visible until the routine ends.
@@ -2093,10 +2236,7 @@ impl<'ctx> CodeGen<'ctx> {
                 span,
             } => {
                 self.set_debug_loc(*span);
-                let slot = *self.lookup_var(target).ok_or_else(|| {
-                    CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
-                })?;
-                let ptr_ty = self.lookup_var_type(target).cloned().unwrap();
+                let (slot, ptr_ty) = self.resolve_array_base(target, *span)?;
                 let obj = self.construct_new(&ptr_ty, ctor, args, *span)?;
                 self.builder
                     .build_store(slot, obj)
@@ -2112,7 +2252,7 @@ impl<'ctx> CodeGen<'ctx> {
                 // Run the destructor (virtually) on p^, then free p.
                 self.set_debug_loc(*span);
                 let span = *span;
-                let deref = Expr::Deref(Box::new(Expr::Var(target.clone(), span)), span);
+                let deref = Expr::Deref(Box::new(target.clone()), span);
                 self.compile_method_call(&deref, dtor, args, span)?;
                 self.compile_dispose(target, span)
             }
@@ -2130,6 +2270,20 @@ impl<'ctx> CodeGen<'ctx> {
             Statement::Inherited { method, args, span } => {
                 self.set_debug_loc(*span);
                 self.compile_inherited(method, args, *span)?;
+                Ok(())
+            }
+            Statement::Str {
+                value,
+                target,
+                span,
+            } => self.compile_str_statement(value, target, *span),
+            Statement::IndirectCall { call, span } => {
+                self.set_debug_loc(*span);
+                if let Expr::IndirectCall { callee, args, .. } = call {
+                    self.compile_indirect_call(callee, args, *span)?;
+                } else {
+                    self.compile_expr(call)?;
+                }
                 Ok(())
             }
             // Inside a method, the object's own `Read`, `Inc` and so on hide
@@ -2346,11 +2500,7 @@ impl<'ctx> CodeGen<'ctx> {
                 self.builder.position_at_end(dead_bb);
                 Ok(())
             }
-            Statement::With {
-                record_var,
-                body,
-                span,
-            } => self.compile_with(record_var, body, *span),
+            Statement::With { target, body, span } => self.compile_with(target, body, *span),
             Statement::ChainedAssignment {
                 target,
                 chain,
@@ -2360,132 +2510,118 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn compile_new(&mut self, target: &str, span: Span) -> Result<(), CodeGenError> {
+    fn compile_new(&mut self, target: &Expr, span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let alloca = *self.lookup_var(target).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{target}'"), Some(span))
-        })?;
-        let var_type = self
-            .lookup_var_type(target)
-            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(span)))?;
-
-        let PascalType::Pointer(pointed) = var_type else {
+        let (slot, var_type) = self.resolve_array_base(target, span)?;
+        let PascalType::Pointer(pointed) = self.resolve_type(&var_type) else {
             return Err(CodeGenError::new(
-                format!("new() requires a pointer variable, got {target}"),
+                "new() needs a pointer variable",
                 Some(span),
             ));
         };
-
-        let size = self.sizeof_type(pointed);
+        // LLVM's own size, so records get their padding.
+        let size = self
+            .llvm_type_for(&pointed)
+            .size_of()
+            .unwrap_or_else(|| self.context.i64_type().const_int(8, false));
         let bruto_alloc = self.module.get_function("bruto_alloc").unwrap();
         let ptr = self
             .builder
-            .build_call(
-                bruto_alloc,
-                &[self.context.i64_type().const_int(size, false).into()],
-                "heap_ptr",
-            )
+            .build_call(bruto_alloc, &[size.into()], "heap_ptr")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
             .try_as_basic_value()
             .basic()
             .unwrap();
         self.builder
-            .build_store(alloca, ptr)
+            .build_store(slot, ptr)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         Ok(())
     }
 
-    fn compile_dispose(&mut self, target: &str, span: Span) -> Result<(), CodeGenError> {
+    fn compile_dispose(&mut self, target: &Expr, span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let alloca = *self.lookup_var(target).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{target}'"), Some(span))
-        })?;
-        let var_type = self
-            .lookup_var_type(target)
-            .ok_or_else(|| CodeGenError::new(format!("unknown type for '{target}'"), Some(span)))?;
-
-        if !matches!(var_type, PascalType::Pointer(_)) {
-            return Err(CodeGenError::new(
-                format!("dispose() requires a pointer variable, got {target}"),
-                Some(span),
-            ));
+        let ptr_val = self.compile_expr(target)?;
+        if !ptr_val.is_pointer_value() {
+            return Err(CodeGenError::new("dispose() needs a pointer", Some(span)));
         }
-
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-        let ptr_val = self
-            .builder
-            .build_load(ptr_type, alloca, "ptr_val")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         let bruto_free = self.module.get_function("bruto_free").unwrap();
         self.builder
             .build_call(bruto_free, &[ptr_val.into()], "")
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        // Null out the pointer
-        self.builder
-            .build_store(alloca, ptr_type.const_null())
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        // Null out a pointer variable (not, say, a cast of one).
+        if Self::is_place(target) && self.is_addressable(target) {
+            let (slot, _) = self.resolve_array_base(target, span)?;
+            let null = self.context.ptr_type(AddressSpace::default()).const_null();
+            self.builder
+                .build_store(slot, null)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        }
         Ok(())
     }
 
     fn compile_with(
         &mut self,
-        record_var: &str,
+        target: &Expr,
         body: &Block,
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let alloca = *self.lookup_var(record_var).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{record_var}'"), Some(span))
-        })?;
-        let var_type = self.lookup_var_type(record_var).cloned().ok_or_else(|| {
-            CodeGenError::new(format!("unknown type for '{record_var}'"), Some(span))
-        })?;
-        let resolved = self.resolve_type(&var_type);
-        let fields = match &resolved {
-            PascalType::Record { fields, .. } => fields.clone(),
-            _ => {
-                return Err(CodeGenError::new(
-                    format!("'{record_var}' is not a record"),
-                    Some(span),
-                ));
-            }
+        let (address, ty) = self.resolve_array_base(target, span)?;
+        let resolved = self.resolve_type(&ty);
+        let PascalType::Record {
+            fields,
+            variant,
+            object,
+        } = &resolved
+        else {
+            return Err(CodeGenError::new(
+                "'with' needs a record or object",
+                Some(span),
+            ));
         };
 
-        // Save any existing variables that would be shadowed
+        // Every field name, including the variant tag and variant fields.
+        let mut names: Vec<String> = fields
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| n != objects::VMT_FIELD)
+            .collect();
+        if let Some(v) = variant {
+            if !v.tag_name.is_empty() {
+                names.push(v.tag_name.clone());
+            }
+            names.extend(Self::variant_field_names(v));
+        }
+
+        // Bind them, remembering what they hide.
         let mut saved: Vec<(String, Option<PointerValue<'ctx>>, Option<PascalType>)> = Vec::new();
-        for (i, (name, ty)) in fields.iter().enumerate() {
-            let old_var = self.variables.remove(name);
-            let old_type = self.var_types.remove(name);
-            saved.push((name.clone(), old_var, old_type));
-
-            let gep = self
-                .builder
-                .build_struct_gep(
-                    self.llvm_type_for(&resolved),
-                    alloca,
-                    i as u32,
-                    &format!("with_{name}"),
-                )
-                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-            self.variables.insert(name.clone(), gep);
-            self.var_types.insert(name.clone(), ty.clone());
+        for name in names {
+            let (field_ptr, field_ty) = self.field_address(address, &resolved, &name, span)?;
+            let old_var = self.variables.insert(name.clone(), field_ptr);
+            let old_type = self.var_types.insert(name.clone(), field_ty);
+            saved.push((name, old_var, old_type));
+        }
+        // An object's methods are callable by bare name too.
+        if let Some(object) = object {
+            self.with_objects.push((object.clone(), address));
         }
 
-        self.compile_block(body)?;
+        let result = self.compile_block(body);
 
-        // Restore saved variables
-        for (name, old_var, old_type) in saved {
-            self.variables.remove(&name);
-            self.var_types.remove(&name);
-            if let Some(v) = old_var {
-                self.variables.insert(name.clone(), v);
-            }
-            if let Some(t) = old_type {
-                self.var_types.insert(name, t);
-            }
+        if object.is_some() {
+            self.with_objects.pop();
         }
-
-        Ok(())
+        for (name, old_var, old_type) in saved.into_iter().rev() {
+            match old_var {
+                Some(v) => self.variables.insert(name.clone(), v),
+                None => self.variables.remove(&name),
+            };
+            match old_type {
+                Some(t) => self.var_types.insert(name, t),
+                None => self.var_types.remove(&name),
+            };
+        }
+        result
     }
 
     fn compile_chained_assignment(
@@ -2765,10 +2901,41 @@ impl<'ctx> CodeGen<'ctx> {
                 if name == field {
                     return Some((offset, ty.clone()));
                 }
+                // A nested variant part: an unnamed record laid out as its
+                // tag followed by its own union.
+                if name.is_empty()
+                    && let PascalType::Record {
+                        variant: Some(nested),
+                        ..
+                    } = ty
+                    && let Some((inner, inner_ty)) = self.find_variant_field(nested, field)
+                {
+                    let tag = self.sizeof_type(&nested.tag_type);
+                    return Some((offset + tag + inner, inner_ty));
+                }
                 offset += self.sizeof_type(ty);
             }
         }
         None
+    }
+
+    /// The names of all fields in a variant part, nested ones included.
+    fn variant_field_names(v: &RecordVariant) -> Vec<String> {
+        let mut names = Vec::new();
+        for (_, vfields) in &v.variants {
+            for (name, ty) in vfields {
+                if !name.is_empty() {
+                    names.push(name.clone());
+                } else if let PascalType::Record {
+                    variant: Some(nested),
+                    ..
+                } = ty
+                {
+                    names.extend(Self::variant_field_names(nested));
+                }
+            }
+        }
+        names
     }
 
     fn compile_if(
@@ -3076,8 +3243,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.set_debug_loc(span);
         // Inside a method, the object's methods hide routines of the same
         // name.
-        if let Some(object) = self.self_method(name) {
-            let self_ptr = self.method_context.unwrap().self_ptr;
+        if let Some((object, self_ptr)) = self.implicit_method(name) {
             self.call_method(
                 objects::Receiver {
                     object: &object,
@@ -3148,19 +3314,10 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let var_name = match &args[0] {
-            Expr::Var(name, _) => name.clone(),
-            _ => return Err(CodeGenError::new("inc/dec requires a variable", Some(span))),
-        };
-        let alloca = *self.lookup_var(var_name.as_str()).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{var_name}'"), Some(span))
-        })?;
-        let var_type = self
-            .lookup_var_type(var_name.as_str())
-            .cloned()
-            .ok_or_else(|| {
-                CodeGenError::new(format!("unknown type for '{var_name}'"), Some(span))
-            })?;
+        if !self.is_addressable(&args[0]) {
+            return Err(CodeGenError::new("inc/dec requires a variable", Some(span)));
+        }
+        let (alloca, var_type) = self.resolve_array_base(&args[0], span)?;
         let llvm_ty = self.llvm_type_for(&var_type);
 
         // Work in 64 bits whatever the variable's width (chars and narrow
@@ -3306,6 +3463,168 @@ impl<'ctx> CodeGen<'ctx> {
         self.builder
             .build_store(alloca, result)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
+    /// Call the procedural value `callee` computes (`TFunc(p)(args)`),
+    /// using its procedural type's signature.
+    fn compile_indirect_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let PascalType::Proc {
+            params,
+            return_type,
+        } = self.resolve_type(&self.infer_declared_type(callee))
+        else {
+            return Err(CodeGenError::new(
+                "only a procedural value can be called this way",
+                Some(span),
+            ));
+        };
+        if params.len() != args.len() {
+            return Err(CodeGenError::new(
+                format!("expected {} arguments, found {}", params.len(), args.len()),
+                Some(span),
+            ));
+        }
+        let target = self.compile_expr(callee)?;
+        if !target.is_pointer_value() {
+            return Err(CodeGenError::new(
+                "this isn't a procedural value",
+                Some(span),
+            ));
+        }
+        let mut param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+        for (param, arg) in params.iter().zip(args) {
+            let param = self.resolve_type(param);
+            param_types.push(self.llvm_type_for(&param).into());
+            let val = self.compile_expr(arg)?;
+            call_args.push(self.convert_for_store(val, &param, span)?.into());
+        }
+        let fn_type = match &return_type {
+            Some(rt) => self
+                .llvm_type_for(&self.resolve_type(rt))
+                .fn_type(&param_types, false),
+            None => self.context.void_type().fn_type(&param_types, false),
+        };
+        let result = self
+            .builder
+            .build_indirect_call(fn_type, target.into_pointer_value(), &call_args, "icall")
+            .map_err(err)?
+            .try_as_basic_value()
+            .basic();
+        match (result, return_type) {
+            (Some(v), Some(rt)) => Ok(Some(self.widen_loaded(v, &rt, span)?)),
+            (v, _) => Ok(v),
+        }
+    }
+
+    /// `str(value[:width[:precision]], target)`. A precision formats the
+    /// value as a fixed-point real; a width pads it on the left.
+    fn compile_str_statement(
+        &mut self,
+        value: &WriteArg,
+        target: &Expr,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        self.set_debug_loc(span);
+        let (slot, _) = self.resolve_array_base(target, span)?;
+        let val = self.compile_expr(&value.expr)?;
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let snprintf = self.module.get_function("snprintf").unwrap_or_else(|| {
+            self.module.add_function(
+                "snprintf",
+                i32_ty.fn_type(&[ptr.into(), i64_ty.into(), ptr.into()], true),
+                None,
+            )
+        });
+        let alloc = self.module.get_function("bruto_alloc").unwrap();
+        let buffer = |cg: &Self| -> Result<PointerValue<'ctx>, CodeGenError> {
+            Ok(cg
+                .builder
+                .build_call(alloc, &[i64_ty.const_int(512, false).into()], "str_buf")
+                .map_err(err)?
+                .try_as_basic_value()
+                .basic()
+                .unwrap()
+                .into_pointer_value())
+        };
+
+        let mut text = if let Some(precision) = &value.precision {
+            let real = self.promote_to_f64(val, span)?;
+            let digits = self.compile_expr(precision)?;
+            let digits = self
+                .builder
+                .build_int_truncate(self.to_i64(digits, span)?, i32_ty, "prec")
+                .map_err(err)?;
+            let out = buffer(self)?;
+            let fmt = self.string_literal("%.*f");
+            self.builder
+                .build_call(
+                    snprintf,
+                    &[
+                        out.into(),
+                        i64_ty.const_int(512, false).into(),
+                        fmt.into(),
+                        digits.into(),
+                        real.into(),
+                    ],
+                    "",
+                )
+                .map_err(err)?;
+            out
+        } else {
+            let fn_name = if val.is_float_value() {
+                "bruto_real_to_str"
+            } else {
+                "bruto_int_to_str"
+            };
+            let arg = if val.is_float_value() {
+                val
+            } else {
+                self.to_i64(val, span)?.into()
+            };
+            let f = self.module.get_function(fn_name).unwrap();
+            self.builder
+                .build_call(f, &[arg.into()], "str_result")
+                .map_err(err)?
+                .try_as_basic_value()
+                .basic()
+                .unwrap()
+                .into_pointer_value()
+        };
+        if let Some(width) = &value.width {
+            let width = self.compile_expr(width)?;
+            let width = self
+                .builder
+                .build_int_truncate(self.to_i64(width, span)?, i32_ty, "width")
+                .map_err(err)?;
+            let out = buffer(self)?;
+            let fmt = self.string_literal("%*s");
+            self.builder
+                .build_call(
+                    snprintf,
+                    &[
+                        out.into(),
+                        i64_ty.const_int(512, false).into(),
+                        fmt.into(),
+                        width.into(),
+                        text.into(),
+                    ],
+                    "",
+                )
+                .map_err(err)?;
+            text = out;
+        }
+        self.builder.build_store(slot, text).map_err(err)?;
         Ok(())
     }
 
@@ -3844,17 +4163,22 @@ impl<'ctx> CodeGen<'ctx> {
             }
 
             if is_var_param {
-                if let Expr::Var(vname, vspan) = arg {
-                    let alloca = *self.lookup_var(vname.as_str()).ok_or_else(|| {
-                        CodeGenError::new(format!("undefined variable '{vname}'"), Some(*vspan))
-                    })?;
-                    call_args.push(alloca.into());
+                // By reference: the address of the variable, element, field
+                // or dereferenced pointer. Anything else (a constant passed
+                // to an untyped `const` parameter) goes through a temporary.
+                let address = if self.is_addressable(arg) {
+                    self.resolve_array_base(arg, span)?.0
                 } else {
-                    return Err(CodeGenError::new(
-                        "var parameter requires a variable",
-                        Some(span),
-                    ));
-                }
+                    let val = self.compile_expr(arg)?;
+                    let temp = self
+                        .entry_alloca(val.get_type(), "arg_tmp")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    self.builder
+                        .build_store(temp, val)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    temp
+                };
+                call_args.push(address.into());
             } else {
                 let val = self.compile_expr(arg)?;
                 let val = match pinfo {
@@ -4238,26 +4562,7 @@ impl<'ctx> CodeGen<'ctx> {
                 span: fa_span,
             } => {
                 let (rec_ptr, rec_type) = self.resolve_array_base(record, *fa_span)?;
-                let resolved = self.resolve_type(&rec_type);
-                let (field_idx, field_ty) = match &resolved {
-                    PascalType::Record { fields, .. } => {
-                        let idx = fields.iter().position(|(n, _)| n == field).ok_or_else(|| {
-                            CodeGenError::new(format!("no field '{field}' in record"), Some(span))
-                        })?;
-                        (idx, fields[idx].1.clone())
-                    }
-                    _ => return Err(CodeGenError::new("field access on non-record", Some(span))),
-                };
-                let gep = self
-                    .builder
-                    .build_struct_gep(
-                        self.llvm_type_for(&resolved),
-                        rec_ptr,
-                        field_idx as u32,
-                        "fa_gep",
-                    )
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                Ok((gep, field_ty))
+                self.field_address(rec_ptr, &rec_type, field, span)
             }
             Expr::Deref(inner, dspan) => {
                 // The pointer itself: loaded from a variable, element or
@@ -4289,6 +4594,17 @@ impl<'ctx> CodeGen<'ctx> {
                     return Err(CodeGenError::new(UNTYPED_DEREF, Some(span)));
                 }
                 Ok((loaded, pointed))
+            }
+            // `TFoo(Buf)`, `TByteArray(P^)`: the same memory seen as
+            // another type.
+            Expr::Call { name, args, .. }
+                if args.len() == 1
+                    && self.cast_target(name).is_some()
+                    && self.is_addressable(&args[0]) =>
+            {
+                let target = self.cast_target(name).unwrap();
+                let (address, _) = self.resolve_array_base(&args[0], span)?;
+                Ok((address, target))
             }
             _ => Err(CodeGenError::new(
                 "array indexing requires a variable",
@@ -4367,6 +4683,76 @@ impl<'ctx> CodeGen<'ctx> {
         self.resolve_type(&self.infer_declared_type(expr)) == PascalType::String
     }
 
+    /// The address and type of `field` in the record at `rec_ptr`: a fixed
+    /// field, the variant tag, or a field of the variant part (which all
+    /// share the union region after the tag).
+    fn field_address(
+        &self,
+        rec_ptr: PointerValue<'ctx>,
+        rec_type: &PascalType,
+        field: &str,
+        span: Span,
+    ) -> Result<(PointerValue<'ctx>, PascalType), CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let resolved = self.resolve_type(rec_type);
+        let PascalType::Record {
+            fields, variant, ..
+        } = &resolved
+        else {
+            return Err(CodeGenError::new("field access on non-record", Some(span)));
+        };
+        let record_ty = self.llvm_type_for(&resolved);
+        if let Some(index) = fields.iter().position(|(n, _)| n == field) {
+            let addr = self
+                .builder
+                .build_struct_gep(record_ty, rec_ptr, index as u32, "fa_gep")
+                .map_err(err)?;
+            return Ok((addr, fields[index].1.clone()));
+        }
+        let missing = || {
+            CodeGenError::new(
+                format!("no field '{}' in this record", self.display(field)),
+                Some(span),
+            )
+        };
+        let v = variant.as_ref().ok_or_else(missing)?;
+        if field == v.tag_name {
+            let addr = self
+                .builder
+                .build_struct_gep(record_ty, rec_ptr, fields.len() as u32, "tag_gep")
+                .map_err(err)?;
+            return Ok((addr, v.tag_type.clone()));
+        }
+        let (offset, field_ty) = self.find_variant_field(v, field).ok_or_else(missing)?;
+        let union = self
+            .builder
+            .build_struct_gep(record_ty, rec_ptr, (fields.len() + 1) as u32, "union_gep")
+            .map_err(err)?;
+        let addr = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    self.context.i8_type(),
+                    union,
+                    &[self.context.i64_type().const_int(offset, false)],
+                    "vfield_ptr",
+                )
+                .map_err(err)?
+        };
+        Ok((addr, field_ty))
+    }
+
+    /// Whether `resolve_array_base` can give `expr`'s address: a place
+    /// (see `is_place`) that isn't a routine name, or a type cast of one.
+    fn is_addressable(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Var(name, _) => self.lookup_var(name).is_some(),
+            Expr::Call { name, args, .. } => {
+                args.len() == 1 && self.cast_target(name).is_some() && self.is_addressable(&args[0])
+            }
+            other => Self::is_place(other),
+        }
+    }
+
     /// Whether `expr` names storage (a variable, element, field or
     /// dereference) whose address `resolve_array_base` can compute.
     fn is_place(expr: &Expr) -> bool {
@@ -4380,6 +4766,15 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         match expr {
+            Expr::IndirectCall { callee, args, span } => self
+                .compile_indirect_call(callee, args, *span)?
+                .ok_or_else(|| {
+                    CodeGenError::new("this procedural value doesn't return a value", Some(*span))
+                }),
+            Expr::RecordInit { span, .. } | Expr::ArrayInit { span, .. } => Err(CodeGenError::new(
+                "a parenthesised record or array value is only allowed for a typed constant",
+                Some(*span),
+            )),
             Expr::MethodCall {
                 object,
                 method,
@@ -4412,13 +4807,7 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::IntLit(n, _) => Ok(self.context.i64_type().const_int(*n as u64, true).into()),
             Expr::RealLit(r, _) => Ok(self.context.f64_type().const_float(*r).into()),
             Expr::CharLit(c, _) => Ok(self.context.i8_type().const_int(*c as u64, false).into()),
-            Expr::StrLit(s, span) => {
-                let gs = self
-                    .builder
-                    .build_global_string_ptr(s, "str_lit")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                Ok(gs.as_pointer_value().into())
-            }
+            Expr::StrLit(s, _) => Ok(self.string_literal(s).into()),
             Expr::BoolLit(b, _) => Ok(self
                 .context
                 .bool_type()
@@ -4430,8 +4819,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .const_null()
                 .into()),
             Expr::Var(name, span) if self.self_method(name).is_some() => {
-                let object = self.self_method(name).unwrap();
-                let self_ptr = self.method_context.unwrap().self_ptr;
+                let (object, self_ptr) = self.implicit_method(name).unwrap();
                 self.call_method(
                     objects::Receiver {
                         object: &object,
@@ -4677,13 +5065,28 @@ impl<'ctx> CodeGen<'ctx> {
                 if args.len() == 1
                     && let Some(target) = self.cast_target(name)
                 {
+                    // A record, array or set seen through a variable of
+                    // another type: load it from that variable's memory.
+                    if matches!(
+                        target,
+                        PascalType::Record { .. }
+                            | PascalType::Array { .. }
+                            | PascalType::Set { .. }
+                    ) && self.is_addressable(&args[0])
+                    {
+                        let (address, _) = self.resolve_array_base(&args[0], *span)?;
+                        let ty = self.llvm_type_for(&target);
+                        return self
+                            .builder
+                            .build_load(ty, address, "reinterpret")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)));
+                    }
                     let val = self.compile_expr(&args[0])?;
                     return self.compile_cast_to(&target, val, *span);
                 }
                 // Inside a method, the object's methods hide routines of the
                 // same name.
-                if let Some(object) = self.self_method(name) {
-                    let self_ptr = self.method_context.unwrap().self_ptr;
+                if let Some((object, self_ptr)) = self.implicit_method(name) {
                     return self
                         .call_method(
                             objects::Receiver {
@@ -4717,6 +5120,49 @@ impl<'ctx> CodeGen<'ctx> {
                     && let Some(target) = self.cast_target(ptype)
                 {
                     return self.construct_new(&target, ctor, ctor_args, *span);
+                }
+                // `String(x)`: a string stays as it is; a char becomes a
+                // one-character string.
+                if name == "string" && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    if val.is_pointer_value() {
+                        return Ok(val);
+                    }
+                    let ch = self.to_i64(val, *span)?;
+                    let ch = self
+                        .builder
+                        .build_int_truncate(ch, self.context.i8_type(), "ch")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let alloc = self.module.get_function("bruto_alloc").unwrap();
+                    let buf = self
+                        .builder
+                        .build_call(
+                            alloc,
+                            &[self.context.i64_type().const_int(2, false).into()],
+                            "chstr",
+                        )
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap()
+                        .into_pointer_value();
+                    self.builder
+                        .build_store(buf, ch)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    let nul = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(
+                                self.context.i8_type(),
+                                buf,
+                                &[self.context.i64_type().const_int(1, false)],
+                                "nul",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                    };
+                    self.builder
+                        .build_store(nul, self.context.i8_type().const_zero())
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    return Ok(buf.into());
                 }
                 if name == "typeof" && args.len() == 1 {
                     return self.compile_typeof(&args[0], *span);
@@ -6117,6 +6563,64 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(phi.as_basic_value())
     }
 
+    /// `p + n` / `p - n` (scaled by the size of what `p` points to) and
+    /// `p - q` (their distance in elements), as FPC allows for typed
+    /// pointers. `None` when this isn't pointer arithmetic.
+    fn pointer_arithmetic(
+        &mut self,
+        op: BinOp,
+        lhs: BasicValueEnum<'ctx>,
+        rhs: BasicValueEnum<'ctx>,
+        left: &Expr,
+        span: Span,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        if !lhs.is_pointer_value() || !matches!(op, BinOp::Add | BinOp::Sub) {
+            return Ok(None);
+        }
+        let elem = match self.resolve_type(&self.infer_declared_type(left)) {
+            PascalType::Pointer(inner) if *inner != PascalType::Untyped => {
+                self.llvm_type_for(&self.resolve_type(&inner))
+            }
+            // Untyped pointers step in bytes. (Strings are pointers too,
+            // but `+` on them is concatenation, handled elsewhere.)
+            PascalType::Pointer(_) => self.context.i8_type().as_basic_type_enum(),
+            _ => return Ok(None),
+        };
+        let i64_ty = self.context.i64_type();
+        let base = lhs.into_pointer_value();
+        if rhs.is_int_value() {
+            let mut n = self.to_i64(rhs, span)?;
+            if op == BinOp::Sub {
+                n = self.builder.build_int_neg(n, "neg").map_err(err)?;
+            }
+            let moved = unsafe {
+                self.builder
+                    .build_gep(elem, base, &[n], "ptr_add")
+                    .map_err(err)?
+            };
+            return Ok(Some(moved.into()));
+        }
+        if rhs.is_pointer_value() && op == BinOp::Sub {
+            let a = self
+                .builder
+                .build_ptr_to_int(base, i64_ty, "pa")
+                .map_err(err)?;
+            let b = self
+                .builder
+                .build_ptr_to_int(rhs.into_pointer_value(), i64_ty, "pb")
+                .map_err(err)?;
+            let bytes = self.builder.build_int_sub(a, b, "pdiff").map_err(err)?;
+            let size = elem.size_of().unwrap_or_else(|| i64_ty.const_int(1, false));
+            let count = self
+                .builder
+                .build_int_signed_div(bytes, size, "pcount")
+                .map_err(err)?;
+            return Ok(Some(count.into()));
+        }
+        Ok(None)
+    }
+
     fn compile_binop(
         &mut self,
         op: BinOp,
@@ -6134,6 +6638,9 @@ impl<'ctx> CodeGen<'ctx> {
             return self.compile_short_circuit(op, lhs.into_int_value(), right, span);
         }
         let rhs = self.compile_expr(right)?;
+        if let Some(result) = self.pointer_arithmetic(op, lhs, rhs, left, span)? {
+            return Ok(result);
+        }
         // A char against a one-character string literal (`c = 'x'`)
         // compares characters.
         let is_char = |v: &BasicValueEnum| {
@@ -6723,6 +7230,14 @@ impl<'ctx> CodeGen<'ctx> {
         idx: inkwell::values::IntValue<'ctx>,
         span: Span,
     ) -> Result<(PointerValue<'ctx>, PascalType), CodeGenError> {
+        // A char or boolean index is compared and offset in 64 bits.
+        let idx = if idx.get_type().get_bit_width() < 64 {
+            self.builder
+                .build_int_z_extend(idx, self.context.i64_type(), "idx64")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+        } else {
+            idx
+        };
         match base_type {
             PascalType::Array { lo, hi, elem } => {
                 self.emit_range_check(idx, *lo, *hi, span)?;
@@ -7063,7 +7578,7 @@ impl<'ctx> CodeGen<'ctx> {
                 Some(span),
             )),
         }
-        .inspect(|v| {
+        .inspect(|_| {
             let _ = bool_ty;
         })
     }
@@ -7113,6 +7628,16 @@ impl<'ctx> CodeGen<'ctx> {
     /// The declared type of what an expression names, before widening.
     fn infer_declared_type(&self, expr: &Expr) -> PascalType {
         match expr {
+            Expr::IndirectCall { callee, .. } => {
+                match self.resolve_type(&self.infer_declared_type(callee)) {
+                    PascalType::Proc {
+                        return_type: Some(rt),
+                        ..
+                    } => *rt,
+                    _ => PascalType::Integer,
+                }
+            }
+            Expr::RecordInit { .. } | Expr::ArrayInit { .. } => PascalType::Integer,
             Expr::MethodCall { object, method, .. } => {
                 let ty = self.infer_declared_type(object);
                 self.object_name_of(&ty)
@@ -7163,6 +7688,20 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                     }
                     BinOp::Shl | BinOp::Shr => PascalType::Integer,
+                    BinOp::Add | BinOp::Sub
+                        if matches!(
+                            self.resolve_type(&self.infer_declared_type(left)),
+                            PascalType::Pointer(_)
+                        ) =>
+                    {
+                        let lt = self.infer_declared_type(left);
+                        let rt = self.resolve_type(&self.infer_declared_type(right));
+                        if matches!(rt, PascalType::Pointer(_)) {
+                            PascalType::Integer
+                        } else {
+                            lt
+                        }
+                    }
                     BinOp::RealDiv => PascalType::Real,
                     _ => {
                         let lt = self.infer_expr_type(left);
@@ -7206,6 +7745,9 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 if name == "typeof" {
                     return PascalType::Pointer(Box::new(PascalType::Untyped));
+                }
+                if name == "string" && args.len() == 1 {
+                    return PascalType::String;
                 }
                 if args.len() == 1
                     && let Some(target) = self.cast_target(name)
@@ -7509,7 +8051,7 @@ fn collect_captures_stmt(
             destructor: method,
             ..
         } => {
-            record(target, out, seen);
+            collect_captures_expr(target, locals, parent_types, out, seen);
             if let Some((_, args)) = method {
                 for a in args {
                     collect_captures_expr(a, locals, parent_types, out, seen);
@@ -7526,6 +8068,16 @@ fn collect_captures_stmt(
             for a in args {
                 collect_captures_expr(a, locals, parent_types, out, seen);
             }
+        }
+        Statement::IndirectCall { call, .. } => {
+            collect_captures_expr(call, locals, parent_types, out, seen)
+        }
+        Statement::Str { value, target, .. } => {
+            collect_captures_expr(&value.expr, locals, parent_types, out, seen);
+            for e in value.width.iter().chain(value.precision.iter()) {
+                collect_captures_expr(e, locals, parent_types, out, seen);
+            }
+            collect_captures_expr(target, locals, parent_types, out, seen);
         }
         Statement::ProcCall { args, .. } => {
             for a in args {
@@ -7561,10 +8113,8 @@ fn collect_captures_stmt(
                 }
             }
         }
-        Statement::With {
-            record_var, body, ..
-        } => {
-            record(record_var, out, seen);
+        Statement::With { target, body, .. } => {
+            collect_captures_expr(target, locals, parent_types, out, seen);
             collect_captures(body, locals, parent_types, out, seen);
         }
         Statement::Exit {
@@ -7590,6 +8140,22 @@ fn collect_captures_expr(
     seen: &mut std::collections::HashSet<String>,
 ) {
     match expr {
+        Expr::IndirectCall { callee, args, .. } => {
+            collect_captures_expr(callee, locals, parent_types, out, seen);
+            for a in args {
+                collect_captures_expr(a, locals, parent_types, out, seen);
+            }
+        }
+        Expr::RecordInit { fields, .. } => {
+            for (_, value) in fields {
+                collect_captures_expr(value, locals, parent_types, out, seen);
+            }
+        }
+        Expr::ArrayInit { elements, .. } => {
+            for e in elements {
+                collect_captures_expr(e, locals, parent_types, out, seen);
+            }
+        }
         Expr::MethodCall { object, args, .. } => {
             collect_captures_expr(object, locals, parent_types, out, seen);
             for a in args {

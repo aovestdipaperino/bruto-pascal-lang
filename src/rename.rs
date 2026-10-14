@@ -9,6 +9,13 @@ use crate::ast::*;
 /// occurrence, declarations before uses, in source order.
 pub(crate) trait Rename {
     fn rename(&self, name: &str) -> String;
+
+    /// Called on every expression before its parts are walked, so a pass
+    /// can rewrite the node itself.
+    fn rewrite_expr_node(&self, _expr: &mut Expr) {}
+
+    /// Called on every statement before its parts are walked.
+    fn rewrite_stmt_node(&self, _stmt: &mut Statement) {}
 }
 
 pub(crate) fn rewrite_program<R: Rename>(program: &mut Program, n: &R) {
@@ -27,6 +34,9 @@ pub(crate) fn rewrite_program<R: Rename>(program: &mut Program, n: &R) {
     for v in &mut program.vars {
         for name in &mut v.names {
             *name = n.rename(name);
+        }
+        if let Some(target) = &mut v.absolute {
+            *target = n.rename(target);
         }
         rewrite_type(&mut v.ty, n);
     }
@@ -64,6 +74,9 @@ fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
     for v in &mut p.vars {
         for name in &mut v.names {
             *name = n.rename(name);
+        }
+        if let Some(target) = &mut v.absolute {
+            *target = n.rename(target);
         }
         rewrite_type(&mut v.ty, n);
     }
@@ -112,7 +125,10 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
             if let Some(var) = variant {
                 var.tag_name = n.rename(&var.tag_name);
                 rewrite_type(&mut var.tag_type, n);
-                for (_vals, vfields) in &mut var.variants {
+                for (labels, vfields) in &mut var.variants {
+                    for label in labels.iter_mut() {
+                        rewrite_const_expr(label, n);
+                    }
                     for (fname, fty) in vfields {
                         *fname = n.rename(fname);
                         rewrite_type(fty, n);
@@ -191,7 +207,19 @@ fn rewrite_stmts<R: Rename>(stmts: &mut [Statement], n: &R) {
 }
 
 fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
+    n.rewrite_stmt_node(s);
     match s {
+        Statement::IndirectCall { call, .. } => rewrite_expr(call, n),
+        Statement::Str { value, target, .. } => {
+            rewrite_expr(&mut value.expr, n);
+            if let Some(w) = &mut value.width {
+                rewrite_expr(w, n);
+            }
+            if let Some(p) = &mut value.precision {
+                rewrite_expr(p, n);
+            }
+            rewrite_expr(target, n);
+        }
         Statement::MethodCall {
             object,
             method,
@@ -281,7 +309,7 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
             destructor: method,
             ..
         } => {
-            *target = n.rename(target);
+            rewrite_expr(target, n);
             if let Some((name, args)) = method {
                 *name = n.rename(name);
                 for a in args {
@@ -350,10 +378,8 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
                 rewrite_stmts(eb, n);
             }
         }
-        Statement::With {
-            record_var, body, ..
-        } => {
-            *record_var = n.rename(record_var);
+        Statement::With { target, body, .. } => {
+            rewrite_expr(target, n);
             rewrite_block(body, n);
         }
         Statement::ChainedAssignment {
@@ -389,7 +415,25 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
 }
 
 fn rewrite_expr<R: Rename>(e: &mut Expr, n: &R) {
+    n.rewrite_expr_node(e);
     match e {
+        Expr::IndirectCall { callee, args, .. } => {
+            rewrite_expr(callee, n);
+            for a in args {
+                rewrite_expr(a, n);
+            }
+        }
+        Expr::RecordInit { fields, .. } => {
+            for (name, value) in fields {
+                *name = n.rename(name);
+                rewrite_expr(value, n);
+            }
+        }
+        Expr::ArrayInit { elements, .. } => {
+            for e in elements {
+                rewrite_expr(e, n);
+            }
+        }
         Expr::MethodCall {
             object,
             method,

@@ -446,6 +446,8 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
             init_stmts.extend(init.statements);
         }
     }
+    program.units = visited.iter().cloned().collect();
+    program.units.sort();
     program.consts.splice(0..0, consts);
     program.type_decls.splice(0..0, types);
     program.vars.splice(0..0, vars);
@@ -560,6 +562,8 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         | ast::Statement::ProcCall { span, .. }
         | ast::Statement::Exit { span, .. }
         | ast::Statement::PlaceAssignment { span, .. }
+        | ast::Statement::Str { span, .. }
+        | ast::Statement::IndirectCall { span, .. }
         | ast::Statement::MethodCall { span, .. }
         | ast::Statement::Inherited { span, .. }
         | ast::Statement::Break { span }
@@ -1719,6 +1723,183 @@ end.
     }
 
     #[test]
+    fn fpc_literals_and_declarations() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$MACRO ON}
+{$DEFINE Deref:=^}
+type
+  TPoint = record X, Y: integer; end;
+  TNote = record Text: string; Count: Byte; end;
+resourcestring
+  sHello = 'hello';
+const
+  CrLf = #13#10;
+  Bell = ^G;
+  Mask = %1010;
+  Octal = &17;
+  Mixed = 'A'#$42'C';
+  Origin: TPoint = (X: 3; Y: 4);
+  Primes: array[1..4] of integer = (2, 3, 5, 7);
+  Names: array[Boolean] of string = ('no', 'yes');
+  Empty: TPoint = ();
+  Old = 1 deprecated 'use New';
+var
+  n: TNote;
+  p: ^integer;
+  s: string;
+  i, total: integer;
+function Sum3(a, b, c: integer): integer;
+begin
+  Result := a + b;
+  Result := Result + c
+end;
+begin
+  writeln(length(CrLf), ' ', ord(Bell), ' ', Mask, ' ', Octal, ' ', Mixed);
+  writeln(sHello, ' ', Origin.X + Origin.Y, ' ', Primes[4], ' ', Names[true], ' ', Empty.Y);
+  n.Text := 'note';
+  n.Count := 2;
+  writeln(n.Text, n.Count);
+  new(p);
+  p Deref := 41;
+  inc(p^);
+  writeln(p^);
+  total := 0;
+  for i := 1 to 3 do ;
+  case i of
+    1: writeln('one');
+  otherwise
+    writeln('other ', i)
+  end;
+  Str(42:5, s);
+  writeln('[', s, ']');
+  Str(3.14159:0:2, s);
+  writeln(s);
+  writeln(Sum3(1, 2, 3))
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "2 7 10 15 ABC",
+                "hello 7 7 yes 0",
+                "note2",
+                "42",
+                "other 3",
+                "[   42]",
+                "3.14",
+                "6"
+            ]
+        );
+    }
+
+    #[test]
+    fn untyped_params_absolute_and_pointer_arithmetic() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TBytes = array[0..7] of Byte;
+  PRec = ^TRec;
+  TRec = record A, B: integer; end;
+var
+  r: TRec;
+  q: PRec;
+  w: LongInt;
+  b: TBytes;
+  pb, pe: ^Byte;
+procedure Fill(var Buf; Count: integer; Value: Byte);
+var Bytes: TBytes absolute Buf;
+  i: integer;
+begin
+  for i := 0 to Count - 1 do Bytes[i] := Value
+end;
+function FirstByte(const Data): Byte;
+begin
+  FirstByte := TBytes(Data)[0]
+end;
+begin
+  Fill(b, 8, 7);
+  writeln(b[0] + b[7]);
+  w := $01020304;
+  writeln(FirstByte(w));
+  pb := @b[0];
+  pe := pb + 5;
+  pe^ := 99;
+  writeln(b[5], ' ', pe - pb);
+  with r do begin A := 1; B := 2 end;
+  q := @r;
+  with q^ do writeln(A + B);
+  new(q);
+  q^.A := 10;
+  with q^ do B := A * 2;
+  writeln(q^.B);
+  dispose(q);
+  Pointer(q) := nil;
+  writeln(q = nil)
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["14", "4", "99 5", "3", "20", "true"]);
+    }
+
+    #[test]
+    fn nested_variants_indirect_calls_and_qualifiers() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+const
+  evMouse = 1;
+  evKey = 2;
+type
+  TKind = (kNone, kSome);
+  TEvent = record
+    What: Word;
+    case Word of
+      evMouse: (X, Y: integer);
+      evKey: (
+        case integer of
+          0: (KeyCode: Word);
+          1: (CharCode: char; ScanCode: Byte));
+  end;
+  TTagged = record
+    case Kind: TKind of
+      kNone: ();
+      kSome: (Value: integer);
+  end;
+  TFunc = function(a, b: integer): integer;
+var
+  e: TEvent;
+  t: TTagged;
+  f: Pointer;
+function Add(a, b: integer): integer;
+begin
+  Add := a + b
+end;
+begin
+  e.What := evKey;
+  e.KeyCode := $1E41;
+  writeln(e.CharCode, ' ', e.ScanCode);
+  with e do begin X := 5; Y := 6 end;
+  writeln(e.X + e.Y);
+  t.Kind := kSome;
+  t.Value := 9;
+  writeln(ord(t.Kind), ' ', t.Value);
+  f := @Add;
+  writeln(TFunc(f)(2, 3));
+  writeln(System.Length('abc'))
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["A 30", "11", "1 9", "5", "3"]);
+    }
+
+    #[test]
     fn bare_function_name_is_a_call() {
         let (ok, out) = build_and_run_source(
             "program T;
@@ -2509,6 +2690,20 @@ end.
             match parser.preprocessing_error() {
                 Some(e) => failures.push(format!("{}: {e}", path.display())),
                 None => println!("{}: {} tokens", path.display(), parser.token_count()),
+            }
+            // With FV_PARSE set, also report how far parsing gets.
+            if std::env::var("FV_PARSE").is_ok() {
+                let mut parser = Parser::with_options(
+                    &source,
+                    &parser::ParseOptions {
+                        file: Some(path.clone()),
+                        include_dirs: vec![fv.clone()],
+                    },
+                );
+                match parser.parse_unit() {
+                    Ok(_) => println!("PARSED {}", path.display()),
+                    Err(e) => println!("PARSE-ERROR {}: {e}", path.display()),
+                }
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));

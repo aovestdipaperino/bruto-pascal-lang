@@ -293,6 +293,8 @@ struct Lexer {
     directives: Directives,
     /// Upper-case conditional symbols.
     defines: HashSet<String>,
+    /// `{$DEFINE NAME := text}` macros: upper-case name -> replacement.
+    macros: std::collections::HashMap<String, String>,
     conditions: Vec<Condition>,
     include_dirs: Vec<PathBuf>,
     /// The first preprocessing error (missing include, `{$error}`, ...).
@@ -350,6 +352,7 @@ impl Lexer {
             suspended: Vec::new(),
             directives: Directives::default(),
             defines: predefined_symbols().into_iter().map(String::from).collect(),
+            macros: std::collections::HashMap::new(),
             conditions: Vec::new(),
             include_dirs: options.include_dirs.clone(),
             error: None,
@@ -461,11 +464,18 @@ impl Lexer {
             "define" => {
                 let symbol = first_word(rest);
                 if !symbol.is_empty() {
+                    // `{$DEFINE NAME := text}` (with `{$MACRO ON}`) also makes
+                    // NAME expand to text.
+                    if let Some((_, text)) = rest.split_once(":=") {
+                        self.macros.insert(symbol.clone(), text.trim().to_string());
+                    }
                     self.defines.insert(symbol);
                 }
             }
             "undef" => {
-                self.defines.remove(&first_word(rest));
+                let symbol = first_word(rest);
+                self.macros.remove(&symbol);
+                self.defines.remove(&symbol);
             }
             "error" | "fatal" => self.fail(format!("{{$error}} {rest}"), span),
             "include" => self.include(rest, span),
@@ -567,6 +577,24 @@ impl Lexer {
             }
         }
         None
+    }
+
+    /// Start reading a macro's replacement text at `span`; the current
+    /// source resumes when it ends.
+    fn expand_macro(&mut self, text: &str, span: Span) {
+        if self.suspended.len() >= 64 {
+            self.fail("macros nested too deeply", span);
+            return;
+        }
+        let frame = Frame {
+            chars: std::mem::replace(&mut self.chars, text.chars().collect()),
+            pos: std::mem::replace(&mut self.pos, 0),
+            line: std::mem::replace(&mut self.line, span.line),
+            col: std::mem::replace(&mut self.col, span.column),
+            file: self.file,
+            dir: self.dir.clone(),
+        };
+        self.suspended.push(frame);
     }
 
     /// Resume the file that included the one that just ended.
@@ -689,10 +717,75 @@ impl Lexer {
             let token = self.lex_token();
             // Tokens in a false conditional branch are read (so strings and
             // comments are skipped correctly) and dropped.
-            if self.active() {
-                return token;
+            if !self.active() {
+                continue;
             }
+            // A macro name expands to its text, read as if it were here.
+            if let Tok::Ident(word) = &token.0
+                && let Some(text) = self.macros.get(&word.to_ascii_uppercase()).cloned()
+            {
+                self.expand_macro(&text, token.1);
+                continue;
+            }
+            return token;
         }
+    }
+
+    /// A run of quoted strings and `#n` / `#$hh` character codes with
+    /// nothing between them. Each character is one byte (Latin-1).
+    fn lex_string_sequence(&mut self, span: Span) -> (Tok, Span) {
+        let mut s = String::new();
+        let mut pieces = 0;
+        let mut only_codes = true;
+        loop {
+            match self.peek() {
+                '\'' => {
+                    only_codes = false;
+                    self.advance();
+                    loop {
+                        if self.pos >= self.chars.len() || self.peek() == '\n' {
+                            if self.active() {
+                                self.fail("unterminated string", span);
+                            }
+                            break;
+                        }
+                        if self.peek() == '\'' {
+                            self.advance();
+                            if self.peek() == '\'' {
+                                s.push('\'');
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        } else {
+                            s.push(self.advance());
+                        }
+                    }
+                }
+                '#' => {
+                    self.advance();
+                    let radix = if self.peek() == '$' {
+                        self.advance();
+                        16
+                    } else {
+                        10
+                    };
+                    let digits = |c: char| c.is_digit(radix);
+                    let mut n: u32 = 0;
+                    while self.pos < self.chars.len() && digits(self.peek()) {
+                        let d = self.advance().to_digit(radix).unwrap_or(0);
+                        n = n.wrapping_mul(radix).wrapping_add(d);
+                    }
+                    s.push(char::from(n as u8));
+                }
+                _ => break,
+            }
+            pieces += 1;
+        }
+        if pieces == 1 && only_codes {
+            return (Tok::CharLit(s.chars().next().unwrap_or('\0') as u8), span);
+        }
+        (Tok::StrLit(s), span)
     }
 
     /// Read one token; whitespace and comments have been skipped.
@@ -701,30 +794,10 @@ impl Lexer {
 
         let ch = self.peek();
 
-        // String literal (it can't span lines)
-        if ch == '\'' {
-            self.advance();
-            let mut s = String::new();
-            loop {
-                if self.pos >= self.chars.len() || self.peek() == '\n' {
-                    if self.active() {
-                        self.fail("unterminated string", span);
-                    }
-                    break;
-                }
-                if self.peek() == '\'' {
-                    self.advance();
-                    if self.peek() == '\'' {
-                        s.push('\'');
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                } else {
-                    s.push(self.advance());
-                }
-            }
-            return (Tok::StrLit(s), span);
+        // String and character literals. Adjacent pieces form one string,
+        // as in `'abc'#13#10` or `#27'[201~'`. A lone `#n` is a char.
+        if ch == '\'' || ch == '#' {
+            return self.lex_string_sequence(span);
         }
 
         // Number (integer or real)
@@ -748,23 +821,19 @@ impl Lexer {
             return (Tok::IntLit(n), span);
         }
 
-        // Char literal: #nn
-        if ch == '#' {
-            self.advance();
-            let mut n: u8 = 0;
-            while self.pos < self.chars.len() && self.peek().is_ascii_digit() {
-                n = n.wrapping_mul(10).wrapping_add(self.advance() as u8 - b'0');
-            }
-            return (Tok::CharLit(n), span);
-        }
-
-        // Hex number: $FF
-        if ch == '$' {
+        // Hex `$FF`, binary `%1010` and octal `&17` numbers.
+        let radix = match ch {
+            '$' => Some(16),
+            '%' => Some(2),
+            '&' if self.chars.get(self.pos + 1).is_some_and(|c| c.is_digit(8)) => Some(8),
+            _ => None,
+        };
+        if let Some(radix) = radix {
             self.advance();
             let mut n: i64 = 0;
-            while self.pos < self.chars.len() && self.peek().is_ascii_hexdigit() {
+            while self.pos < self.chars.len() && self.peek().is_digit(radix) {
                 let d = self.advance();
-                n = n * 16 + d.to_digit(16).unwrap_or(0) as i64;
+                n = n.wrapping_mul(radix as i64) + d.to_digit(radix).unwrap_or(0) as i64;
             }
             return (Tok::IntLit(n), span);
         }
@@ -806,7 +875,6 @@ impl Lexer {
                 "nil" => Tok::KwNil,
                 "file" => Tok::KwFile,
                 "packed" => Tok::KwPacked,
-                "text" => Tok::TyText,
                 "for" => Tok::For,
                 "to" => Tok::To,
                 "downto" => Tok::DownTo,
@@ -1192,6 +1260,7 @@ impl Parser {
         Ok(Program {
             name,
             uses,
+            units: Vec::new(),
             labels: decls.labels,
             consts: decls.consts,
             type_decls: decls.type_decls,
@@ -1220,6 +1289,9 @@ impl Parser {
             match self.peek() {
                 Tok::KwLabel => decls.labels.extend(self.parse_label_section()?),
                 Tok::Const => decls.consts.extend(self.parse_const_section()?),
+                Tok::Ident(w) if w.eq_ignore_ascii_case("resourcestring") => {
+                    decls.consts.extend(self.parse_const_section()?)
+                }
                 Tok::KwType => decls.type_decls.extend(self.parse_type_section()?),
                 Tok::Var => decls.vars.extend(self.parse_var_section()?),
                 _ if self.at_routine() => {
@@ -1404,6 +1476,9 @@ impl Parser {
             "export",
             "reintroduce",
             "static",
+            "platform",
+            "experimental",
+            "unimplemented",
         ])?;
         let mut decl = ProcDecl::header(name, kind, params, return_type, span);
         decl.owner = owner;
@@ -1416,10 +1491,15 @@ impl Parser {
         let mut found = Vec::new();
         while let Tok::Ident(word) = self.peek() {
             let lower = word.to_ascii_lowercase();
-            if !names.contains(&lower.as_str()) {
+            let is_hint = lower == "deprecated";
+            if !is_hint && !names.contains(&lower.as_str()) {
                 break;
             }
             self.advance();
+            // `deprecated 'message';`
+            if is_hint && matches!(self.peek(), Tok::StrLit(_)) {
+                self.advance();
+            }
             self.expect(&Tok::Semi)?;
             found.push(lower);
         }
@@ -1453,7 +1533,7 @@ impl Parser {
     fn parse_type_section(&mut self) -> Result<Vec<TypeDecl>, ParseError> {
         self.expect(&Tok::KwType)?;
         let mut decls = Vec::new();
-        while matches!(self.peek(), Tok::Ident(_)) {
+        while self.at_decl_name() {
             let span = self.span();
             let (decl_name, _) = self.expect_ident()?;
             self.expect(&Tok::Eq)?;
@@ -1461,6 +1541,7 @@ impl Parser {
             if let PascalType::Enum { ref mut name, .. } = ty {
                 *name = decl_name.clone();
             }
+            self.skip_hint_directives();
             self.expect(&Tok::Semi)?;
             decls.push(TypeDecl {
                 name: decl_name,
@@ -1479,10 +1560,21 @@ impl Parser {
 
     // ── const section ────────────────────────────────────
 
+    /// Whether the next token is an identifier that is really a section
+    /// keyword (`resourcestring`), ending the current section.
+    fn at_decl_name(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(w) if !w.eq_ignore_ascii_case("resourcestring"))
+    }
+
     fn parse_const_section(&mut self) -> Result<Vec<ConstDecl>, ParseError> {
-        self.expect(&Tok::Const)?;
+        // `resourcestring` sections are string constants.
+        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("resourcestring")) {
+            self.advance();
+        } else {
+            self.expect(&Tok::Const)?;
+        }
         let mut decls = Vec::new();
-        while matches!(self.peek(), Tok::Ident(_)) {
+        while self.at_decl_name() {
             let span = self.span();
             let (name, _) = self.expect_ident()?;
             // Optional type annotation: `name : type = value`
@@ -1493,7 +1585,12 @@ impl Parser {
                 None
             };
             self.expect(&Tok::Eq)?;
-            let value = self.parse_expr()?;
+            let value = if ty.is_some() {
+                self.parse_initializer()?
+            } else {
+                self.parse_expr()?
+            };
+            self.skip_hint_directives();
             self.expect(&Tok::Semi)?;
             decls.push(ConstDecl {
                 name,
@@ -1511,13 +1608,83 @@ impl Parser {
         Ok(decls)
     }
 
+    /// A typed constant's value: an expression, `(Field: value; ...)` for
+    /// a record, or `(value, value, ...)` for an array, nested as needed.
+    fn parse_initializer(&mut self) -> Result<Expr, ParseError> {
+        if *self.peek() != Tok::LParen {
+            return self.parse_expr();
+        }
+        let span = self.span();
+        // `()`: a record with every field left zero.
+        if matches!(self.tokens.get(self.pos + 1), Some((Tok::RParen, _))) {
+            self.advance();
+            self.advance();
+            return Ok(Expr::RecordInit {
+                fields: Vec::new(),
+                span,
+            });
+        }
+        let is_record = matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
+            && matches!(self.tokens.get(self.pos + 2), Some((Tok::Colon, _)));
+        if is_record {
+            self.advance();
+            let mut fields = Vec::new();
+            while *self.peek() != Tok::RParen {
+                let (name, _) = self.expect_ident()?;
+                self.expect(&Tok::Colon)?;
+                fields.push((name, self.parse_initializer()?));
+                if *self.peek() == Tok::Semi {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen)?;
+            return Ok(Expr::RecordInit { fields, span });
+        }
+        // `(a, b, ...)` is an array; a single `(e)` is just a parenthesised
+        // expression, possibly the start of a longer one.
+        let start = self.pos;
+        self.advance();
+        let mut elements = vec![self.parse_initializer()?];
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            elements.push(self.parse_initializer()?);
+        }
+        if elements.len() == 1 {
+            self.pos = start;
+            return self.parse_expr();
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(Expr::ArrayInit { elements, span })
+    }
+
+    /// Skip FPC hint directives after a declaration: `deprecated
+    /// ['message']`, `platform`, `experimental`, `unimplemented`,
+    /// `library`.
+    fn skip_hint_directives(&mut self) {
+        while let Tok::Ident(word) = self.peek() {
+            let word = word.to_ascii_lowercase();
+            if !matches!(
+                word.as_str(),
+                "deprecated" | "platform" | "experimental" | "unimplemented" | "library"
+            ) {
+                return;
+            }
+            self.advance();
+            if word == "deprecated" && matches!(self.peek(), Tok::StrLit(_)) {
+                self.advance();
+            }
+        }
+    }
+
     // ── var section ──────────────────────────────────────
 
     fn parse_var_section(&mut self) -> Result<Vec<VarDecl>, ParseError> {
         self.expect(&Tok::Var)?;
         let mut decls = Vec::new();
         // Parse var declarations until we see 'begin' or another section keyword
-        while matches!(self.peek(), Tok::Ident(_)) {
+        while self.at_decl_name() {
             decls.push(self.parse_var_decl()?);
             self.expect(&Tok::Semi)?;
         }
@@ -1542,7 +1709,21 @@ impl Parser {
         }
         self.expect(&Tok::Colon)?;
         let ty = self.parse_type()?;
-        Ok(VarDecl { names, ty, span })
+        // `x: T absolute y`: x shares y's memory.
+        let absolute = if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("absolute"))
+        {
+            self.advance();
+            Some(self.expect_ident()?.0)
+        } else {
+            None
+        };
+        self.skip_hint_directives();
+        Ok(VarDecl {
+            names,
+            ty,
+            absolute,
+            span,
+        })
     }
 
     fn parse_type(&mut self) -> Result<PascalType, ParseError> {
@@ -1581,16 +1762,15 @@ impl Parser {
         }
         if *self.peek() == Tok::KwFile {
             self.advance();
-            self.expect(&Tok::KwOf)?;
-            let elem = self.parse_type()?;
+            // `file of T`, or an untyped `file` read and written in blocks.
+            let elem = if *self.peek() == Tok::KwOf {
+                self.advance();
+                self.parse_type()?
+            } else {
+                PascalType::Untyped
+            };
             return Ok(PascalType::File {
                 elem: Box::new(elem),
-            });
-        }
-        if *self.peek() == Tok::TyText {
-            self.advance();
-            return Ok(PascalType::File {
-                elem: Box::new(PascalType::Char),
             });
         }
         if *self.peek() == Tok::KwArray {
@@ -1645,7 +1825,7 @@ impl Parser {
                 // Optional length: `string[N]` — accepted but treated as plain string
                 if *self.peek() == Tok::LBracket {
                     self.advance();
-                    let _n = self.parse_int_literal()?;
+                    let _n = self.parse_const_bound()?;
                     self.expect(&Tok::RBracket)?;
                 }
                 Ok(PascalType::String)
@@ -1659,8 +1839,16 @@ impl Parser {
                 Ok(PascalType::Char)
             }
             Tok::Ident(name) => {
-                let name = name.clone();
+                let mut name = name.clone();
                 self.advance();
+                // `Objects.TRect`: units share one namespace here, so the
+                // unit qualifier is dropped.
+                while *self.peek() == Tok::Dot
+                    && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
+                {
+                    self.advance();
+                    name = self.expect_ident()?.0;
+                }
                 Ok(PascalType::Named(name))
             }
             _ => Err(ParseError {
@@ -1694,6 +1882,26 @@ impl Parser {
 
         let mut dimensions = Vec::new();
         loop {
+            // An index type (`array[Boolean]`, `array[TColor]`) instead of
+            // a range: its bounds are `low(T)..high(T)`.
+            let index_type = match (self.peek(), self.tokens.get(self.pos + 1)) {
+                (Tok::TyBoolean, _) => Some("boolean".to_string()),
+                (Tok::TyChar, _) => Some("char".to_string()),
+                (Tok::Ident(name), Some((Tok::RBracket | Tok::Comma, _))) => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(type_name) = index_type {
+                self.advance();
+                let bound = |f: &str| {
+                    ConstExpr::Call(f.to_string(), Box::new(ConstExpr::Name(type_name.clone())))
+                };
+                dimensions.push((bound("low"), bound("high")));
+                if *self.peek() != Tok::Comma {
+                    break;
+                }
+                self.advance();
+                continue;
+            }
             let lo = self.parse_const_bound()?;
             self.expect(&Tok::DotDot)?;
             let hi = self.parse_const_bound()?;
@@ -1876,23 +2084,43 @@ impl Parser {
 
     fn parse_variant_part(&mut self) -> Result<RecordVariant, ParseError> {
         self.expect(&Tok::KwCase)?;
-        let (tag_name, _) = self.expect_ident()?;
-        self.expect(&Tok::Colon)?;
-        let tag_type = self.parse_type()?;
+        // `case Tag: T of` or, with no tag field, `case T of`.
+        let (tag_name, tag_type) = if matches!(self.tokens.get(self.pos + 1), Some((Tok::Colon, _)))
+        {
+            let (tag_name, _) = self.expect_ident()?;
+            self.expect(&Tok::Colon)?;
+            (tag_name, self.parse_type()?)
+        } else {
+            (String::new(), self.parse_type()?)
+        };
         self.expect(&Tok::KwOf)?;
 
         let mut variants = Vec::new();
-        while *self.peek() != Tok::End {
+        while *self.peek() != Tok::End && *self.peek() != Tok::RParen {
             let mut values = Vec::new();
-            values.push(self.parse_int_literal()?);
+            values.push(self.parse_const_bound()?);
             while *self.peek() == Tok::Comma {
                 self.advance();
-                values.push(self.parse_int_literal()?);
+                values.push(self.parse_const_bound()?);
             }
             self.expect(&Tok::Colon)?;
             self.expect(&Tok::LParen)?;
             let mut vfields = Vec::new();
             while *self.peek() != Tok::RParen {
+                // A nested variant part: kept as an unnamed field holding an
+                // anonymous variant record, whose fields are found by name.
+                if *self.peek() == Tok::KwCase {
+                    let nested = self.parse_variant_part()?;
+                    vfields.push((
+                        String::new(),
+                        PascalType::Record {
+                            fields: Vec::new(),
+                            variant: Some(Box::new(nested)),
+                            object: None,
+                        },
+                    ));
+                    continue;
+                }
                 let mut names = Vec::new();
                 let (first, _) = self.expect_ident()?;
                 names.push(first);
@@ -1995,12 +2223,23 @@ impl Parser {
             });
         }
 
-        let mode = if *self.peek() == Tok::Var {
-            self.advance();
-            ParamMode::Var
-        } else {
-            ParamMode::Value
+        // `var`, `out` and `constref` pass by reference; `const` passes a
+        // typed value by value and an untyped one by reference.
+        let keyword = match self.peek() {
+            Tok::Var => Some("var"),
+            Tok::Const => Some("const"),
+            Tok::Ident(w)
+                if w.eq_ignore_ascii_case("out")
+                    && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _))) =>
+            {
+                Some("out")
+            }
+            Tok::Ident(w) if w.eq_ignore_ascii_case("constref") => Some("constref"),
+            _ => None,
         };
+        if keyword.is_some() {
+            self.advance();
+        }
         let mut names = Vec::new();
         let (first, _) = self.expect_ident()?;
         names.push(first);
@@ -2009,8 +2248,20 @@ impl Parser {
             let (name, _) = self.expect_ident()?;
             names.push(name);
         }
+        if *self.peek() != Tok::Colon && keyword.is_some() {
+            // Untyped: `var Buf` / `const Data`, always by reference.
+            return Ok(ParamGroup {
+                mode: ParamMode::Var,
+                names,
+                ty: PascalType::Untyped,
+            });
+        }
         self.expect(&Tok::Colon)?;
         let ty = self.parse_type()?;
+        let mode = match keyword {
+            Some("var" | "out" | "constref") => ParamMode::Var,
+            _ => ParamMode::Value,
+        };
         Ok(ParamGroup { mode, names, ty })
     }
 
@@ -2122,6 +2373,16 @@ impl Parser {
             self.tokens[self.pos].0 = Tok::Ident(word.to_string());
         }
 
+        // An empty statement: `while Busy do;`, `begin ; end`.
+        if matches!(self.peek(), Tok::Semi | Tok::End | Tok::Else | Tok::Until) {
+            let span = self.span();
+            return Ok(Statement::Block(Block {
+                statements: Vec::new(),
+                span,
+                end_span: span,
+            }));
+        }
+
         match self.peek() {
             Tok::Begin => Ok(Statement::Block(self.parse_block()?)),
             Tok::If => self.parse_if(),
@@ -2219,6 +2480,20 @@ impl Parser {
     fn parse_ident_statement(&mut self) -> Result<Statement, ParseError> {
         let span = self.span();
         let (name, _) = self.expect_ident()?;
+
+        // `str(x:width:precision, s)`: the value takes write-style formats.
+        if name.eq_ignore_ascii_case("str") && *self.peek() == Tok::LParen {
+            self.advance();
+            let value = self.parse_write_arg()?;
+            self.expect(&Tok::Comma)?;
+            let target = self.parse_expr()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(Statement::Str {
+                value,
+                target,
+                span,
+            });
+        }
 
         // Collect chain of postfix accesses (.field, [index], ^)
         let mut chain: Vec<LValueAccess> = Vec::new();
@@ -2346,6 +2621,21 @@ impl Parser {
                 }
             }
             self.expect(&Tok::RParen)?;
+            // `TProc(p)(args);`: call the procedural value a cast gives.
+            if *self.peek() == Tok::LParen {
+                let call = self.parse_postfix(Expr::Call { name, args, span }, span)?;
+                return Ok(Statement::IndirectCall { call, span });
+            }
+            // `Pointer(P) := nil`: assignment through a type cast.
+            if *self.peek() == Tok::Assign {
+                self.advance();
+                let expr = self.parse_expr()?;
+                return Ok(Statement::PlaceAssignment {
+                    target: Expr::Call { name, args, span },
+                    expr,
+                    span,
+                });
+            }
             // `Cast(x)^.Field := value` and the like: a call (usually a type
             // cast) followed by postfix operators is an assignment target.
             if matches!(self.peek(), Tok::Caret | Tok::Dot | Tok::LBracket) {
@@ -2565,7 +2855,10 @@ impl Parser {
             if *self.peek() == Tok::End {
                 break;
             }
-            if *self.peek() == Tok::Else {
+            // `else`, or FPC's `otherwise`.
+            let is_else = *self.peek() == Tok::Else
+                || matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("otherwise"));
+            if is_else {
                 self.advance();
                 let mut stmts = Vec::new();
                 if *self.peek() != Tok::End {
@@ -2625,10 +2918,15 @@ impl Parser {
     fn parse_with(&mut self) -> Result<Statement, ParseError> {
         let span = self.span();
         self.expect(&Tok::KwWith)?;
-        let (record_var, _) = self.expect_ident()?;
+        // `with a, b do s` means `with a do with b do s`.
+        let mut targets = vec![self.parse_expr()?];
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            targets.push(self.parse_expr()?);
+        }
         self.expect(&Tok::Do)?;
         let body_stmt = self.parse_statement()?;
-        let body = match body_stmt {
+        let mut body = match body_stmt {
             Statement::Block(b) => b,
             other => {
                 let s = other.span();
@@ -2639,18 +2937,25 @@ impl Parser {
                 }
             }
         };
-        Ok(Statement::With {
-            record_var,
-            body,
-            span,
-        })
+        while let Some(target) = targets.pop() {
+            let statement = Statement::With { target, body, span };
+            if targets.is_empty() {
+                return Ok(statement);
+            }
+            body = Block {
+                span,
+                end_span: span,
+                statements: vec![statement],
+            };
+        }
+        unreachable!("with has at least one target")
     }
 
     fn parse_new(&mut self) -> Result<Statement, ParseError> {
         let span = self.span();
         self.advance(); // consume 'new'
         self.expect(&Tok::LParen)?;
-        let (target, _) = self.expect_ident()?;
+        let target = self.parse_expr()?;
         let constructor = self.parse_optional_method_arg()?;
         self.expect(&Tok::RParen)?;
         Ok(Statement::New {
@@ -2664,7 +2969,7 @@ impl Parser {
         let span = self.span();
         self.advance(); // consume 'dispose'
         self.expect(&Tok::LParen)?;
-        let (target, _) = self.expect_ident()?;
+        let target = self.parse_expr()?;
         let destructor = self.parse_optional_method_arg()?;
         self.expect(&Tok::RParen)?;
         Ok(Statement::Dispose {
@@ -2931,6 +3236,15 @@ impl Parser {
                     self.advance();
                     expr = Expr::Deref(Box::new(expr), span);
                 }
+                // `Cast(p)(args)`: call the procedural value just computed.
+                Tok::LParen if matches!(expr, Expr::Call { .. } | Expr::IndirectCall { .. }) => {
+                    let args = self.parse_call_args()?;
+                    expr = Expr::IndirectCall {
+                        callee: Box::new(expr),
+                        args,
+                        span,
+                    };
+                }
                 _ => return Ok(expr),
             }
         }
@@ -2991,6 +3305,55 @@ impl Parser {
                     span,
                 })
             }
+            // `^M^J`: control characters (`^A` is #1). Several in a row
+            // form a string.
+            Tok::Caret
+                if matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(w), _))
+                    if w.len() == 1 && w.as_bytes()[0].is_ascii_alphabetic()) =>
+            {
+                let span = self.span();
+                let mut text = String::new();
+                while *self.peek() == Tok::Caret
+                    && let Some((Tok::Ident(w), _)) = self.tokens.get(self.pos + 1)
+                    && w.len() == 1
+                    && w.as_bytes()[0].is_ascii_alphabetic()
+                {
+                    let code = w.as_bytes()[0].to_ascii_uppercase() - b'@';
+                    text.push(char::from(code));
+                    self.advance();
+                    self.advance();
+                }
+                Ok(if text.chars().count() == 1 {
+                    Expr::CharLit(text.as_bytes()[0], span)
+                } else {
+                    Expr::StrLit(text, span)
+                })
+            }
+            // `String(x)`: a cast to string.
+            Tok::TyString if matches!(self.tokens.get(self.pos + 1), Some((Tok::LParen, _))) => {
+                let span = self.span();
+                self.advance();
+                let args = self.parse_call_args()?;
+                Ok(Expr::Call {
+                    name: "string".to_string(),
+                    args,
+                    span,
+                })
+            }
+            // A type name used as a value, as in `SizeOf(Real)`.
+            Tok::TyInteger | Tok::TyReal | Tok::TyChar | Tok::TyBoolean | Tok::TyString
+                if !matches!(self.tokens.get(self.pos + 1), Some((Tok::LParen, _))) =>
+            {
+                let span = self.span();
+                let name = match self.advance().0 {
+                    Tok::TyInteger => "integer",
+                    Tok::TyReal => "real",
+                    Tok::TyChar => "char",
+                    Tok::TyBoolean => "boolean",
+                    _ => "string",
+                };
+                Ok(Expr::Var(name.to_string(), span))
+            }
             Tok::TyInteger | Tok::TyReal | Tok::TyChar | Tok::TyBoolean
                 if self
                     .tokens
@@ -3039,10 +3402,12 @@ impl Parser {
                 self.parse_postfix(expr, span)
             }
             Tok::LParen => {
+                let span = self.span();
                 self.advance();
                 let expr = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;
-                Ok(expr)
+                // `(p + n)^`, `(x).Field`: postfix operators apply too.
+                self.parse_postfix(expr, span)
             }
             Tok::LBracket => {
                 self.advance();

@@ -35,6 +35,10 @@ impl Span {
 pub struct Program {
     pub name: String,
     pub uses: Vec<String>,
+    /// Every unit loaded for this program (lower case), direct or not,
+    /// filled in when `uses` is resolved. `Unit.Name` qualifiers naming
+    /// these are dropped by the semantic pass.
+    pub units: Vec<String>,
     pub labels: Vec<i64>,
     pub consts: Vec<ConstDecl>,
     pub type_decls: Vec<TypeDecl>,
@@ -160,6 +164,8 @@ impl ProcDecl {
 pub struct VarDecl {
     pub names: Vec<String>,
     pub ty: PascalType,
+    /// `absolute other`: the variables share `other`'s memory.
+    pub absolute: Option<String>,
     pub span: Span,
 }
 
@@ -317,7 +323,20 @@ impl ConstExpr {
             }
             Expr::Call { name, args, .. } if args.len() == 1 => {
                 let lower = name.to_ascii_lowercase();
-                if !matches!(lower.as_str(), "ord" | "chr" | "succ" | "pred" | "abs") {
+                if !matches!(
+                    lower.as_str(),
+                    "ord"
+                        | "chr"
+                        | "succ"
+                        | "pred"
+                        | "abs"
+                        | "length"
+                        | "sizeof"
+                        | "low"
+                        | "high"
+                        | "lo"
+                        | "hi"
+                ) {
                     return None;
                 }
                 ConstExpr::Call(lower, Box::new(ConstExpr::from_expr(&args[0])?))
@@ -362,7 +381,9 @@ pub struct MethodHeader {
 pub struct RecordVariant {
     pub tag_name: String,
     pub tag_type: PascalType,
-    pub variants: Vec<(Vec<i64>, Vec<(String, PascalType)>)>, // (case_values, fields)
+    /// (case labels, fields). Labels are folded to `ConstExpr::Int` by the
+    /// semantic pass.
+    pub variants: Vec<(Vec<ConstExpr>, Vec<(String, PascalType)>)>,
 }
 
 /// A begin/end block containing statements.
@@ -426,13 +447,13 @@ pub enum Statement {
     },
     /// `new(p)`, or `new(p, Init(args))` to construct an object.
     New {
-        target: String,
+        target: Expr,
         constructor: Option<(String, Vec<Expr>)>,
         span: Span,
     },
     /// `dispose(p)`, or `dispose(p, Done)` to destroy an object first.
     Dispose {
-        target: String,
+        target: Expr,
         destructor: Option<(String, Vec<Expr>)>,
         span: Span,
     },
@@ -441,6 +462,19 @@ pub enum Statement {
         object: Expr,
         method: String,
         args: Vec<Expr>,
+        span: Span,
+    },
+    /// `str(value[:width[:precision]], target)`: format a number into a
+    /// string variable.
+    Str {
+        value: WriteArg,
+        target: Expr,
+        span: Span,
+    },
+    /// A call through a computed procedural value, as a statement:
+    /// `TErrorProc(StreamError)(Self)`.
+    IndirectCall {
+        call: Expr,
         span: Span,
     },
     /// `inherited Method(args)` as a statement.
@@ -493,9 +527,10 @@ pub enum Statement {
         label: i64,
         span: Span,
     },
-    /// With statement: `with record_var do statement`
+    /// With statement: `with target do statement`, where the target is a
+    /// record or object (a variable, `p^`, a field, a cast...).
     With {
-        record_var: String,
+        target: Expr,
         body: Block,
         span: Span,
     },
@@ -568,6 +603,8 @@ impl Statement {
             | Self::With { span, .. }
             | Self::Exit { span, .. }
             | Self::PlaceAssignment { span, .. }
+            | Self::Str { span, .. }
+            | Self::IndirectCall { span, .. }
             | Self::MethodCall { span, .. }
             | Self::Inherited { span, .. }
             | Self::Break { span }
@@ -654,6 +691,22 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// A call through a computed procedural value: `TFunc(p)(args)`.
+    IndirectCall {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    /// A typed constant's record value: `(X: 1; Y: 2)`.
+    RecordInit {
+        fields: Vec<(String, Expr)>,
+        span: Span,
+    },
+    /// A typed constant's array value: `(1, 2, 3)`.
+    ArrayInit {
+        elements: Vec<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -677,6 +730,9 @@ impl Expr {
             | Self::AddrOf(_, span)
             | Self::MethodCall { span, .. }
             | Self::Inherited { span, .. }
+            | Self::RecordInit { span, .. }
+            | Self::ArrayInit { span, .. }
+            | Self::IndirectCall { span, .. }
             | Self::Call { span, .. }
             | Self::Index { span, .. }
             | Self::FieldAccess { span, .. }

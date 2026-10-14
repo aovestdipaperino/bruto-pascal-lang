@@ -46,6 +46,7 @@ pub struct Resolved {
 pub fn resolve_program(program: &Program) -> Result<Resolved, SemaError> {
     let mut program = program.clone();
     let display_names = fold_identifier_case(&mut program);
+    strip_unit_qualifiers(&mut program);
     let program = fold_constant_bounds(&program)?;
     Ok(Resolved {
         program,
@@ -60,6 +61,84 @@ pub fn fold_identifier_case(program: &mut Program) -> HashMap<String, String> {
     let folder = CaseFolder::default();
     rewrite_program(program, &folder);
     folder.first_spelling.into_inner()
+}
+
+/// Drop `Unit.` qualifiers: units share one namespace here, so
+/// `Video.InitVideo` is just `InitVideo`. Only the names of loaded units
+/// (and `System`) count, and only when the program doesn't declare
+/// something of the same name itself.
+fn strip_unit_qualifiers(program: &mut Program) {
+    let declared: HashSet<String> = program
+        .vars
+        .iter()
+        .flat_map(|v| v.names.iter().cloned())
+        .chain(program.consts.iter().map(|c| c.name.clone()))
+        .chain(program.type_decls.iter().map(|t| t.name.clone()))
+        .chain(program.procedures.iter().map(|p| p.name.clone()))
+        .collect();
+    let units: HashSet<String> = program
+        .units
+        .iter()
+        .map(|u| u.to_ascii_lowercase())
+        .chain(std::iter::once("system".to_string()))
+        .filter(|u| !declared.contains(u))
+        .collect();
+    rewrite_program(program, &UnitQualifiers { units });
+}
+
+struct UnitQualifiers {
+    units: HashSet<String>,
+}
+
+impl UnitQualifiers {
+    fn is_unit(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Var(name, _) if self.units.contains(name))
+    }
+}
+
+impl Rename for UnitQualifiers {
+    fn rename(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn rewrite_expr_node(&self, expr: &mut Expr) {
+        let replacement = match expr {
+            Expr::FieldAccess {
+                record,
+                field,
+                span,
+            } if self.is_unit(record) => Expr::Var(field.clone(), *span),
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                span,
+            } if self.is_unit(object) => Expr::Call {
+                name: method.clone(),
+                args: std::mem::take(args),
+                span: *span,
+            },
+            _ => return,
+        };
+        *expr = replacement;
+    }
+
+    fn rewrite_stmt_node(&self, stmt: &mut Statement) {
+        if let Statement::MethodCall {
+            object,
+            method,
+            args,
+            span,
+        } = stmt
+            && self.is_unit(object)
+        {
+            *stmt = Statement::ProcCall {
+                name: method.clone(),
+                args: std::mem::take(args),
+                span: *span,
+            };
+        }
+    }
 }
 
 #[derive(Default)]
@@ -93,11 +172,18 @@ fn fold_constant_bounds(program: &Program) -> Result<Program, SemaError> {
     for c in &program.consts {
         // Typed constants are initialised variables in Turbo Pascal, so
         // they can't appear where a true constant is required.
-        if c.ty.is_none()
-            && let Some(value) = ConstExpr::from_expr(&c.value).and_then(|e| env.eval(&e).ok())
-        {
-            env.values.insert(c.name.clone(), value);
+        if c.ty.is_none() {
+            if let Expr::StrLit(text, _) = &c.value {
+                env.string_lengths
+                    .insert(c.name.clone(), text.chars().count() as i64);
+            }
+            if let Some(value) = ConstExpr::from_expr(&c.value).and_then(|e| env.eval(&e).ok()) {
+                env.values.insert(c.name.clone(), value);
+            }
         }
+    }
+    for td in &program.type_decls {
+        env.add_type_bounds(&td.name, &td.ty);
     }
 
     let mut out = program.clone();
@@ -124,6 +210,23 @@ struct ConstEnv {
     values: HashMap<String, i64>,
     /// Names of the program's own types, which hide built-in type names.
     user_types: HashSet<String>,
+    /// Lengths of untyped string constants, for `length(C)`.
+    string_lengths: HashMap<String, i64>,
+    /// Bounds of enumeration and subrange types, for `low(T)` / `high(T)`.
+    type_bounds: HashMap<String, (i64, i64)>,
+}
+
+/// The size in bytes of a built-in type, for `sizeof` in constants.
+fn builtin_size(name: &str) -> Option<i64> {
+    Some(match name {
+        "byte" | "shortint" | "int8" | "uint8" | "char" | "ansichar" | "boolean" => 1,
+        "word" | "smallint" | "int16" | "uint16" => 2,
+        "longint" | "longword" | "cardinal" | "dword" | "int32" | "uint32" => 4,
+        "integer" | "int64" | "qword" | "uint64" | "ptrint" | "ptruint" | "sizeint"
+        | "sizeuint" | "nativeint" | "nativeuint" | "real" | "double" | "pointer"
+        | "codepointer" | "string" => 8,
+        _ => return None,
+    })
 }
 
 /// The built-in type a (lower-case) name stands for, if it is one of
@@ -140,6 +243,9 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
         "qword" | "uint64" | "ptruint" | "sizeuint" | "nativeuint" => sized(64, false),
         "int64" | "ptrint" | "sizeint" | "nativeint" => PascalType::Integer,
         "pointer" | "codepointer" => PascalType::Pointer(Box::new(PascalType::Untyped)),
+        "text" => PascalType::File {
+            elem: Box::new(PascalType::Char),
+        },
         _ => return None,
     })
 }
@@ -181,16 +287,72 @@ impl ConstEnv {
                     ConstOp::Shr => ((l as u64).wrapping_shr(r as u32)) as i64,
                 }
             }
+            ConstExpr::Call(name, arg)
+                if matches!(name.as_str(), "length" | "sizeof" | "low" | "high") =>
+            {
+                let ConstExpr::Name(subject) = arg.as_ref() else {
+                    return Err(format!("{name}() of this isn't a constant"));
+                };
+                match name.as_str() {
+                    "length" => *self
+                        .string_lengths
+                        .get(subject)
+                        .ok_or_else(|| format!("'{subject}' is not a string constant"))?,
+                    "sizeof" => builtin_size(subject)
+                        .ok_or_else(|| format!("sizeof({subject}) isn't known here"))?,
+                    _ => {
+                        let (lo, hi) = self
+                            .bounds_of(subject)
+                            .ok_or_else(|| format!("'{subject}' has no bounds"))?;
+                        if name == "low" { lo } else { hi }
+                    }
+                }
+            }
             ConstExpr::Call(name, arg) => {
                 let v = self.eval(arg)?;
                 match name.as_str() {
                     "succ" => v + 1,
                     "pred" => v - 1,
                     "abs" => v.abs(),
+                    "lo" => v & 0xFF,
+                    "hi" => (v >> 8) & 0xFF,
                     // `ord` and `chr` only change the type, not the value.
                     _ => v,
                 }
             }
+        })
+    }
+
+    /// Record the bounds of an enumeration or subrange type, or of an
+    /// alias of a type whose bounds are known.
+    fn add_type_bounds(&mut self, name: &str, ty: &PascalType) {
+        let bounds = match ty {
+            PascalType::Enum { values, .. } => Some((0, values.len() as i64 - 1)),
+            PascalType::Subrange { lo, hi } => Some((*lo, *hi)),
+            PascalType::SubrangeExpr { lo, hi } => self.eval(lo).ok().zip(self.eval(hi).ok()),
+            PascalType::Named(other) => self.bounds_of(other),
+            _ => None,
+        };
+        if let Some(bounds) = bounds {
+            self.type_bounds.insert(name.to_string(), bounds);
+        }
+    }
+
+    /// `low(T)..high(T)` for an ordinal type name.
+    fn bounds_of(&self, name: &str) -> Option<(i64, i64)> {
+        if let Some(b) = self.type_bounds.get(name) {
+            return Some(*b);
+        }
+        Some(match name {
+            "boolean" => (0, 1),
+            "char" | "byte" | "uint8" | "ansichar" => (0, 255),
+            "shortint" | "int8" => (-128, 127),
+            "smallint" | "int16" => (-32768, 32767),
+            "word" | "uint16" => (0, 65535),
+            "longint" | "int32" => (i32::MIN as i64, i32::MAX as i64),
+            "longword" | "cardinal" | "dword" | "uint32" => (0, u32::MAX as i64),
+            "integer" | "int64" | "ptrint" | "sizeint" | "nativeint" => (i64::MIN, i64::MAX),
+            _ => return None,
         })
     }
 
@@ -288,7 +450,10 @@ impl ConstEnv {
                 }
                 if let Some(v) = variant {
                     self.resolve_type(&mut v.tag_type, span)?;
-                    for (_, vfields) in &mut v.variants {
+                    for (labels, vfields) in &mut v.variants {
+                        for label in labels.iter_mut() {
+                            *label = ConstExpr::Int(self.eval_at(label, span)?);
+                        }
                         for (_, t) in vfields {
                             self.resolve_type(t, span)?;
                         }

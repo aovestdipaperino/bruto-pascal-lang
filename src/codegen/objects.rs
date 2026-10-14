@@ -351,17 +351,25 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    /// If `name` is a method of the object whose method is being compiled
-    /// (and no local variable hides it), that object's name.
-    pub(super) fn self_method(&self, name: &str) -> Option<String> {
-        let object = self.current_object.clone()?;
+    /// If `name` (not hidden by a variable) is a method of an object named
+    /// by an enclosing `with`, or of the object whose method is being
+    /// compiled, that object type and the instance to call it on.
+    pub(super) fn implicit_method(&self, name: &str) -> Option<(String, PointerValue<'ctx>)> {
         if self.variables.contains_key(name) {
             return None;
         }
-        self.objects[&object]
-            .methods
-            .contains_key(name)
-            .then_some(object)
+        let has = |object: &str| self.objects[object].methods.contains_key(name);
+        if let Some((object, ptr)) = self.with_objects.iter().rev().find(|(o, _)| has(o)) {
+            return Some((object.clone(), *ptr));
+        }
+        let object = self.current_object.clone()?;
+        let ctx = self.method_context?;
+        has(&object).then_some((object, ctx.self_ptr))
+    }
+
+    /// The object type `implicit_method` would call `name` on.
+    pub(super) fn self_method(&self, name: &str) -> Option<String> {
+        self.implicit_method(name).map(|(object, _)| object)
     }
 
     /// Call `method` on `receiver`.
