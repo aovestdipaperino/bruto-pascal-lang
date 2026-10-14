@@ -161,6 +161,7 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
         PascalType::Proc {
             params,
             return_type,
+            ..
         } => {
             for p in params {
                 rewrite_type(p, n);

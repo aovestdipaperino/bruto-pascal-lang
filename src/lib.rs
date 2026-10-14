@@ -2021,6 +2021,128 @@ end.
     }
 
     #[test]
+    fn overloaded_routines() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+function Describe(n: integer): string;
+begin
+  Describe := 'int'
+end;
+function Describe(s: string): string;
+begin
+  Describe := 'string ' + s
+end;
+function Describe(a, b: integer): string;
+begin
+  Result := 'pair'
+end;
+procedure Show(r: real);
+begin
+  writeln('real ', r:0:1)
+end;
+procedure Show(c: char);
+begin
+  writeln('char ', c)
+end;
+procedure Early;
+begin
+  Late
+end;
+procedure Late;
+begin
+  writeln('late')
+end;
+begin
+  writeln(Describe(1), ' / ', Describe('x'), ' / ', Describe(1, 2));
+  Show(2.5);
+  Show('z');
+  Early
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(
+            lines,
+            ["int / string x / pair", "real 2.5", "char z", "late"]
+        );
+    }
+
+    #[test]
+    fn nested_procedural_values() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TProcParam = procedure(Item: Pointer) is nested;
+  TFunBoolParam = function(Item: Pointer): Boolean is nested;
+  TList = object
+    Items: array[0..4] of LongInt;
+    Count: integer;
+    procedure ForEach(Action: TProcParam);
+    function FirstThat(Test: TFunBoolParam): Pointer;
+  end;
+procedure TList.ForEach(Action: TProcParam);
+var i: integer;
+begin
+  for i := 0 to Count - 1 do Action(@Items[i])
+end;
+function TList.FirstThat(Test: TFunBoolParam): Pointer;
+var i: integer;
+begin
+  FirstThat := nil;
+  for i := 0 to Count - 1 do
+    if Test(@Items[i]) then
+    begin
+      FirstThat := @Items[i];
+      exit
+    end
+end;
+function Call(F: TFunBoolParam; P: Pointer): Boolean;
+begin
+  Call := F(P)
+end;
+function IsBig(Item: Pointer): Boolean;
+begin
+  IsBig := PLongInt(Item)^ > 1000
+end;
+procedure Run;
+var
+  L: TList;
+  total, limit: LongInt;
+  found: PLongInt;
+  i: integer;
+  procedure Add(Item: Pointer);
+  begin
+    total := total + PLongInt(Item)^
+  end;
+  function Above(Item: Pointer): Boolean;
+  begin
+    Above := PLongInt(Item)^ > limit
+  end;
+begin
+  L.Count := 5;
+  for i := 0 to 4 do L.Items[i] := (i + 1) * 10;
+  total := 0;
+  L.ForEach(@Add);
+  writeln(total);
+  limit := 25;
+  found := L.FirstThat(@Above);
+  writeln(found^);
+  limit := 100;
+  writeln(L.FirstThat(@Above) = nil);
+  writeln(Call(IsBig, @L.Items[0]), ' ', Call(@Above, @L.Items[0]))
+end;
+begin
+  Run
+end.
+",
+        );
+        assert!(ok);
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, ["150", "30", "true", "false false"]);
+    }
+
+    #[test]
     fn bare_function_name_is_a_call() {
         let (ok, out) = build_and_run_source(
             "program T;

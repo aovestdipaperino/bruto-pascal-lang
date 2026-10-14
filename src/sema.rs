@@ -47,6 +47,7 @@ pub fn resolve_program(program: &Program) -> Result<Resolved, SemaError> {
     let mut program = program.clone();
     let display_names = fold_identifier_case(&mut program);
     strip_unit_qualifiers(&mut program);
+    name_overloads(&mut program);
     let program = fold_constant_bounds(&program)?;
     Ok(Resolved {
         program,
@@ -61,6 +62,58 @@ pub fn fold_identifier_case(program: &mut Program) -> HashMap<String, String> {
     let folder = CaseFolder::default();
     rewrite_program(program, &folder);
     folder.first_spelling.into_inner()
+}
+
+/// Give each distinct signature of an overloaded top-level routine its
+/// own name: the first keeps the routine's name, the others become
+/// `name$2`, `name$3`... A `forward` header and its implementation share
+/// one (the implementation may leave out its parameters). Calls are
+/// matched to an overload by argument types during code generation.
+fn name_overloads(program: &mut Program) {
+    let signature = |p: &ProcDecl| {
+        let params: Vec<String> = p
+            .params
+            .iter()
+            .flat_map(|g| {
+                g.names
+                    .iter()
+                    .map(move |_| format!("{:?} {:?}", g.mode, g.ty))
+            })
+            .collect();
+        format!("{params:?} -> {:?}", p.return_type)
+    };
+    let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for proc in program.procedures.iter_mut().filter(|p| p.owner.is_none()) {
+        let variants = by_name.entry(proc.name.clone()).or_default();
+        // An implementation without parameters matches its forward header.
+        let key = if proc.params.is_empty()
+            && proc.return_type.is_none()
+            && !proc.is_forward
+            && variants.len() == 1
+        {
+            variants[0].0.clone()
+        } else {
+            signature(proc)
+        };
+        let symbol = match variants.iter().find(|(k, _)| *k == key) {
+            Some((_, symbol)) => symbol.clone(),
+            None => {
+                let symbol = if variants.is_empty() {
+                    proc.name.clone()
+                } else {
+                    format!("{}${}", proc.name, variants.len() + 1)
+                };
+                variants.push((key, symbol.clone()));
+                symbol
+            }
+        };
+        proc.name = symbol;
+    }
+    program.overloads = by_name
+        .into_iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(name, v)| (name, v.into_iter().map(|(_, s)| s).collect()))
+        .collect();
 }
 
 /// Drop `Unit.` qualifiers: units share one namespace here, so
@@ -506,6 +559,7 @@ impl ConstEnv {
             PascalType::Proc {
                 params,
                 return_type,
+                ..
             } => {
                 for p in params {
                     self.resolve_type(p, span)?;

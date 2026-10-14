@@ -306,10 +306,14 @@ struct Lexer {
 
 /// The conditional symbols FPC would define for the host, plus `BRUTO`.
 fn predefined_symbols() -> Vec<&'static str> {
+    // `CPULLVM`: FPC's LLVM code generator, which Bruto also is. Code that
+    // checks for it (`objects.pp`'s typed nested callbacks) then takes the
+    // path that doesn't rely on raw frame pointers.
     let mut symbols = vec![
         "FPC",
         "BRUTO",
         "CPU64",
+        "CPULLVM",
         "ENDIAN_LITTLE",
         "FPC_LITTLE_ENDIAN",
     ];
@@ -1278,6 +1282,7 @@ impl Parser {
             name,
             uses,
             units: Vec::new(),
+            overloads: std::collections::HashMap::new(),
             labels: decls.labels,
             consts: decls.consts,
             type_decls: decls.type_decls,
@@ -2321,9 +2326,25 @@ impl Parser {
         } else {
             None
         };
+        // `is nested`: a closure over a local routine; `of object`: a
+        // method pointer (parsed, treated like a plain procedural value).
+        let mut nested = false;
+        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("is"))
+            && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(w), _)) if w.eq_ignore_ascii_case("nested"))
+        {
+            self.advance();
+            self.advance();
+            nested = true;
+        } else if *self.peek() == Tok::KwOf
+            && matches!(self.tokens.get(self.pos + 1), Some((Tok::KwObject, _)))
+        {
+            self.advance();
+            self.advance();
+        }
         Ok(PascalType::Proc {
             params,
             return_type,
+            nested,
         })
     }
 

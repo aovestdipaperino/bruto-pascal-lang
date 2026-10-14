@@ -361,6 +361,11 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?
                     .into()
             }
+            // FPC's frame intrinsics. Bruto's nested procedural values
+            // carry their own environment, so the frame is never needed.
+            ("get_frame" | "get_pc_addr", 0) | ("get_caller_frame", 1 | 2) => {
+                ptr.const_null().into()
+            }
             ("paramcount", 0) => {
                 let argc = self.argc_value(span)?;
                 self.builder
@@ -439,11 +444,15 @@ impl<'ctx> CodeGen<'ctx> {
         Some(match (name, arg_count) {
             ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) => PascalType::Integer,
             ("paramstr", 1) => PascalType::String,
+            ("get_frame" | "get_pc_addr", 0) | ("get_caller_frame", 1 | 2) => {
+                PascalType::Pointer(Box::new(PascalType::Untyped))
+            }
             _ => return None,
         })
     }
 
-    /// System variables: `FileMode` (2, read/write) and `ExitCode`.
+    /// System variables: `FileMode` (2, read/write), `ExitCode`, and the
+    /// file-handle constants (`UnusedHandle` is -1).
     /// Declared before the program's globals, which can hide them.
     pub(super) fn declare_system_variables(&mut self) {
         let byte = PascalType::SizedInt {
@@ -454,7 +463,15 @@ impl<'ctx> CodeGen<'ctx> {
             bits: 32,
             signed: true,
         };
-        for (name, ty, initial) in [("filemode", byte, 2u64), ("exitcode", longint, 0)] {
+        for (name, ty, initial) in [
+            ("filemode", byte, 2u64),
+            ("exitcode", longint.clone(), 0),
+            // File handle constants.
+            ("unusedhandle", longint.clone(), u64::MAX),
+            ("stdinputhandle", longint.clone(), 0),
+            ("stdoutputhandle", longint.clone(), 1),
+            ("stderrorhandle", longint, 2),
+        ] {
             let llvm_ty = self.llvm_type_for(&ty).into_int_type();
             let global = self
                 .module

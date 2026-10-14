@@ -469,6 +469,29 @@ impl<'ctx> CodeGen<'ctx> {
         args: &[Expr],
         span: Span,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
+        // `TAncestor.Method(...)` inside a method: that type's
+        // implementation, called on Self without virtual dispatch.
+        if let Expr::Var(type_name, _) = object
+            && self.lookup_var(type_name).is_none()
+            && self.objects.contains_key(type_name)
+        {
+            let ctx = self.method_context.ok_or_else(|| {
+                CodeGenError::new(
+                    format!(
+                        "'{}.{method}' needs an object to call it on",
+                        self.display(type_name)
+                    ),
+                    Some(span),
+                )
+            })?;
+            let receiver = Receiver {
+                object: type_name,
+                self_ptr: ctx.self_ptr,
+                dispatch: Dispatch::Static,
+                vmt: None,
+            };
+            return self.call_method(receiver, method, args, span);
+        }
         let (self_ptr, ty) = self.resolve_array_base(object, span)?;
         let name = self.object_name_of(&ty).ok_or_else(|| {
             CodeGenError::new(

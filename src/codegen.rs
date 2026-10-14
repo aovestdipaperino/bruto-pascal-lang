@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
+mod closures;
 mod objects;
 mod strings;
 mod system;
@@ -133,6 +134,8 @@ pub struct CodeGen<'ctx> {
     loop_targets: Vec<(BasicBlock<'ctx>, BasicBlock<'ctx>)>,
     // How many pointers `create_debug_type` is currently inside.
     debug_pointer_depth: std::cell::Cell<u32>,
+    // Overloaded routines: base name -> one symbol per signature.
+    overloads: HashMap<String, Vec<String>>,
     // Compiling a `System.X` call: built-ins win over methods and the
     // program's own routines.
     bypass_user: bool,
@@ -236,6 +239,7 @@ impl<'ctx> CodeGen<'ctx> {
             objects: HashMap::new(),
             with_objects: Vec::new(),
             bypass_user: false,
+            overloads: HashMap::new(),
             current_object: None,
             method_context: None,
             current_function: None,
@@ -411,6 +415,7 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(|e| CodeGenError::new(e.message, Some(e.span)))?;
         self.display_names = resolved.display_names;
         let program = &resolved.program;
+        self.overloads = program.overloads.clone();
         self.emit_runtime_decls();
         if self.instrument {
             self.emit_prof_decls();
@@ -534,6 +539,17 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     None => self.declare_global(name, &var_decl.ty, var_decl.span),
                 }
+            }
+        }
+
+        // Declare every routine's prototype first, so any body can call
+        // any routine (a unit's implementation calls routines implemented
+        // further down; calls to overloads are resolved by signature).
+        for proc in &program.procedures {
+            if proc.owner.is_none() && !proc.is_forward {
+                let mut header = proc.clone();
+                header.is_forward = true;
+                self.compile_proc_decl(&header)?;
             }
         }
 
@@ -1585,8 +1601,9 @@ impl<'ctx> CodeGen<'ctx> {
         let saved_object = self.current_object.clone();
         let saved_method_context = self.method_context;
         // A routine nested in a method is its own function: it reaches the
-        // object's fields through captures, not the method's Self.
-        self.current_object = None;
+        // object's fields through captures, and its `Self` is captured too
+        // (set up below, once the captures are bound).
+        let enclosing_object = self.current_object.take();
         self.method_context = None;
         if let Some((owner, _)) = &method {
             let self_param = func.get_nth_param(0).unwrap().into_pointer_value();
@@ -1600,6 +1617,16 @@ impl<'ctx> CodeGen<'ctx> {
             self.current_object = Some(owner.clone());
             self.method_context = Some(objects::MethodContext { self_ptr });
             self.bind_object_fields(owner, self_ptr, proc.span)?;
+        }
+
+        // Nested in a method: the object's methods are reachable through
+        // the captured `Self`.
+        if method.is_none()
+            && let (Some(object), Some(self_ptr)) =
+                (enclosing_object, self.variables.get("self").copied())
+        {
+            self.current_object = Some(object);
+            self.method_context = Some(objects::MethodContext { self_ptr });
         }
 
         // Function result variable (Pascal assigns to function name)
@@ -1619,6 +1646,11 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
             self.variables.insert(proc.name.clone(), alloca);
             self.var_types.insert(proc.name.clone(), ret_ty.clone());
+            // An overload (`name$2`) assigns its result by its plain name.
+            if let Some((base, _)) = proc.name.split_once('$') {
+                self.variables.insert(base.to_string(), alloca);
+                self.var_types.insert(base.to_string(), ret_ty.clone());
+            }
             // `Result` names the same variable (FPC's objfpc and Delphi
             // modes), unless a parameter is called that.
             if !self.variables.contains_key("result") {
@@ -1679,6 +1711,14 @@ impl<'ctx> CodeGen<'ctx> {
                 &mut found,
                 &mut seen,
             );
+            // Inside a method, a nested routine can call the object's
+            // methods by bare name, so it always gets `Self`.
+            if self.current_object.is_some()
+                && !seen.contains("self")
+                && let Some(self_ty) = self.var_types.get("self").cloned()
+            {
+                found.push(("self".to_string(), self_ty));
+            }
             self.proc_captures.insert(nested.name.clone(), found);
         }
 
@@ -3303,6 +3343,8 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
+        let resolved_name = self.resolve_overload(name, args);
+        let name = resolved_name.as_str();
         // Inside a method, the object's methods hide routines of the same
         // name.
         if let Some((object, self_ptr)) = self.implicit_method(name) {
@@ -3327,36 +3369,15 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return Ok(());
         }
-        // Indirect call through a procedural parameter
-        if let Some(PascalType::Proc {
-            params: ptypes,
-            return_type,
-        }) = self.lookup_var_type(name).cloned()
-        {
-            let alloca = *self.lookup_var(name).unwrap();
-            let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            let fp = self
+        // A call through a procedural variable or parameter.
+        if let Some(proc_ty) = self.procedural_var_type(name) {
+            let slot = *self.lookup_var(name).unwrap();
+            let target = self
                 .builder
-                .build_load(ptr_ty, alloca, "fp")
+                .build_load(self.context.ptr_type(AddressSpace::default()), slot, "proc")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 .into_pointer_value();
-            let mut llvm_params: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
-            for p in &ptypes {
-                llvm_params.push(self.llvm_type_for(p).into());
-            }
-            let fn_type = if let Some(rt) = &return_type {
-                self.llvm_type_for(rt).fn_type(&llvm_params, false)
-            } else {
-                self.context.void_type().fn_type(&llvm_params, false)
-            };
-            let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-            for arg in args {
-                let v = self.compile_expr(arg)?;
-                call_args.push(v.into());
-            }
-            self.builder
-                .build_indirect_call(fn_type, fp, &call_args, "")
-                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.call_procedural(target, &proc_ty, args, span)?;
             return Ok(());
         }
         if self.module.get_function(name).is_none() && self.compile_system_proc(name, args, span)? {
@@ -3565,23 +3586,7 @@ impl<'ctx> CodeGen<'ctx> {
         args: &[Expr],
         span: Span,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
-        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
-        let PascalType::Proc {
-            params,
-            return_type,
-        } = self.resolve_type(&self.infer_declared_type(callee))
-        else {
-            return Err(CodeGenError::new(
-                "only a procedural value can be called this way",
-                Some(span),
-            ));
-        };
-        if params.len() != args.len() {
-            return Err(CodeGenError::new(
-                format!("expected {} arguments, found {}", params.len(), args.len()),
-                Some(span),
-            ));
-        }
+        let proc_ty = self.infer_declared_type(callee);
         let target = self.compile_expr(callee)?;
         if !target.is_pointer_value() {
             return Err(CodeGenError::new(
@@ -3589,28 +3594,13 @@ impl<'ctx> CodeGen<'ctx> {
                 Some(span),
             ));
         }
-        let mut param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
-        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-        for (param, arg) in params.iter().zip(args) {
-            let param = self.resolve_type(param);
-            param_types.push(self.abi_type_for(&param).into());
-            let val = self.compile_expr(arg)?;
-            call_args.push(self.convert_for_store(val, &param, span)?.into());
-        }
-        let fn_type = match &return_type {
-            Some(rt) => self.abi_type_for(rt).fn_type(&param_types, false),
-            None => self.context.void_type().fn_type(&param_types, false),
-        };
-        let result = self
-            .builder
-            .build_indirect_call(fn_type, target.into_pointer_value(), &call_args, "icall")
-            .map_err(err)?
-            .try_as_basic_value()
-            .basic();
-        match (result, return_type) {
-            (Some(v), Some(rt)) => Ok(Some(self.widen_loaded(v, &rt, span)?)),
-            (v, _) => Ok(v),
-        }
+        self.call_procedural(target.into_pointer_value(), &proc_ty, args, span)
+    }
+
+    /// The procedural type of variable `name`, if it is one.
+    fn procedural_var_type(&self, name: &str) -> Option<PascalType> {
+        let ty = self.resolve_type(self.lookup_var_type(name)?);
+        matches!(ty, PascalType::Proc { .. }).then_some(ty)
     }
 
     /// `str(value[:width[:precision]], target)`. A precision formats the
@@ -4232,29 +4222,39 @@ impl<'ctx> CodeGen<'ctx> {
             }
 
             if is_proc_param {
-                if let Expr::Var(vname, _) = arg {
-                    if let Some(PascalType::Proc { .. }) = self.lookup_var_type(vname.as_str()) {
-                        let alloca = *self.lookup_var(vname.as_str()).unwrap();
-                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                        let fp = self
-                            .builder
-                            .build_load(ptr_ty, alloca, "argfp")
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                        call_args.push(fp.into());
-                    } else if let Some(target_fn) = self.module.get_function(vname) {
-                        call_args.push(target_fn.as_global_value().as_pointer_value().into());
-                    } else {
-                        return Err(CodeGenError::new(
-                            format!("'{vname}' is not a procedure or function"),
-                            Some(span),
-                        ));
-                    }
-                } else {
-                    return Err(CodeGenError::new(
-                        "procedural parameter requires a procedure or function name",
-                        Some(span),
-                    ));
+                // A routine name (or `@Routine`) gives its code, or for an
+                // `is nested` parameter a closure over its environment; any
+                // other expression is already a procedural value.
+                let param_ty = pinfo.map(|(_, _, t)| self.resolve_type(t)).unwrap();
+                let routine = match arg {
+                    Expr::Var(n, _) => Some(n),
+                    Expr::AddrOf(inner, _) => match inner.as_ref() {
+                        Expr::Var(n, _) => Some(n),
+                        _ => None,
+                    },
+                    _ => None,
                 }
+                .filter(|n| self.lookup_var(n).is_none())
+                .cloned();
+                let value: BasicValueEnum = match routine {
+                    Some(r) if matches!(param_ty, PascalType::Proc { nested: true, .. }) => {
+                        self.make_closure(&r, &param_ty, span)?.into()
+                    }
+                    Some(r) => self
+                        .module
+                        .get_function(&r)
+                        .ok_or_else(|| {
+                            CodeGenError::new(
+                                format!("'{r}' is not a procedure or function"),
+                                Some(span),
+                            )
+                        })?
+                        .as_global_value()
+                        .as_pointer_value()
+                        .into(),
+                    None => self.compile_expr(arg)?,
+                };
+                call_args.push(value.into());
                 pi += 1;
                 continue;
             }
@@ -4891,6 +4891,27 @@ impl<'ctx> CodeGen<'ctx> {
                 // `@Proc` is the routine's code address.
                 if let Some(f) = self.routine_name(inner) {
                     return Ok(f.as_global_value().as_pointer_value().into());
+                }
+                // `@TType.Method`: the code of that type's implementation.
+                if let Expr::FieldAccess { record, field, .. } = inner.as_ref()
+                    && let Expr::Var(type_name, _) = record.as_ref()
+                    && self.lookup_var(type_name).is_none()
+                    && let Some(info) = self.objects.get(type_name)
+                {
+                    let method = info.methods.get(field).ok_or_else(|| {
+                        CodeGenError::new(
+                            format!("'{}' has no method '{field}'", self.display(type_name)),
+                            Some(*span),
+                        )
+                    })?;
+                    return Ok(match self.module.get_function(&method.symbol) {
+                        Some(f) => f.as_global_value().as_pointer_value().into(),
+                        None => self
+                            .abstract_error_fn()
+                            .as_global_value()
+                            .as_pointer_value()
+                            .into(),
+                    });
                 }
                 let (ptr, _) = self.resolve_array_base(inner, *span)?;
                 Ok(ptr.into())
@@ -5862,47 +5883,24 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     return Ok(result);
                 }
-                // Indirect call through a procedural parameter.
-                if let Some(PascalType::Proc {
-                    params: ptypes,
-                    return_type,
-                }) = self.lookup_var_type(name.as_str()).cloned()
-                {
-                    let alloca = *self.lookup_var(name.as_str()).unwrap();
-                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let fp = self
+                // A call through a procedural variable or parameter.
+                if let Some(proc_ty) = self.procedural_var_type(name) {
+                    let slot = *self.lookup_var(name.as_str()).unwrap();
+                    let target = self
                         .builder
-                        .build_load(ptr_ty, alloca, "fp")
+                        .build_load(self.context.ptr_type(AddressSpace::default()), slot, "proc")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                         .into_pointer_value();
-                    // Build the function type from the procedural signature.
-                    let mut llvm_params: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
-                    for p in &ptypes {
-                        llvm_params.push(self.llvm_type_for(p).into());
-                    }
-                    let fn_type = if let Some(rt) = &return_type {
-                        self.llvm_type_for(rt).fn_type(&llvm_params, false)
-                    } else {
-                        self.context.void_type().fn_type(&llvm_params, false)
-                    };
-                    // Build call args
-                    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-                    for (i, arg) in args.iter().enumerate() {
-                        let _ = i;
-                        let v = self.compile_expr(arg)?;
-                        call_args.push(v.into());
-                    }
-                    let ret = self
-                        .builder
-                        .build_indirect_call(fn_type, fp, &call_args, "icall")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    return ret.try_as_basic_value().basic().ok_or_else(|| {
-                        CodeGenError::new(
-                            format!("procedural variable '{name}' does not return a value"),
-                            Some(*span),
-                        )
-                    });
+                    return self
+                        .call_procedural(target, &proc_ty, args, *span)?
+                        .ok_or_else(|| {
+                            CodeGenError::new(
+                                format!("procedural variable '{name}' does not return a value"),
+                                Some(*span),
+                            )
+                        });
                 }
+                let name = &self.resolve_overload(name, args);
                 if !self.proc_return_types.contains_key(name.as_str())
                     && let Some(value) = self.compile_system_func(name, args, *span)?
                 {
@@ -6241,6 +6239,7 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Proc {
                 params,
                 return_type,
+                nested,
             } => PascalType::Proc {
                 params: params
                     .iter()
@@ -6249,6 +6248,7 @@ impl<'ctx> CodeGen<'ctx> {
                 return_type: return_type
                     .as_ref()
                     .map(|t| Box::new(self.resolve_type_at(t, behind_pointer))),
+                nested: *nested,
             },
             PascalType::ConformantArray {
                 lo_name,
@@ -7882,6 +7882,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::Call { name, args, .. } => {
+                let name = &self.resolve_overload(name, args);
                 if let Some(object) = self.self_method(name) {
                     return self
                         .method_result_type(&object, name)
@@ -8028,6 +8029,56 @@ impl<'ctx> CodeGen<'ctx> {
         let is_field = matches!(&info.record, PascalType::Record { fields, .. }
             if fields.iter().any(|(n, _)| n == field));
         !is_field && info.methods.contains_key(field)
+    }
+
+    /// The routine a call to `name` with `args` means: `name` itself, or
+    /// for an overloaded name, the overload whose parameters best fit the
+    /// argument types.
+    fn resolve_overload(&self, name: &str, args: &[Expr]) -> String {
+        let Some(candidates) = self.overloads.get(name) else {
+            return name.to_string();
+        };
+        let score = |symbol: &String| -> Option<i32> {
+            let params = self.proc_param_modes.get(symbol)?;
+            if params.len() != args.len() {
+                return None;
+            }
+            let mut total = 0;
+            for ((_, mode, param), arg) in params.iter().zip(args) {
+                let param = self.resolve_type(param);
+                let arg_ty = self.resolve_type(&self.infer_declared_type(arg));
+                total += if param == arg_ty {
+                    3
+                } else if *mode == ParamMode::Var && param == PascalType::Untyped {
+                    1
+                } else {
+                    match (&param, &arg_ty) {
+                        (
+                            PascalType::Integer | PascalType::SizedInt { .. },
+                            PascalType::Integer | PascalType::SizedInt { .. },
+                        )
+                        | (PascalType::Real, PascalType::Integer | PascalType::SizedInt { .. })
+                        | (
+                            PascalType::String | PascalType::ShortString { .. },
+                            PascalType::String | PascalType::ShortString { .. },
+                        ) => 2,
+                        (
+                            PascalType::Pointer(_) | PascalType::Proc { .. },
+                            PascalType::Pointer(_),
+                        ) => 1,
+                        (PascalType::Char, PascalType::String) => 1,
+                        _ => return None,
+                    }
+                };
+            }
+            Some(total)
+        };
+        candidates
+            .iter()
+            .filter_map(|s| score(s).map(|n| (n, s)))
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// If `expr` is the bare name of a procedure or function (not shadowed

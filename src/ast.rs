@@ -39,6 +39,9 @@ pub struct Program {
     /// filled in when `uses` is resolved. `Unit.Name` qualifiers naming
     /// these are dropped by the semantic pass.
     pub units: Vec<String>,
+    /// Overloaded routine names: the base name -> one symbol per distinct
+    /// signature (`name`, `name$2`, ...). Filled by the semantic pass.
+    pub overloads: std::collections::HashMap<String, Vec<String>>,
     pub labels: Vec<i64>,
     pub consts: Vec<ConstDecl>,
     pub type_decls: Vec<TypeDecl>,
@@ -231,9 +234,12 @@ pub enum PascalType {
     },
     /// Procedural type — function pointer with a known signature.
     /// `return_type = None` means procedure (void); Some => function.
+    /// A `nested` one (`... is nested`) is a closure that can hold a
+    /// local routine together with the variables it uses.
     Proc {
         params: Vec<PascalType>,
         return_type: Option<Box<PascalType>>,
+        nested: bool,
     },
     /// Conformant array parameter (ISO 7185):
     ///   `array[lo..hi: integer] of T`

@@ -207,6 +207,7 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
         PascalType::Proc {
             params,
             return_type,
+            ..
         } => {
             for p in params {
                 collect_type(p, n);
