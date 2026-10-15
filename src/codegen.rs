@@ -2428,6 +2428,24 @@ impl<'ctx> CodeGen<'ctx> {
         ) {
             return self.compile_method_pointer(expr);
         }
+        // A PChar stored into a string: its characters are copied, as FPC
+        // does (the C string may be a buffer about to change).
+        if self.resolve_type(target) == PascalType::String
+            && self.arc
+            && !self.in_runtime
+            && matches!(
+                self.resolve_type(&self.infer_declared_type(expr)),
+                PascalType::Pointer(ref inner) if **inner == PascalType::Char
+            )
+        {
+            let value = self.compile_expr(expr)?;
+            if value.is_pointer_value() {
+                return Ok(self
+                    .call_ustr_runtime("bruto_astr_from_pchar", &[value.into()], expr.span())?
+                    .unwrap());
+            }
+            return Ok(value);
+        }
         if matches!(self.resolve_type(target), PascalType::Pointer(_))
             && self.is_addressable(expr)
             && matches!(
@@ -5035,8 +5053,13 @@ impl<'ctx> CodeGen<'ctx> {
                 // By reference: the address of the variable, element, field
                 // or dereferenced pointer. Anything else (a constant passed
                 // to an untyped `const` parameter) goes through a temporary.
+                let untyped = matches!(pinfo, Some((_, _, PascalType::Untyped)));
                 let address = if self.is_addressable(arg) {
                     self.resolve_array_base(arg, span)?.0
+                } else if untyped && matches!(arg, Expr::StrLit(..) | Expr::CodePageStrLit(..)) {
+                    // A string constant passed to an untyped parameter: its
+                    // characters, as FPC passes them.
+                    self.compile_expr(arg)?.into_pointer_value()
                 } else {
                     let val = self.compile_expr(arg)?;
                     let temp = self
@@ -9371,6 +9394,20 @@ impl<'ctx> CodeGen<'ctx> {
                     ) => 2,
                     (PascalType::Pointer(_) | PascalType::Proc { .. }, PascalType::Pointer(_)) => 1,
                     (PascalType::Char, PascalType::String) => 1,
+                    (
+                        PascalType::Enum { .. } | PascalType::Subrange { .. },
+                        PascalType::Enum { .. }
+                        | PascalType::Subrange { .. }
+                        | PascalType::Integer
+                        | PascalType::SizedInt { .. },
+                    )
+                    | (
+                        PascalType::Integer | PascalType::SizedInt { .. },
+                        PascalType::Enum { .. } | PascalType::Subrange { .. },
+                    )
+                    | (PascalType::Set { .. }, PascalType::Set { .. })
+                    | (PascalType::ClassOf(_), PascalType::ClassOf(_) | PascalType::Pointer(_))
+                    | (PascalType::Pointer(_), PascalType::ClassOf(_)) => 1,
                     _ => return None,
                 }
             };

@@ -586,15 +586,32 @@ impl<'ctx> CodeGen<'ctx> {
         if candidates.len() < 2 {
             return method.to_string();
         }
-        candidates
-            .into_iter()
+        let best = candidates
+            .iter()
             .filter_map(|k| {
-                self.overload_score(&info.methods[k].symbol, args)
-                    .map(|n| (n, k))
+                self.overload_score(&info.methods[*k].symbol, args)
+                    .map(|n| (n, *k))
             })
             .max_by_key(|(n, k)| (*n, std::cmp::Reverse(k.len())))
-            .map(|(_, k)| k.clone())
-            .unwrap_or_else(|| method.to_string())
+            .map(|(_, k)| k.clone());
+        if let Some(best) = best {
+            return best;
+        }
+        // No overload's types fit for sure: the only one taking that many
+        // arguments, if there is one.
+        let by_count: Vec<&&String> = candidates
+            .iter()
+            .filter(|k| {
+                let symbol = &info.methods[**k].symbol;
+                self.proc_param_modes
+                    .get(symbol)
+                    .is_some_and(|p| p.len() == self.with_defaults(symbol, args).len())
+            })
+            .collect();
+        match by_count.as_slice() {
+            [only] => (**only).clone(),
+            _ => method.to_string(),
+        }
     }
 
     /// Call `method` on `receiver`.
@@ -762,9 +779,10 @@ impl<'ctx> CodeGen<'ctx> {
             && self.is_class_name(type_name)
             && self.objects[type_name.as_str()]
                 .methods
-                .get(method)
+                .get(&self.method_overload(type_name, method, args))
                 .is_some_and(|m| m.kind == RoutineKind::Constructor || m.is_class_method)
         {
+            let method = &self.method_overload(type_name, method, args);
             let class = Some(self.vmt_of(type_name));
             return self.call_method(
                 Receiver {

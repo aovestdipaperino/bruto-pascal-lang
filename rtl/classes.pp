@@ -95,6 +95,29 @@ type
     procedure Assign(Source: TPersistent); virtual;
   end;
 
+  { A component: owned components are freed with their owner. }
+  TComponent = class(TPersistent)
+  private
+    FOwner: TComponent;
+    FName: string;
+    FTag: PtrInt;
+    FComponents: TFPList;
+    function GetComponent(Index: Integer): TComponent;
+    function GetComponentCount: Integer;
+  public
+    constructor Create(AOwner: TComponent); virtual;
+    destructor Destroy; override;
+    procedure InsertComponent(AComponent: TComponent);
+    procedure RemoveComponent(AComponent: TComponent);
+    function FindComponent(const AName: string): TComponent;
+    property Owner: TComponent read FOwner;
+    property Name: string read FName write FName;
+    property Tag: PtrInt read FTag write FTag;
+    property Components[Index: Integer]: TComponent read GetComponent;
+    property ComponentCount: Integer read GetComponentCount;
+  end;
+  TComponentClass = class of TComponent;
+
   TSeekOrigin = (soBeginning, soCurrent, soEnd);
 
   TStream = class(TObject)
@@ -697,6 +720,76 @@ begin
     Source.AssignTo(Self)
   else
     raise EConvertError.Create('Cannot assign a nil to a ' + ClassName + '.');
+end;
+
+{ TComponent }
+
+constructor TComponent.Create(AOwner: TComponent);
+begin
+  inherited Create;
+  if AOwner <> nil then
+    AOwner.InsertComponent(Self);
+end;
+
+destructor TComponent.Destroy;
+var
+  C: TComponent;
+begin
+  if FComponents <> nil then
+  begin
+    while FComponents.Count > 0 do
+    begin
+      C := TComponent(FComponents.Last);
+      RemoveComponent(C);
+      C.Free;
+    end;
+    FComponents.Free;
+    FComponents := nil;
+  end;
+  if FOwner <> nil then
+    FOwner.RemoveComponent(Self);
+  inherited Destroy;
+end;
+
+procedure TComponent.InsertComponent(AComponent: TComponent);
+begin
+  if FComponents = nil then
+    FComponents := TFPList.Create;
+  FComponents.Add(AComponent);
+  AComponent.FOwner := Self;
+end;
+
+procedure TComponent.RemoveComponent(AComponent: TComponent);
+begin
+  if FComponents <> nil then
+    FComponents.Remove(AComponent);
+  AComponent.FOwner := nil;
+end;
+
+function TComponent.FindComponent(const AName: string): TComponent;
+var
+  I: Integer;
+begin
+  Result := nil;
+  if FComponents <> nil then
+    for I := 0 to FComponents.Count - 1 do
+      if CompareText(TComponent(FComponents[I]).Name, AName) = 0 then
+        Exit(TComponent(FComponents[I]));
+end;
+
+function TComponent.GetComponent(Index: Integer): TComponent;
+begin
+  if FComponents = nil then
+    raise ListIndexError(Index);
+  Result := TComponent(FComponents[Index]);
+end;
+
+function TComponent.GetComponentCount: Integer;
+begin
+  if FComponents = nil then
+    Result := 0
+  else
+    Result := FComponents.Count;
 end;
 
 { TStream }

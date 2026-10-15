@@ -57,6 +57,8 @@ function bruto_astr_from_buf(P: Pointer; Len: Int64): Pointer;
 function bruto_astr_from_char(C: Int64): Pointer;
 { A string holding the C string P, whose memory (from malloc) is freed. }
 function bruto_astr_adopt(P: Pointer): Pointer;
+{ A copy of the C string at P (nil: the empty string). }
+function bruto_astr_from_pchar(P: Pointer): Pointer;
 function bruto_astr_concat(A, B: Pointer): Pointer;
 function bruto_astr_compare(A, B: Pointer): Int64;
 function bruto_astr_copy(S: Pointer; Index, Count: Int64): Pointer;
@@ -273,6 +275,14 @@ begin
   if Len < 0 then
     Len := 0;
   bruto_astr_alloc := bruto_string_block(Len, Len + 1);
+end;
+
+function bruto_astr_from_pchar(P: Pointer): Pointer;
+begin
+  if P = nil then
+    bruto_astr_from_pchar := nil
+  else
+    bruto_astr_from_pchar := bruto_astr_from_buf(P, bruto_strlen(P));
 end;
 
 function bruto_astr_from_buf(P: Pointer; Len: Int64): Pointer;

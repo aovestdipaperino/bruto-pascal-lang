@@ -39,6 +39,15 @@ const UNITS: &[(&str, &str)] = &[
     ("netdb.pp", include_str!("../rtl/netdb.pp")),
     ("netobjects.pp", include_str!("../rtl/netobjects.pp")),
     ("classes.pp", include_str!("../rtl/classes.pp")),
+    ("openssl.pp", include_str!("../rtl/openssl.pp")),
+    ("ssockets.pp", include_str!("../rtl/ssockets.pp")),
+    ("sslbase.pp", include_str!("../rtl/sslbase.pp")),
+    ("sslsockets.pp", include_str!("../rtl/sslsockets.pp")),
+    (
+        "opensslsockets.pp",
+        include_str!("../rtl/opensslsockets.pp"),
+    ),
+    ("fphttpclient.pp", include_str!("../rtl/fphttpclient.pp")),
 ];
 
 /// The directory the built-in units are written to.

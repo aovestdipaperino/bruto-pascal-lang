@@ -4405,6 +4405,139 @@ end.
         assert_eq!(out, "FALSE\n***\n");
     }
 
+    // TLS through FPC's units (ssockets, sslsockets, opensslsockets,
+    // fphttpclient) against a local server with a self-signed
+    // certificate. Skipped where the `openssl` command or the OpenSSL
+    // libraries are missing.
+    #[cfg(unix)]
+    #[test]
+    fn tls_sockets_and_https() {
+        let dir = std::env::temp_dir().join(format!("bruto-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let made = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+            ])
+            .args([
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("skipped: no openssl command");
+            return;
+        }
+        let cert = cert.display();
+        let key = key.display();
+        let source = format!(
+            "program T;
+{{$mode objfpc}}{{$H+}}
+uses SysUtils, Classes, ssockets, sslsockets, opensslsockets, openssl, fphttpclient;
+function c_fork: LongInt; cdecl; external 'c' name 'fork';
+procedure c_exit(Code: LongInt); cdecl; external 'c' name '_exit';
+function c_waitpid(Pid: LongInt; Status: Pointer; Options: LongInt): LongInt;
+  cdecl; external 'c' name 'waitpid';
+function c_alarm(Seconds: LongWord): LongWord; cdecl; external 'c' name 'alarm';
+const
+  CertFile = '{cert}';
+  KeyFile = '{key}';
+var
+  Server: TInetServer;
+  ServerHandler, H: TSSLSocketHandler;
+  Peer: TSocketStream;
+  Client: TInetSocket;
+  Http: TFPHTTPClient;
+  Buf: array[0..255] of Char;
+  N: LongInt;
+  Reply, Body: string;
+  Pid, Status, I: LongInt;
+  Port: Word;
+begin
+  if not InitSSLInterface then
+  begin
+    WriteLn('no OpenSSL');
+    Halt(0);
+  end;
+  ServerHandler := TSSLSocketHandler.GetDefaultHandler;
+  ServerHandler.CertificateData.Certificate.FileName := CertFile;
+  ServerHandler.CertificateData.PrivateKey.FileName := KeyFile;
+  Server := TInetServer.Create('127.0.0.1', 0, ServerHandler);
+  Server.Listen;
+  Port := Server.Port;
+  c_alarm(30);
+  Pid := c_fork;
+  if Pid = 0 then
+  begin
+    c_alarm(20);
+    for I := 1 to 3 do
+    begin
+      Peer := Server.GetConnection;
+      if Peer = nil then
+        c_exit(3);
+      N := Peer.Read(Buf, SizeOf(Buf));
+      if I < 3 then
+      begin
+        Reply := 'echo: ' + Copy(PChar(@Buf), 1, N);
+        Peer.WriteBuffer(Reply[1], Length(Reply));
+      end
+      else
+      begin
+        Body := 'secure hello';
+        Reply := 'HTTP/1.1 200 OK'#13#10'Content-Type: text/plain'#13#10 +
+          'Content-Length: ' + IntToStr(Length(Body)) + #13#10#13#10 + Body;
+        Peer.WriteBuffer(Reply[1], Length(Reply));
+      end;
+      Peer.Free;
+    end;
+    c_exit(0);
+  end;
+  {{ Without checking the certificate. }}
+  H := TSSLSocketHandler.GetDefaultHandler;
+  Client := TInetSocket.Create('127.0.0.1', Port, H);
+  Client.WriteBuffer('ping', 4);
+  N := Client.Read(Buf, SizeOf(Buf));
+  WriteLn(Copy(PChar(@Buf), 1, N), ' ', H.SSLActive);
+  Client.Free;
+  {{ Checking it against the certificate itself, for localhost. }}
+  H := TSSLSocketHandler.GetDefaultHandler;
+  H.VerifyPeerCert := True;
+  H.CertificateData.TrustedCertificate.FileName := CertFile;
+  Client := TInetSocket.Create('localhost', Port, H);
+  Client.WriteBuffer('pong', 4);
+  N := Client.Read(Buf, SizeOf(Buf));
+  WriteLn(Copy(PChar(@Buf), 1, N));
+  Client.Free;
+  Http := TFPHTTPClient.Create(nil);
+  WriteLn(Http.Get('https://127.0.0.1:' + IntToStr(Port) + '/'), ' ', Http.ResponseStatusCode);
+  Http.Free;
+  c_waitpid(Pid, @Status, 0);
+  WriteLn('server exit ', Status);
+  Server.Free;
+end.
+"
+        );
+        let (ok, out) = build_and_run_source(&source);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok, "program failed: {out}");
+        if out == "no OpenSSL\n" {
+            eprintln!("skipped: no OpenSSL libraries");
+            return;
+        }
+        assert_eq!(
+            out,
+            "echo: ping TRUE\necho: pong\nsecure hello 200\nserver exit 0\n"
+        );
+    }
+
     #[test]
     fn class_instances_and_their_strings_are_freed() {
         let (ok, out) = build_and_run_source(
