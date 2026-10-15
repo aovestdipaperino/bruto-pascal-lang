@@ -12,9 +12,8 @@ use std::path::PathBuf;
 
 const SYSTEM_PRELUDE: &str = include_str!("../rtl/system.pp");
 
-/// The UnicodeString routines code generation calls; every program gets
-/// them.
-const USTRINGS: &str = include_str!("../rtl/ustrings.pp");
+/// The string routines code generation calls; every program gets them.
+const STRINGS: &str = include_str!("../rtl/brutostrings.pp");
 
 const UNITS: &[(&str, &str)] = &[
     ("unixtype.pp", include_str!("../rtl/unixtype.pp")),
@@ -32,11 +31,25 @@ const UNITS: &[(&str, &str)] = &[
     ("mouse.pp", include_str!("../rtl/mouse.pp")),
 ];
 
+/// The directory the built-in units are written to.
+fn rtl_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("bruto-rtl-{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// Whether `path` is one of the compiler's own runtime files (written to
+/// the `bruto-rtl-<version>` directory, however the temp directory is
+/// spelled).
+pub(crate) fn is_runtime_file(path: &std::path::Path) -> bool {
+    let dir = rtl_dir();
+    let name = dir.file_name().unwrap_or_default();
+    path.parent().and_then(|p| p.file_name()) == Some(name)
+}
+
 /// The file of built-in unit `name`, if there is one.
 pub(crate) fn unit_file(name: &str) -> Option<PathBuf> {
     let file = format!("{}.pp", name.to_ascii_lowercase());
     let (_, source) = UNITS.iter().find(|(f, _)| *f == file)?;
-    let dir = std::env::temp_dir().join(format!("bruto-rtl-{}", env!("CARGO_PKG_VERSION")));
+    let dir = rtl_dir();
     let path = dir.join(&file);
     // Rewrite it if a different compiler build left another version.
     if std::fs::read_to_string(&path).ok().as_deref() != Some(*source) {
@@ -52,17 +65,15 @@ pub(crate) fn add_system_prelude(program: &mut Program) -> Result<(), String> {
     add_prelude(program, "system.pp", SYSTEM_PRELUDE)
 }
 
-/// Add the UnicodeString routines (`rtl/ustrings.pp`).
-pub(crate) fn add_unicode_strings(program: &mut Program) -> Result<(), String> {
-    add_prelude(program, "ustrings.pp", USTRINGS)
+/// Add the string routines (`rtl/brutostrings.pp`).
+pub(crate) fn add_string_runtime(program: &mut Program) -> Result<(), String> {
+    add_prelude(program, "brutostrings.pp", STRINGS)
 }
 
 /// Add the types and routines of the prelude unit `source` that the
 /// program doesn't declare itself.
 fn add_prelude(program: &mut Program, file: &str, source: &str) -> Result<(), String> {
-    let path = std::env::temp_dir()
-        .join(format!("bruto-rtl-{}", env!("CARGO_PKG_VERSION")))
-        .join(file);
+    let path = rtl_dir().join(file);
     if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let _ = std::fs::write(&path, source);
@@ -107,6 +118,12 @@ fn add_prelude(program: &mut Program, file: &str, source: &str) -> Result<(), St
         .chain(unit.impl_types)
         .filter(|t| fresh(&t.name));
     program.type_decls.splice(0..0, types);
+    let consts = unit
+        .interface_consts
+        .into_iter()
+        .chain(unit.impl_consts)
+        .filter(|c| fresh(&c.name));
+    program.consts.splice(0..0, consts);
     let procs = unit.procedures.into_iter().filter(|p| fresh(&p.name));
     program.procedures.splice(0..0, procs);
     Ok(())

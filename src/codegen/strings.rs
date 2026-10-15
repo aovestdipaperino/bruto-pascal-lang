@@ -13,19 +13,32 @@ use inkwell::module::Linkage;
 use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue};
 
 impl<'ctx> CodeGen<'ctx> {
-    /// The short string in the buffer at `buffer`, as a fresh C string.
+    /// The short string in the buffer at `buffer`, as a fresh AnsiString
+    /// (#0 characters included).
     pub(super) fn short_to_c_string(
         &self,
         buffer: PointerValue<'ctx>,
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
-        let f = self.short_to_c_string_fn();
-        Ok(self
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let i8_ty = self.context.i8_type();
+        let i64_ty = self.context.i64_type();
+        let len = self
             .builder
-            .build_call(f, &[buffer.into()], "short_str")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value()
-            .basic()
+            .build_load(i8_ty, buffer, "short_len")
+            .map_err(err)?
+            .into_int_value();
+        let len = self
+            .builder
+            .build_int_z_extend(len, i64_ty, "len")
+            .map_err(err)?;
+        let chars = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_ty, buffer, &[i64_ty.const_int(1, false)], "chars")
+                .map_err(err)?
+        };
+        Ok(self
+            .call_ustr_runtime("bruto_astr_from_buf", &[chars.into(), len.into()], span)?
             .unwrap())
     }
 
@@ -83,49 +96,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// `bruto_short_to_cstr(short) -> ptr`: copy a short string's
-    /// characters into a new NUL-terminated buffer.
-    fn short_to_c_string_fn(&self) -> FunctionValue<'ctx> {
-        if let Some(f) = self.module.get_function("bruto_short_to_cstr") {
-            return f;
-        }
-        let ptr = self.context.ptr_type(AddressSpace::default());
-        let i8_ty = self.context.i8_type();
-        let i64_ty = self.context.i64_type();
-        let f = self.module.add_function(
-            "bruto_short_to_cstr",
-            ptr.fn_type(&[ptr.into()], false),
-            None,
-        );
-        f.set_linkage(Linkage::Internal);
-        let b = self.context.create_builder();
-        b.position_at_end(self.context.append_basic_block(f, "entry"));
-        let src = f.get_first_param().unwrap().into_pointer_value();
-        let len = b.build_load(i8_ty, src, "len").unwrap().into_int_value();
-        let len = b.build_int_z_extend(len, i64_ty, "len64").unwrap();
-        let size = b
-            .build_int_add(len, i64_ty.const_int(1, false), "size")
-            .unwrap();
-        let malloc = self.module.get_function("malloc").unwrap();
-        let buf = b
-            .build_call(malloc, &[size.into()], "buf")
-            .unwrap()
-            .try_as_basic_value()
-            .basic()
-            .unwrap()
-            .into_pointer_value();
-        let chars = unsafe {
-            b.build_in_bounds_gep(i8_ty, src, &[i64_ty.const_int(1, false)], "chars")
-                .unwrap()
-        };
-        b.build_memcpy(buf, 1, chars, 1, len).unwrap();
-        let end = unsafe { b.build_in_bounds_gep(i8_ty, buf, &[len], "end").unwrap() };
-        b.build_store(end, i8_ty.const_zero()).unwrap();
-        b.build_return(Some(&buf)).unwrap();
-        f
-    }
-
-    /// `bruto_cstr_to_short(dest, src, max)`: store a C string (nil means
+    /// `bruto_cstr_to_short(dest, src, max)`: store a string (nil means
     /// empty) into a short string buffer, keeping at most `max` characters.
     fn c_string_to_short_fn(&self) -> FunctionValue<'ctx> {
         if let Some(f) = self.module.get_function("bruto_cstr_to_short") {
@@ -153,12 +124,14 @@ impl<'ctx> CodeGen<'ctx> {
         b.build_conditional_branch(is_nil, copy, measure).unwrap();
 
         b.position_at_end(measure);
-        let strlen = self.module.get_function("strlen").unwrap_or_else(|| {
-            self.module
-                .add_function("strlen", i64_ty.fn_type(&[ptr.into()], false), None)
-        });
+        // The AnsiString's length (#0 characters included), or strlen of
+        // a C string.
+        let measure_fn = self
+            .module
+            .get_function("bruto_astr_len")
+            .expect("the string runtime is part of every program");
         let full = b
-            .build_call(strlen, &[src.into()], "full")
+            .build_call(measure_fn, &[src.into()], "full")
             .unwrap()
             .try_as_basic_value()
             .basic()

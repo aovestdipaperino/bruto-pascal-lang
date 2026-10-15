@@ -29,6 +29,10 @@ mod strings;
 mod system;
 mod unicode;
 
+/// The marker in an AnsiString's header (`BrutoAStrMarker` in
+/// `rtl/brutostrings.pp`).
+const ANSI_MARKER: u64 = 0xB57A_57A1;
+
 const UNTYPED_DEREF: &str =
     "an untyped pointer can't be dereferenced; cast it to a typed pointer first";
 
@@ -136,6 +140,9 @@ pub struct CodeGen<'ctx> {
     loop_targets: Vec<(BasicBlock<'ctx>, BasicBlock<'ctx>)>,
     /// Hidden locals made so far (for `for-in` loops), for unique names.
     hidden_count: u32,
+    /// Whether the routine being compiled is Bruto's runtime, which the
+    /// profiler leaves out.
+    prof_skip: bool,
     /// The Unicode text of each string literal's global (by address),
     /// so a literal stored as a UnicodeString becomes UTF-16 at compile
     /// time, in its source's code page.
@@ -244,6 +251,7 @@ impl<'ctx> CodeGen<'ctx> {
             label_blocks: HashMap::new(),
             loop_targets: Vec::new(),
             hidden_count: 0,
+            prof_skip: false,
             literal_texts: HashMap::new(),
             exit_block: None,
             end_bp_slots: HashMap::new(),
@@ -338,7 +346,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// `__bruto_prof_enter(id)` at the current insertion point, registering
     /// `name` at `line` as a routine.
     fn emit_prof_enter(&mut self, name: &str, line: u32) -> Result<(), CodeGenError> {
-        if !self.instrument {
+        if !self.instrument || self.prof_skip {
             return Ok(());
         }
         let id = self.prof_alloc_id();
@@ -358,7 +366,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// `__bruto_prof_exit()` at the current insertion point (call right
     /// before every `ret`).
     fn emit_prof_exit(&mut self) -> Result<(), CodeGenError> {
-        if !self.instrument {
+        if !self.instrument || self.prof_skip {
             return Ok(());
         }
         let f = self.module.get_function("__bruto_prof_exit").unwrap();
@@ -370,7 +378,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// `__bruto_prof_line(id)` for the statement at `span`.
     fn emit_prof_line(&mut self, span: Span) -> Result<(), CodeGenError> {
-        if !self.instrument {
+        if !self.instrument || self.prof_skip {
             return Ok(());
         }
         let id = self.prof_alloc_id();
@@ -424,6 +432,21 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Compile a Pascal program AST into LLVM IR.
     pub fn compile(&mut self, program: &Program) -> Result<(), CodeGenError> {
+        // The string runtime every program needs, unless `resolve_uses`
+        // has added it already.
+        let with_runtime;
+        let program = if program
+            .procedures
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case("bruto_astr_len"))
+        {
+            program
+        } else {
+            let mut copy = program.clone();
+            crate::rtl::add_string_runtime(&mut copy).map_err(|e| CodeGenError::new(e, None))?;
+            with_runtime = copy;
+            &with_runtime
+        };
         let resolved = crate::sema::resolve_program(program)
             .map_err(|e| CodeGenError::new(e.message, Some(e.span)))?;
         self.display_names = resolved.display_names;
@@ -1056,12 +1079,9 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::String => {
-                    let empty = self
-                        .builder
-                        .build_global_string_ptr("", "empty_str")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
+                    let empty = self.empty_string_constant();
                     self.builder
-                        .build_store(alloca, empty.as_pointer_value())
+                        .build_store(alloca, empty)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::Pointer(_) | PascalType::File { .. } | PascalType::Proc { .. } => {
@@ -1225,7 +1245,8 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// A string literal as a private constant: one byte per character
     /// (Pascal strings are byte strings, so `#129` is the byte 129, not a
-    /// UTF-8 sequence), NUL-terminated.
+    /// UTF-8 sequence), with an AnsiString header (see
+    /// `rtl/brutostrings.pp`) whose reference count, -1, marks a literal.
     fn string_literal(&self, text: &str) -> PointerValue<'ctx> {
         // Characters above 255 (from a UTF-8 source, or `#$2500`) are
         // written in UTF-8, the code page of AnsiStrings on Unix.
@@ -1236,32 +1257,53 @@ impl<'ctx> CodeGen<'ctx> {
                 Err(_) => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
             }
         }
-        let value = self.context.const_string(&bytes, true);
-        let global = self.module.add_global(value.get_type(), None, "str_lit");
+        self.ansi_constant(&bytes, "str_lit")
+    }
+
+    /// A constant AnsiString holding `bytes`: a pointer to its first
+    /// character, after the header.
+    fn ansi_constant(&self, bytes: &[u8], name: &str) -> PointerValue<'ctx> {
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let chars = self.context.const_string(bytes, true);
+        let value = self.context.const_struct(
+            &[
+                i32_ty.const_int(ANSI_MARKER, false).into(),
+                i32_ty.const_all_ones().into(),
+                i64_ty.const_int(bytes.len() as u64, false).into(),
+                chars.into(),
+            ],
+            false,
+        );
+        let global = self.module.add_global(value.get_type(), None, name);
         global.set_linkage(Linkage::Private);
         global.set_constant(true);
         global.set_unnamed_addr(true);
+        // Aligned to 32 bytes, the characters (16 bytes in) never start a
+        // memory page, so the header can always be read.
+        global.set_alignment(32);
         global.set_initializer(&value);
-        global.as_pointer_value()
+        unsafe {
+            global.as_pointer_value().const_in_bounds_gep(
+                self.context.i8_type(),
+                &[i64_ty.const_int(16, false)],
+            )
+        }
     }
 
-    /// Pointer to a shared, empty NUL-terminated string, usable as a
-    /// constant initializer.
+    /// The shared empty AnsiString, usable as a constant initializer.
     fn empty_string_constant(&self) -> BasicValueEnum<'ctx> {
-        let global = self
-            .module
-            .get_global("pascal.empty_str")
-            .unwrap_or_else(|| {
-                let bytes = self.context.const_string(b"", true);
-                let g = self
-                    .module
-                    .add_global(bytes.get_type(), None, "pascal.empty_str");
-                g.set_linkage(Linkage::Private);
-                g.set_constant(true);
-                g.set_initializer(&bytes);
-                g
-            });
-        global.as_pointer_value().into()
+        if let Some(g) = self.module.get_global("pascal.empty_str") {
+            return unsafe {
+                g.as_pointer_value()
+                    .const_in_bounds_gep(
+                        self.context.i8_type(),
+                        &[self.context.i64_type().const_int(16, false)],
+                    )
+                    .into()
+            };
+        }
+        self.ansi_constant(b"", "pascal.empty_str").into()
     }
 
     fn record_metadata(&mut self, name: &str, ty: &PascalType) {
@@ -1515,6 +1557,16 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_proc_decl(&mut self, proc: &ProcDecl) -> Result<(), CodeGenError> {
+        // Bruto's own runtime routines aren't profiled.
+        let saved = self.prof_skip;
+        self.prof_skip = crate::source_map::path_of(proc.span.file)
+            .is_some_and(|p| crate::rtl::is_runtime_file(&p));
+        let result = self.compile_routine(proc);
+        self.prof_skip = saved;
+        result
+    }
+
+    fn compile_routine(&mut self, proc: &ProcDecl) -> Result<(), CodeGenError> {
         // A method implementation, `procedure TFoo.Bar`, belongs to a
         // method declared in TFoo's type.
         let method = match &proc.owner {
@@ -2156,28 +2208,10 @@ impl<'ctx> CodeGen<'ctx> {
         if ch.get_type().get_bit_width() != 8 {
             return Ok(val);
         }
-        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
-        let i8_ty = self.context.i8_type();
-        let i64_ty = self.context.i64_type();
-        let malloc = self.module.get_function("malloc").unwrap();
-        let buf = self
-            .builder
-            .build_call(malloc, &[i64_ty.const_int(2, false).into()], "char_str")
-            .map_err(err)?
-            .try_as_basic_value()
-            .basic()
-            .unwrap()
-            .into_pointer_value();
-        self.builder.build_store(buf, ch).map_err(err)?;
-        let end = unsafe {
-            self.builder
-                .build_in_bounds_gep(i8_ty, buf, &[i64_ty.const_int(1, false)], "char_end")
-                .map_err(err)?
-        };
-        self.builder
-            .build_store(end, i8_ty.const_zero())
-            .map_err(err)?;
-        Ok(buf.into())
+        let code = self.to_i64(val, span)?;
+        Ok(self
+            .call_ustr_runtime("bruto_astr_from_char", &[code.into()], span)?
+            .unwrap())
     }
 
     /// Store an expression value into a slot of type `ty`, converting it
@@ -3820,13 +3854,12 @@ impl<'ctx> CodeGen<'ctx> {
             )?;
             return self.store_value(slot, result, &ty, span);
         }
-        let f = self.module.get_function("bruto_str_delete").unwrap();
         let result = self
-            .builder
-            .build_call(f, &[s_val.into(), idx.into(), cnt.into()], "deleted")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value()
-            .basic()
+            .call_ustr_runtime(
+                "bruto_astr_delete",
+                &[s_val.into(), idx.into(), cnt.into()],
+                span,
+            )?
             .unwrap();
         self.store_value(slot, result, &ty, span)
     }
@@ -3872,13 +3905,12 @@ impl<'ctx> CodeGen<'ctx> {
         let s_val = self.compile_expr(&args[1])?;
         let idx = self.compile_expr(&args[2])?;
         let idx = self.to_i64(idx, span)?;
-        let f = self.module.get_function("bruto_str_insert").unwrap();
         let result = self
-            .builder
-            .build_call(f, &[source.into(), s_val.into(), idx.into()], "inserted")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value()
-            .basic()
+            .call_ustr_runtime(
+                "bruto_astr_insert",
+                &[source.into(), s_val.into(), idx.into()],
+                span,
+            )?
             .unwrap();
         self.store_value(slot, result, &ty, span)
     }
@@ -4783,6 +4815,11 @@ impl<'ctx> CodeGen<'ctx> {
                 continue;
             }
 
+            // A string is written by its length, so #0 characters are too.
+            if self.resolve_type(&arg_type) == PascalType::String {
+                self.call_ustr_runtime("bruto_astr_write", &[val.into()], span)?;
+                continue;
+            }
             let (write_fn, capture_fn) = match arg_type {
                 PascalType::Integer | PascalType::Enum { .. } | PascalType::Subrange { .. } => {
                     ("bruto_write_int", "bruto_capture_write_int")
@@ -5067,33 +5104,20 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<(), CodeGenError> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let strdup = self.module.get_function("strdup").unwrap_or_else(|| {
-            self.module
-                .add_function("strdup", ptr_ty.fn_type(&[ptr_ty.into()], false), None)
-        });
         let old = self
             .builder
             .build_load(ptr_ty, slot, "str_old")
             .map_err(err)?;
-        let copy = self
-            .builder
-            .build_call(strdup, &[old.into()], "str_copy")
-            .map_err(err)?
-            .try_as_basic_value()
-            .basic()
-            .unwrap()
-            .into_pointer_value();
         let idx = self.to_i64(index, span)?;
-        let offset = self
-            .builder
-            .build_int_sub(idx, self.context.i64_type().const_int(1, false), "str_off")
-            .map_err(err)?;
-        let at = unsafe {
-            self.builder
-                .build_in_bounds_gep(self.context.i8_type(), copy, &[offset], "str_at")
-                .map_err(err)?
-        };
-        self.store_value(at, ch, &PascalType::Char, span)?;
+        let ch = self.convert_for_store(ch, &PascalType::Char, span)?;
+        let code = self.to_i64(ch, span)?;
+        let copy = self
+            .call_ustr_runtime(
+                "bruto_astr_setchar",
+                &[old.into(), idx.into(), code.into()],
+                span,
+            )?
+            .unwrap();
         self.builder.build_store(slot, copy).map_err(err)?;
         Ok(())
     }
@@ -5820,15 +5844,10 @@ impl<'ctx> CodeGen<'ctx> {
                             .into());
                     }
                     let val = self.compile_expr(&args[0])?;
-                    let f = self.module.get_function("bruto_str_length").unwrap();
-                    let r = self
-                        .builder
-                        .build_call(f, &[val.into()], "len")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value()
-                        .basic()
-                        .unwrap();
-                    return Ok(r);
+                    let val = self.as_string_value(val, *span)?;
+                    return Ok(self
+                        .call_ustr_runtime("bruto_astr_len", &[val.into()], *span)?
+                        .unwrap());
                 }
                 if name == "ord" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
@@ -6226,31 +6245,32 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 if name == "copy" && args.len() == 3 {
                     let s = self.compile_expr(&args[0])?;
+                    let s = self.as_string_value(s, *span)?;
                     let idx = self.compile_expr(&args[1])?;
+                    let idx = self.to_i64(idx, *span)?;
                     let cnt = self.compile_expr(&args[2])?;
-                    let f = self.module.get_function("bruto_str_copy").unwrap();
-                    let r = self
-                        .builder
-                        .build_call(f, &[s.into(), idx.into(), cnt.into()], "copy")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value()
-                        .basic()
-                        .unwrap();
-                    return Ok(r);
+                    let cnt = self.to_i64(cnt, *span)?;
+                    return Ok(self
+                        .call_ustr_runtime(
+                            "bruto_astr_copy",
+                            &[s.into(), idx.into(), cnt.into()],
+                            *span,
+                        )?
+                        .unwrap());
                 }
                 if name == "pos" && args.len() == 2 {
                     let substr = self.compile_expr(&args[0])?;
                     let substr = self.as_string_value(substr, *span)?;
                     let s = self.compile_expr(&args[1])?;
-                    let f = self.module.get_function("bruto_str_pos").unwrap();
-                    let r = self
-                        .builder
-                        .build_call(f, &[substr.into(), s.into()], "pos")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value()
-                        .basic()
-                        .unwrap();
-                    return Ok(r);
+                    let s = self.as_string_value(s, *span)?;
+                    let one = self.context.i64_type().const_int(1, false);
+                    return Ok(self
+                        .call_ustr_runtime(
+                            "bruto_astr_pos",
+                            &[substr.into(), s.into(), one.into()],
+                            *span,
+                        )?
+                        .unwrap());
                 }
                 if name == "upcase" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
@@ -6404,16 +6424,17 @@ impl<'ctx> CodeGen<'ctx> {
                     return Ok(r);
                 }
                 if name == "concat" && args.len() >= 2 {
-                    let concat_fn = self.module.get_function("bruto_str_concat").unwrap();
                     let mut result = self.compile_expr(&args[0])?;
+                    result = self.as_string_value(result, *span)?;
                     for arg in &args[1..] {
                         let next = self.compile_expr(arg)?;
+                        let next = self.as_string_value(next, *span)?;
                         result = self
-                            .builder
-                            .build_call(concat_fn, &[result.into(), next.into()], "concat")
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                            .try_as_basic_value()
-                            .basic()
+                            .call_ustr_runtime(
+                                "bruto_astr_concat",
+                                &[result.into(), next.into()],
+                                *span,
+                            )?
                             .unwrap();
                     }
                     return Ok(result);
@@ -7857,27 +7878,16 @@ impl<'ctx> CodeGen<'ctx> {
             }
             match op {
                 BinOp::Add => {
-                    let concat = self.module.get_function("bruto_str_concat").unwrap();
-                    let result = self
-                        .builder
-                        .build_call(concat, &[l.into(), r.into()], "concat")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                        .try_as_basic_value()
-                        .basic()
-                        .unwrap();
-                    return Ok(result);
+                    return Ok(self
+                        .call_ustr_runtime("bruto_astr_concat", &[l.into(), r.into()], span)?
+                        .unwrap());
                 }
                 BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => {
-                    let cmp = self.module.get_function("bruto_str_compare").unwrap();
                     let cmp_result = self
-                        .builder
-                        .build_call(cmp, &[l.into(), r.into()], "strcmp")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                        .try_as_basic_value()
-                        .basic()
+                        .call_ustr_runtime("bruto_astr_compare", &[l.into(), r.into()], span)?
                         .unwrap()
                         .into_int_value();
-                    let zero = self.context.i32_type().const_int(0, false);
+                    let zero = self.context.i64_type().const_int(0, false);
                     let pred = match op {
                         BinOp::Eq => inkwell::IntPredicate::EQ,
                         BinOp::Neq => inkwell::IntPredicate::NE,

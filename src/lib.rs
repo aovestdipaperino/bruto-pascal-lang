@@ -406,7 +406,7 @@ impl Drop for PascalBuildJob {
 /// in dependency order. Detects cycles and missing files.
 pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Result<(), String> {
     if program.uses.is_empty() {
-        return rtl::add_unicode_strings(program);
+        return rtl::add_string_runtime(program);
     }
 
     let mut loaded: Vec<ast::Unit> = Vec::new();
@@ -471,7 +471,7 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
     program.body.statements.splice(0..0, init_stmts);
 
     rtl::add_system_prelude(program)?;
-    rtl::add_unicode_strings(program)
+    rtl::add_string_runtime(program)
 }
 
 fn load_unit_recursive(
@@ -2925,7 +2925,7 @@ end.
         assert!(ok, "program failed: {out}");
         assert_eq!(
             out,
-            "true false\nfalse\nlate\n9\n[abc  ] 5\n[ab]\n20\n42\nbye\n"
+            "true false\nfalse\nlate\n9\n[abc\0\0] 5\n[ab]\n20\n42\nbye\n"
         );
     }
 

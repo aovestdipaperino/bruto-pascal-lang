@@ -23,95 +23,6 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// A libc function, declared on first use.
-    /// `bruto_setlength(old, n) -> ptr`: a new string of `n` characters,
-    /// starting with `old`'s (nil is empty) and padded with spaces.
-    fn set_length_fn(&self) -> FunctionValue<'ctx> {
-        if let Some(f) = self.module.get_function("bruto_setlength") {
-            return f;
-        }
-        let ptr = self.context.ptr_type(AddressSpace::default());
-        let i8_ty = self.context.i8_type();
-        let i32_ty = self.context.i32_type();
-        let i64_ty = self.context.i64_type();
-        let f = self.module.add_function(
-            "bruto_setlength",
-            ptr.fn_type(&[ptr.into(), i64_ty.into()], false),
-            None,
-        );
-        f.set_linkage(inkwell::module::Linkage::Internal);
-        let malloc = self.libc("malloc", ptr.fn_type(&[i64_ty.into()], false));
-        let memset = self.libc(
-            "memset",
-            ptr.fn_type(&[ptr.into(), i32_ty.into(), i64_ty.into()], false),
-        );
-        let strlen = self.libc("strlen", i64_ty.fn_type(&[ptr.into()], false));
-        let b = self.context.create_builder();
-        let entry = self.context.append_basic_block(f, "entry");
-        let measure = self.context.append_basic_block(f, "measure");
-        let copy = self.context.append_basic_block(f, "copy");
-        b.position_at_end(entry);
-        let old = f.get_nth_param(0).unwrap().into_pointer_value();
-        let n = f.get_nth_param(1).unwrap().into_int_value();
-        let zero = i64_ty.const_zero();
-        let n = b
-            .build_select(
-                b.build_int_compare(inkwell::IntPredicate::SLT, n, zero, "neg")
-                    .unwrap(),
-                zero,
-                n,
-                "n",
-            )
-            .unwrap()
-            .into_int_value();
-        let size = b
-            .build_int_add(n, i64_ty.const_int(1, false), "size")
-            .unwrap();
-        let buf = b
-            .build_call(malloc, &[size.into()], "buf")
-            .unwrap()
-            .try_as_basic_value()
-            .basic()
-            .unwrap()
-            .into_pointer_value();
-        b.build_call(
-            memset,
-            &[
-                buf.into(),
-                i32_ty.const_int(b' ' as u64, false).into(),
-                n.into(),
-            ],
-            "",
-        )
-        .unwrap();
-        let end = unsafe { b.build_in_bounds_gep(i8_ty, buf, &[n], "end").unwrap() };
-        b.build_store(end, i8_ty.const_zero()).unwrap();
-        let is_nil = b.build_is_null(old, "nil").unwrap();
-        let done = self.context.append_basic_block(f, "done");
-        b.build_conditional_branch(is_nil, done, measure).unwrap();
-        b.position_at_end(measure);
-        let old_len = b
-            .build_call(strlen, &[old.into()], "old_len")
-            .unwrap()
-            .try_as_basic_value()
-            .basic()
-            .unwrap()
-            .into_int_value();
-        let shorter = b
-            .build_int_compare(inkwell::IntPredicate::ULT, old_len, n, "shorter")
-            .unwrap();
-        let kept = b
-            .build_select(shorter, old_len, n, "kept")
-            .unwrap()
-            .into_int_value();
-        b.build_unconditional_branch(copy).unwrap();
-        b.position_at_end(copy);
-        b.build_memcpy(buf, 1, old, 1, kept).unwrap();
-        b.build_unconditional_branch(done).unwrap();
-        b.position_at_end(done);
-        b.build_return(Some(&buf)).unwrap();
-        f
-    }
-
     fn libc(&self, name: &str, ty: inkwell::types::FunctionType<'ctx>) -> FunctionValue<'ctx> {
         self.module
             .get_function(name)
@@ -357,13 +268,12 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     PascalType::String => {
                         let old = self.builder.build_load(ptr, slot, "old").map_err(err)?;
-                        let f = self.set_length_fn();
                         let new = self
-                            .builder
-                            .build_call(f, &[old.into(), n.into()], "resized")
-                            .map_err(err)?
-                            .try_as_basic_value()
-                            .basic()
+                            .call_ustr_runtime(
+                                "bruto_astr_setlength",
+                                &[old.into(), n.into()],
+                                span,
+                            )?
                             .unwrap();
                         self.builder.build_store(slot, new).map_err(err)?;
                     }

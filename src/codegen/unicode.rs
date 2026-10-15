@@ -1,7 +1,7 @@
 //! `UnicodeString` and `WideChar`.
 //!
 //! A UnicodeString is a pointer to UTF-16 code units laid out as in FPC
-//! (see `rtl/ustrings.pp`, whose routines do the work). In expressions it
+//! (see `rtl/brutostrings.pp`, whose routines do the work). In expressions it
 //! is the struct `{ ptr }` rather than a bare pointer, and a WideChar is an
 //! `i16`, so a value says what it is: a `String` (a C string, UTF-8 by
 //! FPC's default code page on Unix), a `Char` (`i8`), a WideChar or a
@@ -76,7 +76,7 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
         let f = self.module.get_function(name).ok_or_else(|| {
             CodeGenError::new(
-                format!("the UnicodeString runtime ({name}) is missing"),
+                format!("the string runtime ({name}) is missing"),
                 Some(span),
             )
         })?;

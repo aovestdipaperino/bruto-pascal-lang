@@ -1,13 +1,24 @@
-{ Bruto Pascal runtime: UnicodeString. Code generation calls these
-  routines for UnicodeString and WideChar operations (and Val); they are
+{ Bruto Pascal runtime: strings. Code generation calls these routines for
+  AnsiString, UnicodeString and WideChar operations (and Val); they are
   added to every program, with FPC's UTF-8 conversion routines.
 
+  An AnsiString is a pointer to its characters, followed by a zero byte
+  and preceded by a 16-byte header: a marker, a reference count (-1 for
+  a literal) and the length, as FPC lays them out. It can hold #0, and
+  the pointer is a C string too. A C string from elsewhere (the C
+  library, a PChar) has no header; the routines recognise the marker and
+  measure those with strlen. The 16 bytes before a pointer are only read
+  when they are on the pointer's own memory page (a C string can start a
+  page whose predecessor isn't mapped), so a Bruto string never starts in
+  the first 16 bytes of a page.
+
   A UnicodeString is a pointer to UTF-16 code units, followed by a zero
-  unit and preceded by the length (an Int64), as in FPC. Nil is the
-  empty string. Bruto has no reference counts, so a string is never
-  changed in place: every operation that changes one builds a copy.
-  String (AnsiString) is UTF-8, as FPC's default code page on Unix. }
-unit BrutoUStrings;
+  unit and preceded by the length (an Int64), as in FPC.
+
+  Nil is the empty string of either kind. A string is never changed in
+  place: every operation that changes one builds a copy. String
+  (AnsiString) is UTF-8, as FPC's default code page on Unix. }
+unit BrutoStrings;
 
 interface
 
@@ -17,6 +28,26 @@ type
   BrutoBytes = array[0..$FFFFFFF] of Byte;
   PBrutoBytes = ^BrutoBytes;
   PBrutoLength = ^Int64;
+  PBrutoMarker = ^LongWord;
+
+const
+  { The header marker of the AnsiStrings Bruto makes. }
+  BrutoAStrMarker = $B57A57A1;
+
+function bruto_astr_len(S: Pointer): Int64;
+function bruto_astr_alloc(Len: Int64): Pointer;
+function bruto_astr_from_buf(P: Pointer; Len: Int64): Pointer;
+function bruto_astr_from_char(C: Int64): Pointer;
+function bruto_astr_concat(A, B: Pointer): Pointer;
+function bruto_astr_compare(A, B: Pointer): Int64;
+function bruto_astr_copy(S: Pointer; Index, Count: Int64): Pointer;
+function bruto_astr_pos(Sub, S: Pointer; Offset: Int64): Int64;
+function bruto_astr_delete(S: Pointer; Index, Count: Int64): Pointer;
+function bruto_astr_insert(Src, S: Pointer; Index: Int64): Pointer;
+function bruto_astr_setlength(S: Pointer; Len: Int64): Pointer;
+function bruto_astr_setchar(S: Pointer; Index, C: Int64): Pointer;
+{ Write S to the console (and the IDE's capture), #0 characters included. }
+procedure bruto_astr_write(S: Pointer);
 
 function bruto_ustr_length(S: Pointer): Int64;
 function bruto_ustr_alloc(Len: Int64): Pointer;
@@ -63,6 +94,234 @@ implementation
 function bruto_towupper(C: LongInt): LongInt; cdecl; external 'c' name 'towupper';
 function bruto_towlower(C: LongInt): LongInt; cdecl; external 'c' name 'towlower';
 function bruto_strtod(S: Pointer; EndPtr: Pointer): Double; cdecl; external 'c' name 'strtod';
+function bruto_strlen(S: Pointer): Int64; cdecl; external 'c' name 'strlen';
+
+{ ── AnsiString ────────────────────────────────────────────── }
+
+function bruto_astr_len(S: Pointer): Int64;
+begin
+  if S = nil then
+    bruto_astr_len := 0
+  else if (PtrUInt(S) and 4095) < 16 then
+    bruto_astr_len := bruto_strlen(S)
+  else if PBrutoMarker(S - 16)^ = BrutoAStrMarker then
+    bruto_astr_len := PBrutoLength(S - 8)^
+  else
+    bruto_astr_len := bruto_strlen(S);
+end;
+
+{ A string of Len bytes, all zero (the reference count 0). Its
+  characters are moved 16 bytes further when they would start a page. }
+function bruto_astr_alloc(Len: Int64): Pointer;
+var
+  Block, Header: Pointer;
+begin
+  if Len < 0 then
+    Len := 0;
+  GetMem(Block, 32 + Len + 1);
+  FillChar(Block^, 32 + Len + 1, 0);
+  Header := Block;
+  if ((PtrUInt(Block) + 16) and 4095) < 16 then
+    Header := Block + 16;
+  PBrutoMarker(Header)^ := BrutoAStrMarker;
+  PBrutoLength(Header + 8)^ := Len;
+  bruto_astr_alloc := Header + 16;
+end;
+
+function bruto_astr_from_buf(P: Pointer; Len: Int64): Pointer;
+var
+  R: Pointer;
+begin
+  R := bruto_astr_alloc(Len);
+  if Len > 0 then
+    Move(P^, R^, Len);
+  bruto_astr_from_buf := R;
+end;
+
+function bruto_astr_from_char(C: Int64): Pointer;
+var
+  R: PBrutoBytes;
+begin
+  R := PBrutoBytes(bruto_astr_alloc(1));
+  R^[0] := C;
+  bruto_astr_from_char := R;
+end;
+
+function bruto_astr_concat(A, B: Pointer): Pointer;
+var
+  LA, LB: Int64;
+  R: PBrutoBytes;
+begin
+  LA := bruto_astr_len(A);
+  LB := bruto_astr_len(B);
+  R := PBrutoBytes(bruto_astr_alloc(LA + LB));
+  if LA > 0 then
+    Move(A^, R^[0], LA);
+  if LB > 0 then
+    Move(B^, R^[LA], LB);
+  bruto_astr_concat := R;
+end;
+
+{ Byte order, then length: negative, zero or positive. }
+function bruto_astr_compare(A, B: Pointer): Int64;
+var
+  LA, LB, I: Int64;
+  BA, BB: PBrutoBytes;
+begin
+  LA := bruto_astr_len(A);
+  LB := bruto_astr_len(B);
+  BA := PBrutoBytes(A);
+  BB := PBrutoBytes(B);
+  I := 0;
+  while (I < LA) and (I < LB) do
+  begin
+    if BA^[I] <> BB^[I] then
+    begin
+      bruto_astr_compare := Int64(BA^[I]) - Int64(BB^[I]);
+      Exit;
+    end;
+    I := I + 1;
+  end;
+  bruto_astr_compare := LA - LB;
+end;
+
+{ As FPC: an index below 1 counts as 1, and the count is cut to what the
+  string holds. }
+function bruto_astr_copy(S: Pointer; Index, Count: Int64): Pointer;
+var
+  Len: Int64;
+begin
+  Len := bruto_astr_len(S);
+  if Index < 1 then
+    Index := 1;
+  if Index > Len then
+    Count := 0
+  else if Count > Len - Index + 1 then
+    Count := Len - Index + 1;
+  if Count <= 0 then
+    bruto_astr_copy := bruto_astr_alloc(0)
+  else
+    bruto_astr_copy := bruto_astr_from_buf(S + (Index - 1), Count);
+end;
+
+function bruto_astr_pos(Sub, S: Pointer; Offset: Int64): Int64;
+var
+  LS, LSub, I, J: Int64;
+  BS, BSub: PBrutoBytes;
+  Found: Boolean;
+begin
+  bruto_astr_pos := 0;
+  LS := bruto_astr_len(S);
+  LSub := bruto_astr_len(Sub);
+  if (LSub = 0) or (Offset < 1) then
+    Exit;
+  BS := PBrutoBytes(S);
+  BSub := PBrutoBytes(Sub);
+  for I := Offset - 1 to LS - LSub do
+  begin
+    Found := True;
+    J := 0;
+    while Found and (J < LSub) do
+    begin
+      if BS^[I + J] <> BSub^[J] then
+        Found := False;
+      J := J + 1;
+    end;
+    if Found then
+    begin
+      bruto_astr_pos := I + 1;
+      Exit;
+    end;
+  end;
+end;
+
+function bruto_astr_delete(S: Pointer; Index, Count: Int64): Pointer;
+var
+  Len: Int64;
+begin
+  Len := bruto_astr_len(S);
+  if (Index < 1) or (Index > Len) or (Count <= 0) then
+  begin
+    bruto_astr_delete := S;
+    Exit;
+  end;
+  if Count > Len - Index + 1 then
+    Count := Len - Index + 1;
+  bruto_astr_delete := bruto_astr_concat(bruto_astr_copy(S, 1, Index - 1),
+    bruto_astr_copy(S, Index + Count, Len));
+end;
+
+function bruto_astr_insert(Src, S: Pointer; Index: Int64): Pointer;
+var
+  Len: Int64;
+begin
+  Len := bruto_astr_len(S);
+  if Index < 1 then
+    Index := 1;
+  if Index > Len + 1 then
+    Index := Len + 1;
+  bruto_astr_insert := bruto_astr_concat(
+    bruto_astr_concat(bruto_astr_copy(S, 1, Index - 1), Src),
+    bruto_astr_copy(S, Index, Len));
+end;
+
+{ New characters are #0, as FPC's memory usually holds. }
+function bruto_astr_setlength(S: Pointer; Len: Int64): Pointer;
+var
+  Old: Int64;
+  R: Pointer;
+begin
+  Old := bruto_astr_len(S);
+  R := bruto_astr_alloc(Len);
+  if Old > Len then
+    Old := Len;
+  if Old > 0 then
+    Move(S^, R^, Old);
+  bruto_astr_setlength := R;
+end;
+
+{ S with byte Index (1-based) set to C, as a new string. }
+function bruto_astr_setchar(S: Pointer; Index, C: Int64): Pointer;
+var
+  Len: Int64;
+  R: PBrutoBytes;
+begin
+  Len := bruto_astr_len(S);
+  R := PBrutoBytes(bruto_astr_from_buf(S, Len));
+  if (Index >= 1) and (Index <= Len) then
+    R^[Index - 1] := C;
+  bruto_astr_setchar := R;
+end;
+
+procedure bruto_rt_write_str(S: Pointer); cdecl; external 'c' name 'bruto_write_str';
+procedure bruto_rt_capture_write_str(S: Pointer); cdecl; external 'c' name 'bruto_capture_write_str';
+procedure bruto_rt_write_char(C: Char); cdecl; external 'c' name 'bruto_write_char';
+procedure bruto_rt_capture_write_char(C: Char); cdecl; external 'c' name 'bruto_capture_write_char';
+
+procedure bruto_astr_write(S: Pointer);
+var
+  Len, I: Int64;
+  B: PBrutoBytes;
+begin
+  if S = nil then
+    Exit;
+  Len := bruto_astr_len(S);
+  if bruto_strlen(S) = Len then
+  begin
+    bruto_rt_write_str(S);
+    bruto_rt_capture_write_str(S);
+    Exit;
+  end;
+  B := PBrutoBytes(S);
+  for I := 0 to Len - 1 do
+  begin
+    bruto_rt_write_char(Chr(B^[I]));
+    bruto_rt_capture_write_char(Chr(B^[I]));
+  end;
+end;
+
+{ ── UnicodeString ─────────────────────────────────────────── }
+
 
 function bruto_ustr_length(S: Pointer): Int64;
 begin
@@ -150,16 +409,17 @@ end;
 function bruto_utf8_to_ustr(S: Pointer): Pointer;
 var
   Bytes: PBrutoBytes;
-  I, Len, Code: Int64;
+  I, Len, Code, ByteLen: Int64;
   R: PBrutoUnits;
 begin
   bruto_utf8_to_ustr := nil;
   if S = nil then
     Exit;
   Bytes := PBrutoBytes(S);
+  ByteLen := bruto_astr_len(S);
   Len := 0;
   I := 0;
-  while Bytes^[I] <> 0 do
+  while I < ByteLen do
   begin
     I := I + bruto_utf8_decode(Bytes, I, Code);
     Len := Len + bruto_utf16_units(Code);
@@ -169,7 +429,7 @@ begin
   R := PBrutoUnits(bruto_ustr_alloc(Len));
   Len := 0;
   I := 0;
-  while Bytes^[I] <> 0 do
+  while I < ByteLen do
   begin
     I := I + bruto_utf8_decode(Bytes, I, Code);
     if Code > $FFFF then
@@ -266,7 +526,7 @@ begin
     Size := Size + bruto_utf8_bytes(Code);
     I := I + Units;
   end;
-  GetMem(R, Size + 1);
+  R := PBrutoBytes(bruto_astr_alloc(Size));
   I := 0;
   J := 0;
   while I < Len do
@@ -275,7 +535,6 @@ begin
     J := J + bruto_utf8_encode(R, J, Code);
     I := I + Units;
   end;
-  R^[J] := 0;
   bruto_ustr_to_utf8 := R;
 end;
 
@@ -292,8 +551,8 @@ function bruto_wchar_to_utf8(C: Int64): Pointer;
 var
   R: PBrutoBytes;
 begin
-  GetMem(R, 5);
-  R^[bruto_utf8_encode(R, 0, C)] := 0;
+  R := PBrutoBytes(bruto_astr_alloc(4));
+  PBrutoLength(Pointer(R) - 8)^ := bruto_utf8_encode(R, 0, C);
   bruto_wchar_to_utf8 := R;
 end;
 
