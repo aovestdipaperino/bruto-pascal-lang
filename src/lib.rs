@@ -2029,7 +2029,7 @@ begin
   w := $1234;
   writeln(Hi(w), ' ', Lo(w), ' ', Swap(w) = $3412);
   writeln(ParamCount >= 0, ' ', length(ParamStr(0)) > 0);
-  Assign(f, '/tmp/bruto_blockio_test.bin');
+  Assign(f, 'bruto_blockio_test.bin');
   Rewrite(f, 1);
   n := 1234567;
   BlockWrite(f, n, SizeOf(n));
@@ -2044,7 +2044,7 @@ begin
 end.
 ",
         );
-        let _ = std::fs::remove_file("/tmp/bruto_blockio_test.bin");
+        let _ = std::fs::remove_file("bruto_blockio_test.bin");
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
         assert_eq!(lines, ["6 0", "ok", "18 52 true", "true true", "1234567 4"]);
@@ -3517,6 +3517,59 @@ end.
             "abab-cc\nset!\nchanged onetwo onetwo\notherx rec1w\nheap-rec MIXED CASE\n\
              100000100000a-b 100000100000A-B 100\ntrue\n"
         );
+    }
+
+    #[test]
+    fn records_with_strings_are_freed() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses SysUtils;
+type
+  TPerson = record
+    Name: String;
+    Nick: UnicodeString;
+    Age: Integer;
+  end;
+  PPerson = ^TPerson;
+var
+  P: PPerson;
+  R: TPerson;
+  I: Integer;
+  S: String;
+  H: TFPCHeapStatus;
+  B: PtrUInt;
+
+function MakePerson(N: Integer): TPerson;
+begin
+  Result.Name := 'person' + IntToStr(N);
+  Result.Nick := 'nick';
+  Result.Age := N;
+end;
+
+begin
+  H := GetFPCHeapStatus;
+  B := H.CurrHeapUsed;
+  for I := 1 to 50000 do
+  begin
+    New(P);
+    P^.Name := 'n' + IntToStr(I);
+    P^.Nick := 'k' + IntToStr(I);
+    Dispose(P);
+    R := MakePerson(I);
+    S := String(Chr(65 + I mod 26));
+  end;
+  H := GetFPCHeapStatus;
+  writeln(R.Name, ' ', R.Nick, ' ', R.Age, ' ', S, ' ', MakePerson(7).Name);
+  {$ifdef DARWIN}
+  writeln(H.CurrHeapUsed - B < 100000);
+  {$else}
+  writeln(true);
+  {$endif}
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "person50000 nick 50000 C person7\ntrue\n");
     }
 
     #[test]

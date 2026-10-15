@@ -93,8 +93,13 @@ const
   StatMTime = 48;
   StatSize = 96;
 {$else}
+  { Linux (glibc): st_mode follows st_nlink on x86-64, st_ino on arm64. }
   DirentName = 19;
+{$ifdef CPUX86_64}
   StatMode = 24;
+{$else}
+  StatMode = 16;
+{$endif}
   StatMTime = 88;
   StatSize = 48;
 {$endif}

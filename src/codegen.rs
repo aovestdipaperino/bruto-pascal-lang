@@ -2050,6 +2050,15 @@ impl<'ctx> CodeGen<'ctx> {
         } else if let Some(ref ret_ty) = return_type {
             let llvm_ty = self.llvm_type_for(ret_ty);
             let alloca = *self.lookup_var(&proc.name).unwrap();
+            // A record or array result's strings go back to the pool.
+            if self.needs_arc(ret_ty)
+                && matches!(
+                    self.resolve_type(ret_ty),
+                    PascalType::Record { .. } | PascalType::Array { .. }
+                )
+            {
+                self.arc_return_slot(alloca, ret_ty, proc.span)?;
+            }
             // A short string result is returned as a C string.
             let ret_val = if let PascalType::ShortString { .. } = self.resolve_type(ret_ty) {
                 self.short_to_c_string(alloca, proc.span)?
@@ -3116,6 +3125,28 @@ impl<'ctx> CodeGen<'ctx> {
         let ptr_val = self.compile_expr(target)?;
         if !ptr_val.is_pointer_value() {
             return Err(CodeGenError::new("dispose() needs a pointer", Some(span)));
+        }
+        // The record's strings are released first (unless the pointer is
+        // nil), as FPC finalizes it.
+        if let PascalType::Pointer(pointed) = self.resolve_type(&self.infer_declared_type(target))
+            && self.needs_arc(&pointed)
+        {
+            let err =
+                |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+            let func = self.current_fn.unwrap();
+            let release = self.context.append_basic_block(func, "dispose_release");
+            let free = self.context.append_basic_block(func, "dispose_free");
+            let is_nil = self
+                .builder
+                .build_is_null(ptr_val.into_pointer_value(), "nil")
+                .map_err(err)?;
+            self.builder
+                .build_conditional_branch(is_nil, free, release)
+                .map_err(err)?;
+            self.builder.position_at_end(release);
+            self.arc_release_slot(ptr_val.into_pointer_value(), &pointed, span)?;
+            self.builder.build_unconditional_branch(free).map_err(err)?;
+            self.builder.position_at_end(free);
         }
         let bruto_free = self.module.get_function("bruto_free").unwrap();
         self.builder
@@ -5204,6 +5235,24 @@ impl<'ctx> CodeGen<'ctx> {
                 let (address, _) = self.resolve_array_base(&args[0], span)?;
                 Ok((address, target))
             }
+            // A record or array a function returns, as in
+            // `MakePerson(7).Name`: held in a temporary.
+            Expr::Call { .. }
+                if matches!(
+                    self.resolve_type(&self.infer_declared_type(expr)),
+                    PascalType::Record { .. } | PascalType::Array { .. }
+                ) =>
+            {
+                let ty = self.infer_declared_type(expr);
+                let value = self.compile_expr(expr)?;
+                let slot = self
+                    .entry_alloca(value.get_type(), "call_result")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                self.builder
+                    .build_store(slot, value)
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                Ok((slot, ty))
+            }
             // A typed pointer value that isn't a variable, such as
             // `PCell(@Dest)` in `PCell(@Dest)[I]`: held in a temporary,
             // so it is indexed as a pointer variable would be.
@@ -5922,41 +5971,15 @@ impl<'ctx> CodeGen<'ctx> {
                     if val.is_pointer_value() {
                         return Ok(val);
                     }
-                    let ch = self.to_i64(val, *span)?;
-                    let ch = self
-                        .builder
-                        .build_int_truncate(ch, self.context.i8_type(), "ch")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let alloc = self.module.get_function("bruto_alloc").unwrap();
-                    let buf = self
-                        .builder
-                        .build_call(
-                            alloc,
-                            &[self.context.i64_type().const_int(2, false).into()],
-                            "chstr",
-                        )
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .try_as_basic_value()
-                        .basic()
-                        .unwrap()
-                        .into_pointer_value();
-                    self.builder
-                        .build_store(buf, ch)
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let nul = unsafe {
-                        self.builder
-                            .build_in_bounds_gep(
-                                self.context.i8_type(),
-                                buf,
-                                &[self.context.i64_type().const_int(1, false)],
-                                "nul",
-                            )
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                    };
-                    self.builder
-                        .build_store(nul, self.context.i8_type().const_zero())
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    return Ok(buf.into());
+                    // A UnicodeString or WideChar in UTF-8; a char (or a
+                    // character code) as a one-character string.
+                    if self.is_ustr(val) || Self::is_wide_char(val) {
+                        return self.ustr_to_ansi(val, *span);
+                    }
+                    let code = self.to_i64(val, *span)?;
+                    return Ok(self
+                        .call_ustr_runtime("bruto_astr_from_char", &[code.into()], *span)?
+                        .unwrap());
                 }
                 if name == "typeof" && args.len() == 1 {
                     return self.compile_typeof(&args[0], *span);

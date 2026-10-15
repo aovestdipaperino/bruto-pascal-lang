@@ -20,6 +20,8 @@ function GetFPCHeapStatus: TFPCHeapStatus;
 procedure SetCodePage(var S: RawByteString; CodePage: TSystemCodePage; Convert: Boolean);
 function StringCodePage(const S: RawByteString): TSystemCodePage;
 
+{ S with ASCII letters in lower case, as FPC's System.LowerCase. }
+function LowerCase(const S: AnsiString): AnsiString;
 { Compare Len bytes: negative, zero or positive, as FPC. }
 function CompareByte(const Buf1, Buf2; Len: SizeInt): SizeInt;
 { The index of the first byte B among Len bytes of Buf, or -1. }
@@ -65,6 +67,18 @@ end;
 function StringCodePage(const S: RawByteString): TSystemCodePage;
 begin
   StringCodePage := 65001;
+end;
+
+function LowerCase(const S: AnsiString): AnsiString;
+var
+  I: SizeInt;
+  R: AnsiString;
+begin
+  R := S;
+  for I := 1 to Length(R) do
+    if (R[I] >= 'A') and (R[I] <= 'Z') then
+      R[I] := Chr(Ord(R[I]) + 32);
+  LowerCase := R;
 end;
 
 function CompareByte(const Buf1, Buf2; Len: SizeInt): SizeInt;

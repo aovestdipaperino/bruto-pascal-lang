@@ -85,6 +85,18 @@ impl<'ctx> CodeGen<'ctx> {
         self.arc_walk(slot, &resolved, "bruto_astr_release", span)
     }
 
+    /// Hand the strings in the function result at `slot` (a record or
+    /// array) back to the pool, for the caller's statement.
+    pub(super) fn arc_return_slot(
+        &mut self,
+        slot: PointerValue<'ctx>,
+        ty: &PascalType,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        let resolved = self.resolve_type(ty);
+        self.arc_walk(slot, &resolved, "bruto_astr_return", span)
+    }
+
     /// Apply runtime routine `op` to every AnsiString in the memory at
     /// `slot`, of type `ty`.
     fn arc_walk(
