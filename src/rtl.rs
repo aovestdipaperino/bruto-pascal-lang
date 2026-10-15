@@ -38,6 +38,7 @@ const UNITS: &[(&str, &str)] = &[
     ("sockets.pp", include_str!("../rtl/sockets.pp")),
     ("netdb.pp", include_str!("../rtl/netdb.pp")),
     ("netobjects.pp", include_str!("../rtl/netobjects.pp")),
+    ("classes.pp", include_str!("../rtl/classes.pp")),
 ];
 
 /// The directory the built-in units are written to.

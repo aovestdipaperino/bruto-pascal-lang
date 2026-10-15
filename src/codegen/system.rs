@@ -18,8 +18,16 @@ pub(super) const ARGV_GLOBAL: &str = "pascal.argv";
 
 impl<'ctx> CodeGen<'ctx> {
     /// Whether `name` is one of the program's own routines.
-    fn is_user_routine(&self, name: &str) -> bool {
-        !self.bypass_user && self.proc_return_types.contains_key(name)
+    pub(super) fn is_user_routine(&self, name: &str) -> bool {
+        // A C function an external routine names under another Pascal
+        // name (SysUtils' `RenameFile` is C's `rename`) doesn't hide the
+        // built-in of the same name.
+        !self.bypass_user
+            && self.proc_return_types.contains_key(name)
+            && !self
+                .external_symbols
+                .iter()
+                .any(|(pascal, c)| c == name && pascal != name)
     }
 
     /// A libc function, declared on first use.
@@ -325,6 +333,39 @@ impl<'ctx> CodeGen<'ctx> {
                 let (slot, _) = self.resolve_array_base(&args[0], span)?;
                 let old = self.builder.build_load(ptr, slot, "old").map_err(err)?;
                 let size = self.int_arg(&args[1], span)?;
+                // A size of 0 frees the block and leaves nil, as in FPC
+                // (C's realloc may hand back a fresh minimal block).
+                let func = self.current_fn.unwrap();
+                let free_bb = self.context.append_basic_block(func, "realloc_free");
+                let grow_bb = self.context.append_basic_block(func, "realloc_grow");
+                let done_bb = self.context.append_basic_block(func, "realloc_done");
+                let empty = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::SLE,
+                        size,
+                        i64_ty.const_zero(),
+                        "empty",
+                    )
+                    .map_err(err)?;
+                self.builder
+                    .build_conditional_branch(empty, free_bb, grow_bb)
+                    .map_err(err)?;
+                self.builder.position_at_end(free_bb);
+                let free = self.libc(
+                    "free",
+                    self.context.void_type().fn_type(&[ptr.into()], false),
+                );
+                self.builder
+                    .build_call(free, &[old.into()], "")
+                    .map_err(err)?;
+                self.builder
+                    .build_store(slot, ptr.const_null())
+                    .map_err(err)?;
+                self.builder
+                    .build_unconditional_branch(done_bb)
+                    .map_err(err)?;
+                self.builder.position_at_end(grow_bb);
                 let realloc =
                     self.libc("realloc", ptr.fn_type(&[ptr.into(), i64_ty.into()], false));
                 let block = self
@@ -335,6 +376,10 @@ impl<'ctx> CodeGen<'ctx> {
                     .basic()
                     .unwrap();
                 self.builder.build_store(slot, block).map_err(err)?;
+                self.builder
+                    .build_unconditional_branch(done_bb)
+                    .map_err(err)?;
+                self.builder.position_at_end(done_bb);
             }
             // BlockRead(F, Buf, Count [, Done]) / BlockWrite(...): raw bytes
             // to or from an untyped file.

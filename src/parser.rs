@@ -3828,6 +3828,13 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        // `N := Read(Buf, Count)` in a stream's method: in an expression,
+        // `read` and `write` can only be functions of the program's own.
+        if matches!(self.peek(), Tok::KwRead | Tok::KwWrite)
+            && let Some(word) = Self::soft_keyword(self.peek())
+        {
+            self.tokens[self.pos].0 = Tok::Ident(word.to_string());
+        }
         match self.peek().clone() {
             Tok::IntLit(n) => {
                 let span = self.span();

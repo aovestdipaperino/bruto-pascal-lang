@@ -1,11 +1,12 @@
 //! `for X in Collection do`: lowered to a `while` loop over hidden locals.
 //!
 //! A string (of any kind) yields its characters, an array its elements.
-//! Anything else must be an enumerator built in place, as Free Vision
-//! writes `for EGC in TUnicodeStringExtendedGraphemeClustersEnumerator
-//! .Create(S) do`: Bruto has no classes, so `T` is an `object` type, the
-//! call runs constructor `Create` on a hidden instance, and the loop runs
-//! `while E.MoveNext do X := E.Current`.
+//! An instance of a class yields what its `GetEnumerator` enumerates (or
+//! is an enumerator itself), and the enumerator is freed after the loop.
+//! An `object` type's enumerator is built in place, as Free Vision writes
+//! `for EGC in TUnicodeStringExtendedGraphemeClustersEnumerator.Create(S)
+//! do`: the call runs constructor `Create` on a hidden instance. Either
+//! way the loop runs `while E.MoveNext do X := E.Current`.
 
 use super::{CodeGen, CodeGenError};
 use crate::ast::*;
@@ -25,7 +26,70 @@ impl<'ctx> CodeGen<'ctx> {
         let mut statements = Vec::new();
         let condition;
 
-        if let Some((type_name, constructor, args)) = self.enumerator_construction(collection) {
+        // A class instance: `Collection.GetEnumerator`, or the instance if it
+        // is an enumerator itself (`TEnum.Create(...)`); freed afterwards.
+        let mut free_enumerator = None;
+        let class = self.class_instance_of(&self.infer_declared_type(collection));
+        if let Some(class) = class {
+            let info = &self.objects[&class];
+            let (source, enum_class) = if info.methods.contains_key("getenumerator") {
+                let result = self
+                    .method_result_type(&class, "getenumerator")
+                    .and_then(|t| self.class_instance_of(&t))
+                    .ok_or_else(|| {
+                        CodeGenError::new(
+                            "GetEnumerator must return an instance of a class",
+                            Some(span),
+                        )
+                    })?;
+                let source = Expr::MethodCall {
+                    object: Box::new(collection.clone()),
+                    method: "getenumerator".to_string(),
+                    args: Vec::new(),
+                    span,
+                };
+                (source, result)
+            } else if info.methods.contains_key("movenext") {
+                (collection.clone(), class.clone())
+            } else {
+                return Err(CodeGenError::new(
+                    format!(
+                        "for-in over a '{}' needs a GetEnumerator method",
+                        self.display(&class)
+                    ),
+                    Some(span),
+                ));
+            };
+            let enumerator = self.hidden_local(&PascalType::Named(enum_class), span)?;
+            self.compile_statement(&Statement::Assignment {
+                target: enumerator.clone(),
+                expr: source,
+                span,
+            })?;
+            condition = Expr::MethodCall {
+                object: Box::new(var_expr(&enumerator)),
+                method: "movenext".to_string(),
+                args: Vec::new(),
+                span,
+            };
+            statements.push(Statement::Assignment {
+                target: var.to_string(),
+                expr: Expr::FieldAccess {
+                    record: Box::new(var_expr(&enumerator)),
+                    field: "current".to_string(),
+                    span,
+                },
+                span,
+            });
+            free_enumerator = Some(Statement::MethodCall {
+                object: var_expr(&enumerator),
+                method: "free".to_string(),
+                args: Vec::new(),
+                span,
+            });
+        } else if let Some((type_name, constructor, args)) =
+            self.enumerator_construction(collection)
+        {
             let enumerator = self.hidden_local(&PascalType::Named(type_name), span)?;
             self.compile_statement(&Statement::MethodCall {
                 object: var_expr(&enumerator),
@@ -108,7 +172,7 @@ impl<'ctx> CodeGen<'ctx> {
             });
         }
         statements.push(Statement::Block(body.clone()));
-        self.compile_statement(&Statement::While {
+        let looped = Statement::While {
             condition,
             body: Block {
                 span: body.span,
@@ -116,7 +180,33 @@ impl<'ctx> CodeGen<'ctx> {
                 statements,
             },
             span,
-        })?;
+        };
+        match free_enumerator {
+            // `try ... finally E.Free end` where an exception or `exit` can
+            // leave the loop.
+            Some(free) if self.global_vars.contains_key("brutoexctop") => {
+                self.compile_statement(&Statement::Try {
+                    body: Block {
+                        statements: vec![looped],
+                        span,
+                        end_span: body.end_span,
+                    },
+                    handler: TryHandler::Finally(Block {
+                        statements: vec![free],
+                        span,
+                        end_span: body.end_span,
+                    }),
+                    span,
+                })?;
+            }
+            Some(free) => {
+                self.compile_statement(&looped)?;
+                if self.block_is_open() {
+                    self.compile_statement(&free)?;
+                }
+            }
+            None => self.compile_statement(&looped)?,
+        }
         // The hidden locals let go of their strings.
         for (name, ty) in self.for_in_locals.split_off(first_local) {
             if self.block_is_open()

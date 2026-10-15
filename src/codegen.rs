@@ -4072,7 +4072,11 @@ impl<'ctx> CodeGen<'ctx> {
             self.call_procedural(target, &proc_ty, args, span)?;
             return Ok(());
         }
-        if self.module.get_function(name).is_none() && self.compile_system_proc(name, args, span)? {
+        // A built-in, unless the program has a routine of that name (the
+        // module may also hold a C function by that name).
+        if (self.module.get_function(name).is_none() || !self.is_user_routine(name))
+            && self.compile_system_proc(name, args, span)?
+        {
             return Ok(());
         }
         let func = self.module.get_function(name).ok_or_else(|| {
@@ -9245,7 +9249,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// What calling method `method` of object type `object` yields: its
     /// result type, or a pointer to the object for a constructor.
-    fn method_result_type(&self, object: &str, method: &str) -> Option<PascalType> {
+    pub(super) fn method_result_type(&self, object: &str, method: &str) -> Option<PascalType> {
         let m = self.objects.get(object)?.methods.get(method)?;
         match m.kind {
             // A class's constructor gives the new instance.

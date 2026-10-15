@@ -268,13 +268,12 @@ impl<'ctx> CodeGen<'ctx> {
         // Declare this type's own methods so calls and VMTs can refer to
         // them before their bodies are compiled.
         for m in &decl.methods {
-            if m.is_abstract {
-                continue;
-            }
             let method = &info.methods[&m.name];
             let fn_type = self.method_fn_type(method);
             let symbol = method.symbol.clone();
-            if self.module.get_function(&symbol).is_none() {
+            // An abstract method has no function, but calls through the VMT
+            // still need its parameter modes.
+            if !m.is_abstract && self.module.get_function(&symbol).is_none() {
                 self.module.add_function(&symbol, fn_type, None);
             }
             let mut param_info = Vec::new();

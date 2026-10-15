@@ -55,6 +55,51 @@ type
   ENotImplemented = class(Exception);
   ENotSupportedException = class(Exception);
 
+const
+  { FileOpen modes and sharing flags (sharing is accepted and ignored). }
+  fmOpenRead = $0000;
+  fmOpenWrite = $0001;
+  fmOpenReadWrite = $0002;
+  fmShareCompat = $0000;
+  fmShareExclusive = $0010;
+  fmShareDenyWrite = $0020;
+  fmShareDenyRead = $0030;
+  fmShareDenyNone = $0040;
+  { FileSeek origins. }
+  fsFromBeginning = 0;
+  fsFromCurrent = 1;
+  fsFromEnd = 2;
+
+{ Files by handle: -1 when they can't be opened or created. }
+function FileOpen(const FileName: string; Mode: LongInt): THandle;
+function FileCreate(const FileName: string): THandle;
+function FileRead(Handle: THandle; var Buffer; Count: LongInt): LongInt;
+function FileWrite(Handle: THandle; const Buffer; Count: LongInt): LongInt;
+function FileSeek(Handle: THandle; FOffset: Int64; Origin: LongInt): Int64;
+procedure FileClose(Handle: THandle);
+function DeleteFile(const FileName: string): Boolean;
+function RenameFile(const OldName, NewName: string): Boolean;
+
+{ Comparisons: < 0, 0 or > 0, as FPC's. The Text ones ignore ASCII
+  case. }
+function CompareStr(const S1, S2: string): LongInt;
+function CompareText(const S1, S2: string): LongInt;
+function SameStr(const S1, S2: string): Boolean;
+function SameText(const S1, S2: string): Boolean;
+function AnsiCompareStr(const S1, S2: string): LongInt;
+function AnsiCompareText(const S1, S2: string): LongInt;
+function AnsiSameText(const S1, S2: string): Boolean;
+function AnsiUpperCase(const S: string): string;
+function AnsiLowerCase(const S: string): string;
+function QuotedStr(const S: string): string;
+function AnsiQuotedStr(const S: string; Quote: Char): string;
+function BoolToStr(B: Boolean; UseBoolStrs: Boolean): string;
+
+{ The error code of the last system call that failed (errno), and its
+  description. }
+function GetLastOSError: LongInt;
+function SysErrorMessage(ErrorCode: LongInt): string;
+
 { Raise EAbort, the exception that is handled without a message. }
 procedure Abort;
 { The exception being handled, in an exception handler. }
@@ -270,6 +315,212 @@ begin
     VMT := PPointer(Instance)^;
     TBrutoDestructor(PPointer(PtrUInt(VMT) + 5 * SizeOf(Pointer))^)(Instance, 1);
   end;
+end;
+
+{$ifdef WINDOWS}
+function bruto_open(Path: PChar; Flags: LongInt): LongInt; cdecl; varargs; external 'c' name '_open';
+function bruto_read(Fd: LongInt; Buf: Pointer; Count: LongWord): LongInt; cdecl; external 'c' name '_read';
+function bruto_write(Fd: LongInt; Buf: Pointer; Count: LongWord): LongInt; cdecl; external 'c' name '_write';
+function bruto_lseek(Fd: LongInt; Offset: Int64; Origin: LongInt): Int64; cdecl; external 'c' name '_lseeki64';
+function bruto_close(Fd: LongInt): LongInt; cdecl; external 'c' name '_close';
+function bruto_unlink(Path: PChar): LongInt; cdecl; external 'c' name '_unlink';
+const
+  BrutoOpenFlags: array[0..2] of LongInt = ($8000, $8001, $8002);
+  BrutoCreateFlags = $8000 or $0001 or $0100 or $0200;
+{$else}
+{ open's mode is a variadic argument (passed on the stack on arm64). }
+function bruto_open(Path: PChar; Flags: LongInt): LongInt; cdecl; varargs; external 'c' name 'open';
+function bruto_read(Fd: LongInt; Buf: Pointer; Count: PtrUInt): PtrInt; cdecl; external 'c' name 'read';
+function bruto_write(Fd: LongInt; Buf: Pointer; Count: PtrUInt): PtrInt; cdecl; external 'c' name 'write';
+function bruto_lseek(Fd: LongInt; Offset: Int64; Origin: LongInt): Int64; cdecl; external 'c' name 'lseek';
+function bruto_close(Fd: LongInt): LongInt; cdecl; external 'c' name 'close';
+function bruto_unlink(Path: PChar): LongInt; cdecl; external 'c' name 'unlink';
+const
+  BrutoOpenFlags: array[0..2] of LongInt = (0, 1, 2);
+{$ifdef DARWIN}
+  BrutoCreateFlags = 1 or $0200 or $0400;
+{$else}
+  BrutoCreateFlags = 1 or $0040 or $0200;
+{$endif}
+{$endif}
+function bruto_rename(OldPath, NewPath: PChar): LongInt; cdecl; external 'c' name 'rename';
+function bruto_strerror(Code: LongInt): PChar; cdecl; external 'c' name 'strerror';
+{$ifdef WINDOWS}
+function bruto_errno_location: PLongInt; cdecl; external 'c' name '_errno';
+{$else}
+{$ifdef DARWIN}
+function bruto_errno_location: PLongInt; cdecl; external 'c' name '__error';
+{$else}
+function bruto_errno_location: PLongInt; cdecl; external 'c' name '__errno_location';
+{$endif}
+{$endif}
+
+function GetLastOSError: LongInt;
+var
+  P: PLongInt;
+begin
+  P := bruto_errno_location;
+  GetLastOSError := P^;
+end;
+
+function SysErrorMessage(ErrorCode: LongInt): string;
+var
+  S: string;
+begin
+  S := bruto_strerror(ErrorCode);
+  SysErrorMessage := S;
+end;
+
+function FileOpen(const FileName: string; Mode: LongInt): THandle;
+begin
+  FileOpen := bruto_open(PChar(FileName), BrutoOpenFlags[Mode and 3]);
+end;
+
+function FileCreate(const FileName: string): THandle;
+begin
+  FileCreate := bruto_open(PChar(FileName), BrutoCreateFlags, LongInt(438));
+end;
+
+function FileRead(Handle: THandle; var Buffer; Count: LongInt): LongInt;
+begin
+  FileRead := bruto_read(Handle, @Buffer, Count);
+end;
+
+function FileWrite(Handle: THandle; const Buffer; Count: LongInt): LongInt;
+begin
+  FileWrite := bruto_write(Handle, @Buffer, Count);
+end;
+
+function FileSeek(Handle: THandle; FOffset: Int64; Origin: LongInt): Int64;
+begin
+  FileSeek := bruto_lseek(Handle, FOffset, Origin);
+end;
+
+procedure FileClose(Handle: THandle);
+begin
+  bruto_close(Handle);
+end;
+
+function DeleteFile(const FileName: string): Boolean;
+begin
+  DeleteFile := bruto_unlink(PChar(FileName)) = 0;
+end;
+
+function RenameFile(const OldName, NewName: string): Boolean;
+begin
+  RenameFile := bruto_rename(PChar(OldName), PChar(NewName)) = 0;
+end;
+
+function CompareStr(const S1, S2: string): LongInt;
+var
+  I, N: Integer;
+begin
+  N := Length(S1);
+  if Length(S2) < N then
+    N := Length(S2);
+  for I := 1 to N do
+    if S1[I] <> S2[I] then
+    begin
+      if S1[I] < S2[I] then
+        Exit(-1);
+      Exit(1);
+    end;
+  CompareStr := Length(S1) - Length(S2);
+end;
+
+function CompareText(const S1, S2: string): LongInt;
+var
+  I, N, C1, C2: Integer;
+begin
+  N := Length(S1);
+  if Length(S2) < N then
+    N := Length(S2);
+  for I := 1 to N do
+  begin
+    C1 := Ord(S1[I]);
+    C2 := Ord(S2[I]);
+    if C1 <> C2 then
+    begin
+      if (C1 >= 97) and (C1 <= 122) then
+        C1 := C1 - 32;
+      if (C2 >= 97) and (C2 <= 122) then
+        C2 := C2 - 32;
+      if C1 <> C2 then
+        Exit(C1 - C2);
+    end;
+  end;
+  CompareText := Length(S1) - Length(S2);
+end;
+
+function SameStr(const S1, S2: string): Boolean;
+begin
+  SameStr := CompareStr(S1, S2) = 0;
+end;
+
+function SameText(const S1, S2: string): Boolean;
+begin
+  SameText := CompareText(S1, S2) = 0;
+end;
+
+function AnsiCompareStr(const S1, S2: string): LongInt;
+begin
+  AnsiCompareStr := CompareStr(S1, S2);
+end;
+
+function AnsiCompareText(const S1, S2: string): LongInt;
+begin
+  AnsiCompareText := CompareStr(LowerCase(S1), LowerCase(S2));
+  if AnsiCompareText < 0 then
+    AnsiCompareText := -1
+  else if AnsiCompareText > 0 then
+    AnsiCompareText := 1;
+end;
+
+function AnsiSameText(const S1, S2: string): Boolean;
+begin
+  AnsiSameText := AnsiCompareText(S1, S2) = 0;
+end;
+
+function AnsiUpperCase(const S: string): string;
+begin
+  AnsiUpperCase := UpperCase(S);
+end;
+
+function AnsiLowerCase(const S: string): string;
+begin
+  AnsiLowerCase := LowerCase(S);
+end;
+
+function AnsiQuotedStr(const S: string; Quote: Char): string;
+var
+  I: Integer;
+  R: string;
+begin
+  R := Quote;
+  for I := 1 to Length(S) do
+  begin
+    R := R + S[I];
+    if S[I] = Quote then
+      R := R + Quote;
+  end;
+  AnsiQuotedStr := R + Quote;
+end;
+
+function QuotedStr(const S: string): string;
+begin
+  QuotedStr := AnsiQuotedStr(S, '''');
+end;
+
+function BoolToStr(B: Boolean; UseBoolStrs: Boolean): string;
+begin
+  if UseBoolStrs then
+  begin
+    if B then BoolToStr := 'True' else BoolToStr := 'False';
+  end
+  else if B then
+    BoolToStr := '-1'
+  else
+    BoolToStr := '0';
 end;
 
 constructor Exception.Create(const Msg: string);

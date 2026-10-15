@@ -4054,6 +4054,171 @@ end.
     }
 
     #[test]
+    fn classes_unit_lists_strings_and_streams() {
+        let tmp = std::env::temp_dir().join(format!("bruto-classes-{}.tmp", std::process::id()));
+        let tmp = tmp.display();
+        let source = format!(
+            "program T;
+{{$mode objfpc}}{{$H+}}
+uses SysUtils, Classes;
+
+type
+  TWatcher = class
+    Changes: Integer;
+    procedure Changed(Sender: TObject);
+  end;
+
+procedure TWatcher.Changed(Sender: TObject);
+begin
+  Inc(Changes);
+end;
+
+function ByValue(Item1, Item2: Pointer): Integer;
+begin
+  Result := PtrInt(Item1) - PtrInt(Item2);
+end;
+
+function ByLength(List: TStringList; Index1, Index2: Integer): Integer;
+begin
+  Result := Length(List[Index1]) - Length(List[Index2]);
+  if Result = 0 then
+    Result := CompareStr(List[Index1], List[Index2]);
+end;
+
+var
+  SL, SL2: TStringList;
+  L: TList;
+  W: TWatcher;
+  I: Integer;
+  V: LongInt;
+  S: string;
+  MS: TMemoryStream;
+  SS: TStringStream;
+  FS: TFileStream;
+begin
+  SL := TStringList.Create;
+  W := TWatcher.Create;
+  SL.OnChange := @W.Changed;
+  SL.Add('pear');
+  SL.Add('Apple');
+  SL.Add('banana');
+  SL.Add('_under');
+  SL.Add('cherry');
+  SL.Insert(1, 'kiwi');
+  WriteLn(SL.Count, ' ', SL[1], ' ', SL.IndexOf('APPLE'), ' ', SL.IndexOf('fig'), ' changes ', W.Changes);
+  WriteLn(SL.CommaText);
+  SL.Sort;
+  WriteLn(SL.CommaText);
+  SL.CustomSort(@ByLength);
+  WriteLn(SL.CommaText);
+  SL.Delete(0);
+  SL.Exchange(0, 1);
+  SL.Move(0, 3);
+  Write('[');
+  for S in SL do
+    Write(S, ';');
+  WriteLn(']');
+  SL.Clear;
+  SL.CommaText := 'one, \"two three\",four,\"say \"\"hi\"\"\",, last';
+  WriteLn(SL.Count);
+  for I := 0 to SL.Count - 1 do
+    Write('<', SL[I], '>');
+  WriteLn;
+  WriteLn(SL.CommaText);
+  SL.Delimiter := ';';
+  SL.StrictDelimiter := True;
+  SL.DelimitedText := 'a b;c;;d';
+  WriteLn(SL.Count, ' ', SL.DelimitedText);
+  SL.Clear;
+  SL.Values['host'] := 'example.com';
+  SL.Values['port'] := '80';
+  SL.Values['host'] := 'other.org';
+  WriteLn(SL.Text = 'host=other.org' + LineEnding + 'port=80' + LineEnding, ' ', SL.Names[1], ' ',
+    SL.Values['PORT'], ' ', SL.ValueFromIndex[0], ' ', SL.IndexOfName('port'));
+  SL.Values['port'] := '';
+  WriteLn(SL.Count);
+  SL.Text := 'line1'#13#10'line2'#10'line3'#13'line4';
+  WriteLn(SL.Count, ' ', SL[3]);
+
+  SL2 := TStringList.Create;
+  SL2.Sorted := True;
+  SL2.Duplicates := dupIgnore;
+  SL2.Add('m'); SL2.Add('c'); SL2.Add('x'); SL2.Add('c'); SL2.Add('A');
+  WriteLn(SL2.CommaText, ' ', SL2.IndexOf('X'));
+  SL2.Duplicates := dupError;
+  try
+    SL2.Add('m');
+  except
+    on E: EStringListError do WriteLn(E.ClassName, ': ', E.Message);
+  end;
+  try
+    WriteLn(SL2[10]);
+  except
+    on E: Exception do WriteLn(E.ClassName, ': ', E.Message);
+  end;
+  SL2.Assign(SL);
+  WriteLn(SL2.Count, ' ', SL2.Sorted, ' ', SL2.Equals(SL));
+
+  L := TList.Create;
+  for I := 1 to 10 do
+    L.Add(Pointer(PtrInt((I * 7) mod 11)));
+  L.Sort(@ByValue);
+  for I := 0 to L.Count - 1 do
+    Write(PtrInt(L[I]), ' ');
+  WriteLn;
+  L.Delete(0);
+  L.Remove(Pointer(PtrInt(5)));
+  L.Insert(0, nil);
+  L.Pack;
+  WriteLn(L.Count, ' ', PtrInt(L.First), ' ', PtrInt(L.Last), ' ', L.IndexOf(Pointer(PtrInt(9))));
+  try
+    L[50] := nil;
+  except
+    on E: EListError do WriteLn(E.Message);
+  end;
+
+  MS := TMemoryStream.Create;
+  MS.WriteAnsiString('hello');
+  V := 12345;
+  MS.WriteBuffer(V, SizeOf(V));
+  MS.Position := 0;
+  S := MS.ReadAnsiString;
+  V := 0;
+  MS.ReadBuffer(V, SizeOf(V));
+  WriteLn(S, ' ', V, ' ', MS.Size, ' ', MS.Position);
+  SL.SaveToStream(MS);
+  MS.SaveToFile('{tmp}');
+  FS := TFileStream.Create('{tmp}', fmOpenRead);
+  WriteLn(FS.Size);
+  FS.Free;
+  SL2.Clear;
+  SL2.LoadFromFile('{tmp}');
+  WriteLn(SL2.Count, ' ', SL2[SL2.Count - 1]);
+  SS := TStringStream.Create('abc');
+  SS.Position := 3;
+  SS.WriteString('def');
+  SS.Position := 1;
+  WriteLn(SS.DataString, ' ', SS.ReadString(3), ' ', SS.Size);
+  try
+    FS := TFileStream.Create('/nonexistent/x.txt', fmOpenRead);
+  except
+    on E: EFOpenError do WriteLn(E.Message);
+  end;
+  DeleteFile('{tmp}');
+  SS.Free; MS.Free; L.Free; SL2.Free;
+  SL.Free; W.Free;
+end.
+"
+        );
+        let (ok, out) = build_and_run_source(&source);
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "6 kiwi 2 -1 changes 6\npear,kiwi,Apple,banana,_under,cherry\n_under,Apple,banana,cherry,kiwi,pear\nkiwi,pear,Apple,_under,banana,cherry\n[pear;_under;banana;Apple;cherry;]\n6\n<one><two three><four><say \"hi\"><><last>\none,\"two three\",four,\"say \"\"hi\"\"\",,last\n4 a b;c;;d\nTRUE port 80 other.org 1\n2\n4 line4\nA,c,m,x 3\nEStringListError: String list does not allow duplicates\nEStringListError: List index (10) out of bounds\n4 TRUE TRUE\n1 2 3 4 5 6 7 8 9 10 \n8 2 10 6\nList index (50) out of bounds\nhello 12345 13 13\n37\n4 line4\nabcdef bcd 6\nUnable to open file \"/nonexistent/x.txt\": No such file or directory\n"
+        );
+    }
+
+    #[test]
     fn class_instances_and_their_strings_are_freed() {
         let (ok, out) = build_and_run_source(
             "program T;
