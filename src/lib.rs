@@ -947,8 +947,8 @@ mod tests {
         );
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(lines[0], "true");
-        assert_eq!(lines[1], "false");
+        assert_eq!(lines[0], "TRUE");
+        assert_eq!(lines[1], "FALSE");
     }
 
     #[test]
@@ -1253,7 +1253,7 @@ end.
         assert_eq!(
             lines,
             [
-                "48", "252", "204", "1024", "128", "-1", "240 15", "true", "false", "-2.5", "true"
+                "48", "252", "204", "1024", "128", "-1", "240 15", "TRUE", "FALSE", "-2.5", "TRUE"
             ]
         );
     }
@@ -1282,7 +1282,7 @@ end.
         );
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(lines, ["safe", "or", "2", "true"]);
+        assert_eq!(lines, ["safe", "or", "2", "TRUE"]);
     }
 
     #[test]
@@ -1494,8 +1494,8 @@ end.
                 "42",
                 "7 44",
                 "6",
-                "true false",
-                "false",
+                "TRUE FALSE",
+                "FALSE",
                 "show 9",
                 "44 -56 1 65535"
             ]
@@ -1680,7 +1680,7 @@ end.
                 "1",
                 "small area  3.00",
                 "plain area  0.00",
-                "true true",
+                "TRUE TRUE",
                 "4",
                 "4"
             ]
@@ -1888,7 +1888,7 @@ end.
         );
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(lines, ["14", "4", "99 5", "3", "20", "true"]);
+        assert_eq!(lines, ["14", "4", "99 5", "3", "20", "TRUE"]);
     }
 
     #[test]
@@ -1998,7 +1998,7 @@ end.
                 "trunc 5",
                 "hell",
                 "hell!",
-                "AbAb true",
+                "AbAb TRUE",
                 "Ada Lovela 36",
                 "xyz 3",
                 ">ell! ell 3",
@@ -2047,7 +2047,7 @@ end.
         let _ = std::fs::remove_file("bruto_blockio_test.bin");
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(lines, ["6 0", "ok", "18 52 true", "true true", "1234567 4"]);
+        assert_eq!(lines, ["6 0", "ok", "18 52 TRUE", "TRUE TRUE", "1234567 4"]);
     }
 
     #[test]
@@ -2169,7 +2169,7 @@ end.
         );
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(lines, ["150", "30", "true", "false false"]);
+        assert_eq!(lines, ["150", "30", "TRUE", "FALSE FALSE"]);
     }
 
     #[test]
@@ -2340,8 +2340,8 @@ end.
         assert!(ok, "new features program failed to run");
         assert!(out.contains("Blue = 2"), "enum: {out}");
         assert!(out.contains("n = 7"), "subrange: {out}");
-        assert!(out.contains("5 in set: true"), "set-in: {out}");
-        assert!(out.contains("4 in set: false"), "set-not-in: {out}");
+        assert!(out.contains("5 in set: TRUE"), "set-in: {out}");
+        assert!(out.contains("4 in set: FALSE"), "set-not-in: {out}");
         assert!(out.contains("Blue"), "case: {out}");
         assert!(out.contains("pt = 300"), "with: {out}");
         assert!(out.contains("m[1,2] = 42"), "multi-dim: {out}");
@@ -2370,8 +2370,8 @@ end.
         );
         assert!(ok);
         let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(lines[0], "true");
-        assert_eq!(lines[1], "false");
+        assert_eq!(lines[0], "TRUE");
+        assert_eq!(lines[1], "FALSE");
     }
 
     #[test]
@@ -2414,8 +2414,8 @@ end.
         );
         assert!(ok);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "true");
-        assert_eq!(lines[1], "false");
+        assert_eq!(lines[0], "TRUE");
+        assert_eq!(lines[1], "FALSE");
     }
 
     #[test]
@@ -2934,7 +2934,7 @@ end.
         assert!(ok, "program failed: {out}");
         assert_eq!(
             out,
-            "true false\nfalse\nlate\n9\n[abc\0\0] 5\n[ab]\n20\n42\nbye\n"
+            "TRUE FALSE\nFALSE\nlate\n9\n[abc\0\0] 5\n[ab]\n20\n42\nbye\n"
         );
     }
 
@@ -2959,7 +2959,7 @@ end.
 ",
         );
         assert!(ok, "program failed: {out}");
-        assert_eq!(out, "15104 8\n4 3\n0 true\ntrue\n");
+        assert_eq!(out, "15104 8\n4 3\n0 TRUE\nTRUE\n");
     }
 
     #[test]
@@ -3099,7 +3099,7 @@ end.
 ",
         );
         assert!(ok, "program failed: {out}");
-        assert_eq!(out, "visited 3\n2\ntrue\none\ntwo\nabc 3 2\nx\n");
+        assert_eq!(out, "visited 3\n2\nTRUE\none\ntwo\nabc 3 2\nx\n");
     }
 
     #[test]
@@ -3172,7 +3172,7 @@ end.
         assert!(ok, "program failed: {out}");
         assert_eq!(
             out,
-            "$00FF|-7|ab|    r\n42 AB MIX [t]\nchild\nbase 3\ntrue [he] [i]\nabc/ 4\n"
+            "$00FF|-7|ab|    r\n42 AB MIX [t]\nchild\nbase 3\nTRUE [he] [i]\nabc/ 4\n"
         );
     }
 
@@ -3229,11 +3229,11 @@ end.
             out,
             "7 10 h\u{e9}llo \u{6253}\n\
              h\u{e9}llo \u{6253}\u{2502} 233 9474\n\
-             \u{e9}ll <\u{e9}llo \u{6253}\u{2502} 3 false true\n\
+             \u{e9}ll <\u{e9}llo \u{6253}\u{2502} 3 FALSE TRUE\n\
              >\u{e9}l3 \u{c9}A \u{250c}\u{2510}\n\
              ab 0\n\
              box\n\
-             false true\n"
+             FALSE TRUE\n"
         );
     }
 
@@ -3379,7 +3379,7 @@ end.
 ",
         );
         assert!(ok, "program failed: {out}");
-        assert_eq!(out, "false true true\n");
+        assert_eq!(out, "FALSE TRUE TRUE\n");
     }
 
     #[test]
@@ -3609,8 +3609,8 @@ end.
         assert!(ok, "program failed: {out}");
         assert_eq!(
             out,
-            "sq is a square 4.0 TSquare square\nsq 9.0\ntrue true 3.0\n\
-             true TShape true\nbye sq\n4302\n4\n2 5 10 false\n"
+            "sq is a square 4.0 TSquare square\nsq 9.0\nTRUE TRUE 3.0\n\
+             TRUE TShape TRUE\nbye sq\n4302\n4\n2 5 10 FALSE\n"
         );
     }
 
@@ -3648,6 +3648,33 @@ end.
         );
         assert!(ok, "program failed: {out}");
         assert_eq!(out, "7 14 30\n");
+    }
+
+    #[test]
+    fn booleans_are_written_as_fpc_writes_them() {
+        let path = std::env::temp_dir().join(format!("bruto-bools-{}.txt", std::process::id()));
+        let source = format!(
+            "program T;
+var B: Boolean; F: Text; S: String;
+begin
+  B := 1 < 2;
+  writeln(B, ' ', not B, ' [', B:6, '] [', not B:7, ']');
+  Assign(F, '{}');
+  Rewrite(F);
+  writeln(F, B, ' ', not B);
+  Close(F);
+  Reset(F);
+  readln(F, S);
+  Close(F);
+  writeln(S);
+end.
+",
+            path.display()
+        );
+        let (ok, out) = build_and_run_source(&source);
+        let _ = std::fs::remove_file(&path);
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "TRUE FALSE [  TRUE] [  FALSE]\nTRUE FALSE\n");
     }
 
     #[test]
@@ -3703,7 +3730,7 @@ end.
 ",
         );
         assert!(ok, "program failed: {out}");
-        assert_eq!(out, "true\ntrue\n");
+        assert_eq!(out, "TRUE\nTRUE\n");
     }
 
     #[test]
@@ -3889,7 +3916,7 @@ end.
         assert_eq!(
             out,
             "abab-cc\nset!\nchanged onetwo onetwo\notherx rec1w\nheap-rec MIXED CASE\n\
-             100000100000a-b 100000100000A-B 100\ntrue\n"
+             100000100000a-b 100000100000A-B 100\nTRUE\n"
         );
     }
 
@@ -3943,7 +3970,7 @@ end.
 ",
         );
         assert!(ok, "program failed: {out}");
-        assert_eq!(out, "person50000 nick 50000 C person7\ntrue\n");
+        assert_eq!(out, "person50000 nick 50000 C person7\nTRUE\n");
     }
 
     // Bruto's network units are for Unix (BSD sockets).
@@ -3993,7 +4020,7 @@ end.
         assert!(ok, "program failed: {out}");
         assert_eq!(
             out,
-            "16 4 192.168.1.20 10.0.0.1 true 0\n0 0\n0\n127.0.0.1\n5 hello\n0\ntrue 127.0.0.1\n"
+            "16 4 192.168.1.20 10.0.0.1 TRUE 0\n0 0\n0\n127.0.0.1\n5 hello\n0\nTRUE 127.0.0.1\n"
         );
     }
 
@@ -4061,7 +4088,7 @@ end.
         assert!(ok, "program failed: {out}");
         assert_eq!(
             out,
-            "echo: first\necho: second\n200 [Hello, world] text/plain\nfalse\ndatagram 127.0.0.1 true\n"
+            "echo: first\necho: second\n200 [Hello, world] text/plain\nFALSE\ndatagram 127.0.0.1 TRUE\n"
         );
     }
 

@@ -4961,7 +4961,7 @@ impl<'ctx> CodeGen<'ctx> {
                         "bruto_file_write_int"
                     }
                     PascalType::Real => "bruto_file_write_real",
-                    PascalType::Boolean => "bruto_file_write_int",
+                    PascalType::Boolean => "bruto_file_write_str",
                     PascalType::Char => "bruto_file_write_char",
                     PascalType::String | PascalType::Pointer(_) => "bruto_file_write_str",
                     _ => {
@@ -4972,13 +4972,38 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 };
                 let mut call_val = val;
+                // A boolean is written as TRUE or FALSE, as FPC does.
                 if matches!(arg_type, PascalType::Boolean) {
+                    let err = |e: inkwell::builder::BuilderError| {
+                        CodeGenError::new(e.to_string(), Some(span))
+                    };
                     let iv = val.into_int_value();
+                    let truth = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::NE,
+                            iv,
+                            iv.get_type().const_zero(),
+                            "truth",
+                        )
+                        .map_err(err)?;
+                    let yes = self
+                        .builder
+                        .build_global_string_ptr("TRUE", "file_true")
+                        .map_err(err)?;
+                    let no = self
+                        .builder
+                        .build_global_string_ptr("FALSE", "file_false")
+                        .map_err(err)?;
                     call_val = self
                         .builder
-                        .build_int_z_extend(iv, self.context.i64_type(), "z")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                        .into();
+                        .build_select(
+                            truth,
+                            yes.as_pointer_value(),
+                            no.as_pointer_value(),
+                            "bool_text",
+                        )
+                        .map_err(err)?;
                 }
                 let f = self.module.get_function(fname).unwrap();
                 self.builder
@@ -5073,6 +5098,44 @@ impl<'ctx> CodeGen<'ctx> {
                         self.builder
                             .build_call(cf, &[val.into(), width_i.into()], "")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    }
+                    // `B:6`: TRUE or FALSE, right-aligned.
+                    PascalType::Boolean if val.is_int_value() => {
+                        let err = |e: inkwell::builder::BuilderError| {
+                            CodeGenError::new(e.to_string(), Some(span))
+                        };
+                        let truth = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::NE,
+                                val.into_int_value(),
+                                val.into_int_value().get_type().const_zero(),
+                                "truth",
+                            )
+                            .map_err(err)?;
+                        let yes = self
+                            .builder
+                            .build_global_string_ptr("TRUE", "fmt_true")
+                            .map_err(err)?;
+                        let no = self
+                            .builder
+                            .build_global_string_ptr("FALSE", "fmt_false")
+                            .map_err(err)?;
+                        let text = self
+                            .builder
+                            .build_select(
+                                truth,
+                                yes.as_pointer_value(),
+                                no.as_pointer_value(),
+                                "bool_text",
+                            )
+                            .map_err(err)?;
+                        for name in ["bruto_write_str_fmt", "bruto_capture_write_str_fmt"] {
+                            let f = self.module.get_function(name).unwrap();
+                            self.builder
+                                .build_call(f, &[text.into(), width_i.into()], "")
+                                .map_err(err)?;
+                        }
                     }
                     _ => {
                         return Err(CodeGenError::new(
