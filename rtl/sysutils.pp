@@ -18,6 +18,8 @@ function TrimRight(const S: string): string;
 function FileExists(const FileName: string): Boolean;
 function DirectoryExists(const Directory: string): Boolean;
 procedure Sleep(Milliseconds: LongWord);
+{ Free the class instance Obj refers to (if any) and set Obj to nil. }
+procedure FreeAndNil(var Obj);
 { A Pascal format string (`%d`, `%4.4x`, `%s`...) as the C one that
   prints the same with 64-bit integers. }
 function BrutoCFormat(const Fmt: string): string;
@@ -189,6 +191,25 @@ begin
     end;
   end;
   BrutoCFormat := R;
+end;
+
+type
+  { A class's destructor: Self, and whether to free the instance. }
+  TBrutoDestructor = procedure(Instance: Pointer; FreeIt: Int64);
+
+procedure FreeAndNil(var Obj);
+var
+  Instance, VMT: Pointer;
+begin
+  Instance := PPointer(@Obj)^;
+  PPointer(@Obj)^ := nil;
+  if Instance <> nil then
+  begin
+    { Destroy is the first virtual method, after the class VMT's five
+      header words. }
+    VMT := PPointer(Instance)^;
+    TBrutoDestructor(PPointer(PtrUInt(VMT) + 5 * SizeOf(Pointer))^)(Instance, 1);
+  end;
 end;
 
 end.

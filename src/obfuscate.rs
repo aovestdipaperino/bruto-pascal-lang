@@ -165,7 +165,18 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
                     collect_type(&group.ty, n);
                 }
             }
+            for p in &obj.properties {
+                n.declare(&p.name);
+                for group in &p.params {
+                    for name in &group.names {
+                        n.declare(name);
+                    }
+                    collect_type(&group.ty, n);
+                }
+                collect_type(&p.ty, n);
+            }
         }
+        PascalType::ClassOf(_) => {}
         PascalType::Enum { name, values } => {
             n.declare(name);
             for v in values {

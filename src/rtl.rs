@@ -5,7 +5,7 @@
 //! They are embedded in the compiler and written out on first use, so
 //! errors and the debugger can point at real files.
 
-use crate::ast::Program;
+use crate::ast::{PascalType, Program};
 use crate::parser::{ParseOptions, Parser};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -14,6 +14,9 @@ const SYSTEM_PRELUDE: &str = include_str!("../rtl/system.pp");
 
 /// The string routines code generation calls; every program gets them.
 const STRINGS: &str = include_str!("../rtl/brutostrings.pp");
+
+/// `TObject` and `TClass`, for programs that declare classes.
+const OBJPAS: &str = include_str!("../rtl/objpas.pp");
 
 const UNITS: &[(&str, &str)] = &[
     ("unixtype.pp", include_str!("../rtl/unixtype.pp")),
@@ -76,8 +79,30 @@ pub(crate) fn add_system_prelude(program: &mut Program) -> Result<(), String> {
     add_prelude(program, "system.pp", SYSTEM_PRELUDE)
 }
 
-/// Add the string routines (`rtl/brutostrings.pp`).
+/// Add the string routines (`rtl/brutostrings.pp`), and for a program
+/// that declares classes, `TObject` (`rtl/objpas.pp`).
 pub(crate) fn add_string_runtime(program: &mut Program) -> Result<(), String> {
+    let has_classes = program
+        .type_decls
+        .iter()
+        .any(|t| matches!(&t.ty, PascalType::Object(o) if o.is_class));
+    if has_classes {
+        // A program with a TObject of its own (Free Vision's object type)
+        // gets the root class as BrutoTObject.
+        let own_tobject = program
+            .type_decls
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case("tobject"));
+        if own_tobject {
+            add_prelude(
+                program,
+                "objpas.pp",
+                &OBJPAS.replace("TObject", "BrutoTObject"),
+            )?;
+        } else {
+            add_prelude(program, "objpas.pp", OBJPAS)?;
+        }
+    }
     add_prelude(program, "brutostrings.pp", STRINGS)
 }
 

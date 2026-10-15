@@ -711,7 +711,14 @@ impl ConstEnv {
                         self.resolve_type(rt, m.span)?;
                     }
                 }
+                for p in &mut obj.properties {
+                    for group in &mut p.params {
+                        self.resolve_type(&mut group.ty, p.span)?;
+                    }
+                    self.resolve_type(&mut p.ty, p.span)?;
+                }
             }
+            PascalType::ClassOf(_) => {}
             PascalType::ArrayExpr { lo, hi, elem } => {
                 let lo = self.eval_at(lo, span)?;
                 let hi = self.eval_at(hi, span)?;

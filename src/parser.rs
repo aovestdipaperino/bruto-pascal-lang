@@ -1377,10 +1377,18 @@ impl Parser {
     /// Whether the next token starts a routine: `procedure`, `function`,
     /// `constructor` or `destructor`.
     fn at_routine(&self) -> bool {
-        matches!(
-            self.peek(),
-            Tok::KwProcedure | Tok::KwFunction | Tok::KwConstructor | Tok::KwDestructor
-        )
+        let routine = |t: &Tok| {
+            matches!(
+                t,
+                Tok::KwProcedure | Tok::KwFunction | Tok::KwConstructor | Tok::KwDestructor
+            )
+        };
+        routine(self.peek())
+            || (matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("class"))
+                && self
+                    .tokens
+                    .get(self.pos + 1)
+                    .is_some_and(|(t, _)| routine(t)))
     }
 
     /// Parse a declaration part: `label`, `const`, `type` and `var`
@@ -1540,6 +1548,11 @@ impl Parser {
     /// calling-convention modifiers (`inline;`, `cdecl;`, ...), which are
     /// accepted and ignored.
     fn parse_routine_heading(&mut self) -> Result<ProcDecl, ParseError> {
+        // `class procedure TFoo.Bar`: whether it is a class method comes
+        // from the class's declaration.
+        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("class")) {
+            self.advance();
+        }
         let span = self.span();
         let kind = match self.peek() {
             Tok::KwProcedure => RoutineKind::Procedure,
@@ -1949,6 +1962,16 @@ impl Parser {
         if *self.peek() == Tok::KwObject {
             return self.parse_object_type();
         }
+        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("class")) {
+            // `class of T`: a class reference type.
+            if matches!(self.tokens.get(self.pos + 1), Some((Tok::KwOf, _))) {
+                self.advance();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                return Ok(PascalType::ClassOf(name));
+            }
+            return self.parse_object_type();
+        }
         // Procedural type: `procedure(params)` or `function(params): T`.
         if matches!(self.peek(), Tok::KwProcedure | Tok::KwFunction) {
             let is_func = *self.peek() == Tok::KwFunction;
@@ -2130,25 +2153,54 @@ impl Parser {
         }
     }
 
-    /// `object [(Parent)] fields and method headers end`, with optional
-    /// `private` / `public` / `protected` sections (accepted, not
-    /// enforced).
+    /// `object [(Parent)] fields and method headers end`, or `class
+    /// [(Parent, Interfaces...)] ... end`, with optional `private` /
+    /// `public` / `protected` / `published` sections (accepted, not
+    /// enforced). A class may also be forward-declared (`TFoo = class;`)
+    /// or declared with no members (`EFoo = class(Exception);`), and may
+    /// have class methods and properties.
     fn parse_object_type(&mut self) -> Result<PascalType, ParseError> {
-        self.expect(&Tok::KwObject)?;
-        let parent = if *self.peek() == Tok::LParen {
+        let is_class = *self.peek() != Tok::KwObject;
+        self.advance();
+        let mut parent = None;
+        if *self.peek() == Tok::LParen {
             self.advance();
-            let (parent, _) = self.expect_ident()?;
+            let (first, _) = self.expect_ident()?;
+            parent = Some(first);
+            // Implemented interfaces are accepted and ignored.
+            while *self.peek() == Tok::Comma {
+                self.advance();
+                self.expect_ident()?;
+            }
             self.expect(&Tok::RParen)?;
-            Some(parent)
-        } else {
-            None
-        };
+        }
         let mut obj = ObjectType {
             parent,
             fields: Vec::new(),
             methods: Vec::new(),
+            is_class,
+            is_forward: false,
+            properties: Vec::new(),
         };
+        if is_class && *self.peek() == Tok::Semi {
+            obj.is_forward = obj.parent.is_none();
+            return Ok(PascalType::Object(Box::new(obj)));
+        }
+        let is_word = |t: &Tok, w: &str| matches!(t, Tok::Ident(x) if x.eq_ignore_ascii_case(w));
         loop {
+            // `class procedure` / `class function`: a class method.
+            let class_method = is_class
+                && is_word(self.peek(), "class")
+                && matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some((
+                        Tok::KwProcedure | Tok::KwFunction | Tok::KwConstructor | Tok::KwDestructor,
+                        _
+                    ))
+                );
+            if class_method {
+                self.advance();
+            }
             match self.peek().clone() {
                 Tok::End => {
                     self.advance();
@@ -2158,22 +2210,38 @@ impl Parser {
                     let heading = self.parse_routine_heading()?;
                     let mods = self.skip_routine_modifiers(&[
                         "virtual",
+                        "dynamic",
+                        "override",
                         "abstract",
                         "inline",
                         "overload",
                         "static",
                         "reintroduce",
+                        "final",
                         "cdecl",
                     ])?;
+                    let has = |m: &str| mods.iter().any(|x| x == m);
                     obj.methods.push(MethodHeader {
                         name: heading.name,
                         kind: heading.kind,
                         params: heading.params,
                         return_type: heading.return_type,
-                        is_virtual: mods.iter().any(|m| m == "virtual"),
-                        is_abstract: mods.iter().any(|m| m == "abstract"),
+                        is_virtual: has("virtual") || has("dynamic") || has("override"),
+                        is_abstract: has("abstract"),
+                        is_override: has("override"),
+                        is_class_method: class_method,
                         span: heading.span,
                     });
+                }
+                Tok::Ident(word)
+                    if word.eq_ignore_ascii_case("property")
+                        && is_class
+                        && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _))) =>
+                {
+                    self.advance();
+                    if let Some(prop) = self.parse_property()? {
+                        obj.properties.push(prop);
+                    }
                 }
                 Tok::Ident(word)
                     if matches!(
@@ -2185,6 +2253,20 @@ impl Parser {
                     ) =>
                 {
                     self.advance();
+                }
+                // `var` before a group of fields.
+                Tok::Var if is_class => {
+                    self.advance();
+                }
+                Tok::Ident(word)
+                    if is_class
+                        && word.eq_ignore_ascii_case("class")
+                        && matches!(self.tokens.get(self.pos + 1), Some((Tok::Var, _))) =>
+                {
+                    return Err(ParseError {
+                        message: "class variables ('class var') are not supported yet".into(),
+                        span: self.span(),
+                    });
                 }
                 Tok::Ident(_) => {
                     let decl = self.parse_var_decl()?;
@@ -2198,7 +2280,8 @@ impl Parser {
                 _ => {
                     return Err(ParseError {
                         message: format!(
-                            "expected a field or method in object, found {}",
+                            "expected a field or method in {}, found {}",
+                            if is_class { "class" } else { "object" },
                             self.peek()
                         ),
                         span: self.span(),
@@ -2207,6 +2290,94 @@ impl Parser {
             }
         }
         Ok(PascalType::Object(Box::new(obj)))
+    }
+
+    /// After `property`: `Name [Params]: Type read R write W [index N]
+    /// [default V] [stored S] [nodefault]; [default;]`. A redeclaration
+    /// that only changes visibility (`property Name;`) gives `None`.
+    fn parse_property(&mut self) -> Result<Option<PropertyDecl>, ParseError> {
+        let span = self.span();
+        let (name, _) = self.expect_ident()?;
+        let mut params = Vec::new();
+        if *self.peek() == Tok::LBracket {
+            self.advance();
+            params.push(self.parse_param_group()?);
+            while *self.peek() == Tok::Semi {
+                self.advance();
+                params.push(self.parse_param_group()?);
+            }
+            self.expect(&Tok::RBracket)?;
+        }
+        let ty = if *self.peek() == Tok::Colon {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let mut prop = PropertyDecl {
+            name,
+            params,
+            ty: ty.clone().unwrap_or(PascalType::Integer),
+            read: None,
+            write: None,
+            index: None,
+            is_default: false,
+            span,
+        };
+        loop {
+            match self.peek().clone() {
+                Tok::KwRead => {
+                    self.advance();
+                    prop.read = Some(self.parse_property_accessor()?);
+                }
+                Tok::KwWrite => {
+                    self.advance();
+                    prop.write = Some(self.parse_property_accessor()?);
+                }
+                Tok::Ident(w) if w.eq_ignore_ascii_case("index") => {
+                    self.advance();
+                    let negative = *self.peek() == Tok::Minus;
+                    if negative {
+                        self.advance();
+                    }
+                    let n = self.parse_int_literal()?;
+                    prop.index = Some(if negative { -n } else { n });
+                }
+                // `default V` / `stored S`: streaming hints, skipped.
+                Tok::Ident(w)
+                    if (w.eq_ignore_ascii_case("default") || w.eq_ignore_ascii_case("stored"))
+                        && !matches!(self.tokens.get(self.pos + 1), Some((Tok::Semi, _))) =>
+                {
+                    self.advance();
+                    self.parse_expr()?;
+                }
+                Tok::Ident(w) if w.eq_ignore_ascii_case("nodefault") => {
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+        self.expect(&Tok::Semi)?;
+        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("default"))
+            && matches!(self.tokens.get(self.pos + 1), Some((Tok::Semi, _)))
+        {
+            self.advance();
+            self.advance();
+            prop.is_default = true;
+        }
+        Ok(ty.map(|_| prop))
+    }
+
+    /// A property's `read`/`write` target: a field or method name, or a
+    /// field path such as `FPoint.X`.
+    fn parse_property_accessor(&mut self) -> Result<String, ParseError> {
+        let (mut name, _) = self.expect_member_name()?;
+        while *self.peek() == Tok::Dot {
+            self.advance();
+            let (part, _) = self.expect_member_name()?;
+            name = format!("{name}.{part}");
+        }
+        Ok(name)
     }
 
     fn parse_record_type(&mut self) -> Result<PascalType, ParseError> {
@@ -3317,6 +3488,7 @@ impl Parser {
                 Tok::Lte => BinOp::Lte,
                 Tok::Gte => BinOp::Gte,
                 Tok::KwIn => BinOp::In,
+                Tok::Ident(w) if w.eq_ignore_ascii_case("is") => BinOp::Is,
                 _ => break,
             };
             let span = self.span();
@@ -3366,6 +3538,7 @@ impl Parser {
                 Tok::KwAnd => BinOp::And,
                 Tok::KwShl => BinOp::Shl,
                 Tok::KwShr => BinOp::Shr,
+                Tok::Ident(w) if w.eq_ignore_ascii_case("as") => BinOp::As,
                 _ => break,
             };
             let span = self.span();

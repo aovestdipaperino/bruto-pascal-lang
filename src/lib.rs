@@ -3434,6 +3434,380 @@ end.
     }
 
     #[test]
+    fn classes_with_virtual_methods_and_properties() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TNode = class;
+
+  TShape = class
+  protected
+    FName: string;
+  public
+    constructor Create(const AName: string); virtual;
+    destructor Destroy; override;
+    function Area: Double; virtual; abstract;
+    function Describe: string;
+    class function Kind: string; virtual;
+    property Name: string read FName write FName;
+  end;
+  TShapeClass = class of TShape;
+
+  TSquare = class(TShape)
+  private
+    FSide: Double;
+    procedure SetSide(V: Double);
+  public
+    constructor Create(const AName: string); override;
+    function Area: Double; override;
+    class function Kind: string; override;
+    property Side: Double read FSide write SetSide;
+  end;
+
+  TNode = class
+    Value: Integer;
+    Next: TNode;
+    destructor Destroy; override;
+  end;
+
+  TBag = class
+  private
+    FItems: array[0..7] of Integer;
+    FCount: Integer;
+    function GetItem(I: Integer): Integer;
+    procedure SetItem(I: Integer; V: Integer);
+    function GetFlag(Index: Integer): Boolean;
+  public
+    procedure Add(V: Integer);
+    property Count: Integer read FCount;
+    property Items[I: Integer]: Integer read GetItem write SetItem; default;
+    property IsEven: Boolean index 0 read GetFlag;
+  end;
+
+var
+  Freed: Integer;
+
+constructor TShape.Create(const AName: string);
+begin
+  inherited Create;
+  FName := AName;
+end;
+
+destructor TShape.Destroy;
+begin
+  writeln('bye ', Name);
+  inherited;
+end;
+
+function TShape.Describe: string;
+begin
+  Result := Name + ' is a ' + Kind;
+end;
+
+class function TShape.Kind: string;
+begin
+  Result := 'shape';
+end;
+
+constructor TSquare.Create(const AName: string);
+begin
+  inherited Create(AName);
+  Side := 2;
+end;
+
+procedure TSquare.SetSide(V: Double);
+begin
+  if V > 0 then FSide := V;
+end;
+
+function TSquare.Area: Double;
+begin
+  Result := Side * Side;
+end;
+
+class function TSquare.Kind: string;
+begin
+  Result := 'square';
+end;
+
+destructor TNode.Destroy;
+begin
+  Next.Free;
+  Inc(Freed);
+  inherited Destroy;
+end;
+
+function TBag.GetItem(I: Integer): Integer;
+begin
+  Result := FItems[I];
+end;
+
+procedure TBag.SetItem(I: Integer; V: Integer);
+begin
+  FItems[I] := V;
+end;
+
+function TBag.GetFlag(Index: Integer): Boolean;
+var I, Sum: Integer;
+begin
+  Sum := 0;
+  for I := 0 to Count - 1 do Sum := Sum + Items[I];
+  Result := Sum mod 2 = Index;
+end;
+
+procedure TBag.Add(V: Integer);
+begin
+  FItems[FCount] := V;
+  Inc(FCount);
+end;
+
+var
+  S: TShape;
+  C: TShapeClass;
+  Head, N: TNode;
+  B: TBag;
+  I: Integer;
+begin
+  C := TSquare;
+  S := C.Create('sq');
+  writeln(S.Describe, ' ', S.Area:0:1, ' ', S.ClassName, ' ', C.Kind);
+  with TSquare(S) do
+  begin
+    Side := -1;
+    Side := Side + 1;
+    writeln(Name, ' ', Area:0:1);
+  end;
+  writeln(S is TSquare, ' ', S is TShape, ' ', (S as TSquare).Side:0:1);
+  writeln(S.InheritsFrom(TShape), ' ', TSquare.ClassParent.ClassName, ' ', S.ClassType = TSquare);
+  S.Free;
+  S := nil;
+  S.Free;
+
+  Head := nil;
+  for I := 1 to 4 do
+  begin
+    N := TNode.Create;
+    N.Value := I;
+    N.Next := Head;
+    Head := N;
+  end;
+  Head.Next.Value := 30;
+  writeln(Head.Value, Head.Next.Value, Head.Next.Next.Value);
+  Head.Free;
+  writeln(Freed);
+
+  B := TBag.Create;
+  B.Add(3);
+  B.Add(4);
+  B[1] := 10;
+  B.Items[0] := B[0] + 2;
+  writeln(B.Count, ' ', B[0], ' ', B.Items[1], ' ', B.IsEven);
+  B.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "sq is a square 4.0 TSquare square\nsq 9.0\ntrue true 3.0\n\
+             true TShape true\nbye sq\n4302\n4\n2 5 10 false\n"
+        );
+    }
+
+    #[test]
+    fn array_properties_with_several_indices() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TGrid = class
+  private
+    FCells: array[0..3, 0..3] of Integer;
+    function GetCell(X, Y: Integer): Integer;
+    procedure SetCell(X, Y: Integer; V: Integer);
+  public
+    procedure Fill;
+    property Cells[X, Y: Integer]: Integer read GetCell write SetCell; default;
+  end;
+function TGrid.GetCell(X, Y: Integer): Integer; begin Result := FCells[X, Y]; end;
+procedure TGrid.SetCell(X, Y: Integer; V: Integer); begin FCells[X, Y] := V; end;
+procedure TGrid.Fill;
+var I: Integer;
+begin
+  for I := 0 to 3 do Cells[I, I] := I * 10;
+end;
+var G: TGrid;
+begin
+  G := TGrid.Create;
+  G.Fill;
+  G.Cells[1, 2] := 7;
+  G[2, 3] := G.Cells[1, 2] * 2;
+  writeln(G.Cells[1, 2], ' ', G[2, 3], ' ', G[3, 3]);
+  G.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "7 14 30\n");
+    }
+
+    #[test]
+    fn class_instances_and_their_strings_are_freed() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses SysUtils;
+type
+  TPerson = class
+  private
+    FName: string;
+    FTags: array[1..3] of string;
+  public
+    constructor Create(const AName: string);
+    property Name: string read FName write FName;
+  end;
+  TEmployee = class(TPerson)
+    Role: string;
+  end;
+
+constructor TPerson.Create(const AName: string);
+var I: Integer;
+begin
+  FName := AName + '!';
+  for I := 1 to 3 do FTags[I] := FName + IntToStr(I);
+end;
+
+var
+  E: TEmployee;
+  P: TPerson;
+  I: Integer;
+  H: TFPCHeapStatus;
+  Before: PtrUInt;
+begin
+  H := GetFPCHeapStatus;
+  Before := H.CurrHeapUsed;
+  for I := 1 to 50000 do
+  begin
+    E := TEmployee.Create('Ann' + IntToStr(I));
+    E.Role := 'dev ' + E.Name;
+    E.Name := E.Name + E.Role;
+    P := E;
+    FreeAndNil(P);
+  end;
+  H := GetFPCHeapStatus;
+  writeln(P = nil);
+  {$ifdef DARWIN}
+  writeln(H.CurrHeapUsed - Before < 100000);
+  {$else}
+  writeln(true);
+  {$endif}
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "true\ntrue\n");
+    }
+
+    #[test]
+    fn classes_beside_an_object_named_tobject() {
+        // Free Vision's Objects unit has an object type called TObject;
+        // classes still descend from the root class.
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  PObject = ^TObject;
+  TObject = object
+    constructor Init;
+    destructor Done; virtual;
+  end;
+  TCounter = class
+    N: Integer;
+    procedure Bump;
+  end;
+  THolder = object(TObject)
+    C: TCounter;
+    constructor Init;
+    destructor Done; virtual;
+  end;
+
+constructor TObject.Init; begin end;
+destructor TObject.Done; begin end;
+procedure TCounter.Bump; begin Inc(N); end;
+constructor THolder.Init;
+begin
+  inherited Init;
+  C := TCounter.Create;
+end;
+destructor THolder.Done;
+begin
+  C.Free;
+  inherited Done;
+end;
+
+var H: ^THolder;
+begin
+  New(H, Init);
+  H^.C.Bump;
+  H^.C.Bump;
+  writeln(H^.C.N, ' ', H^.C.ClassName, ' ', H^.C.ClassParent.ClassName);
+  Dispose(H, Done);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "2 TCounter TObject\n");
+    }
+
+    #[test]
+    fn class_mistakes_are_errors() {
+        for (source, message) in [
+            (
+                "program T;
+type
+  TA = class
+    procedure Run; override;
+  end;
+procedure TA.Run; begin end;
+begin
+end.
+",
+                "overrides nothing",
+            ),
+            (
+                "program T;
+type
+  TA = class
+    FX: Integer;
+    property X: Integer read FX;
+  end;
+var A: TA;
+begin
+  A := TA.Create;
+  A.X := 1;
+end.
+",
+                "read-only",
+            ),
+            (
+                "program T;
+type
+  TA = class
+    procedure Run;
+  end;
+procedure TA.Run; begin end;
+begin
+  TA.Run;
+end.
+",
+                "needs an object to call it on",
+            ),
+        ] {
+            let Err(e) = MiniPascal.build(source) else {
+                panic!("should not compile: {source}");
+            };
+            assert!(format!("{e:?}").contains(message), "{e:?}");
+        }
+    }
+
+    #[test]
     fn strings_are_reference_counted() {
         let (ok, out) = build_and_run_source(
             "program T;

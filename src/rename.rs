@@ -162,7 +162,25 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
                     rewrite_type(rt, n);
                 }
             }
+            for p in &mut obj.properties {
+                p.name = n.rename_member(&p.name);
+                for group in &mut p.params {
+                    for name in &mut group.names {
+                        *name = n.rename(name);
+                    }
+                    rewrite_type(&mut group.ty, n);
+                }
+                rewrite_type(&mut p.ty, n);
+                for accessor in [&mut p.read, &mut p.write].into_iter().flatten() {
+                    *accessor = accessor
+                        .split('.')
+                        .map(|part| n.rename_member(part))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                }
+            }
         }
+        PascalType::ClassOf(name) => *name = n.rename(name),
         PascalType::Enum { name, values } => {
             *name = n.rename(name);
             for v in values {

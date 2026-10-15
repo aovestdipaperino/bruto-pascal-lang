@@ -233,6 +233,9 @@ pub enum PascalType {
     /// An `object` type as declared. Code generation lowers it to a
     /// `Record` (with `object` set) plus a method table.
     Object(Box<ObjectType>),
+    /// `class of T`: a class reference, the address of T's (or a
+    /// descendant's) VMT.
+    ClassOf(String),
     /// Enumerated type: (val1, val2, val3)
     Enum {
         /// The type name (e.g., "Color") — set during type section parsing
@@ -426,13 +429,37 @@ impl ConstExpr {
     }
 }
 
-/// A Turbo Pascal `object` type declaration.
+/// A Turbo Pascal `object` type declaration, or an Object Pascal
+/// `class` (`is_class`), whose instances live on the heap and are used
+/// through references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectType {
     pub parent: Option<String>,
     /// The object's own fields, in declaration order.
     pub fields: Vec<(String, PascalType)>,
     pub methods: Vec<MethodHeader>,
+    pub is_class: bool,
+    /// `TFoo = class;`: declared here, defined later in the same section.
+    pub is_forward: bool,
+    pub properties: Vec<PropertyDecl>,
+}
+
+/// A class property: `property Name[Index: T]: T read Getter write
+/// Setter; default;`. Reading it reads the field or calls the getter;
+/// writing it writes the field or calls the setter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyDecl {
+    pub name: String,
+    /// An array property's index parameters.
+    pub params: Vec<ParamGroup>,
+    pub ty: PascalType,
+    pub read: Option<String>,
+    pub write: Option<String>,
+    /// `index N`: passed to the getter and setter before the value.
+    pub index: Option<i64>,
+    /// The class's default array property: `Obj[I]` means `Obj.Name[I]`.
+    pub is_default: bool,
+    pub span: Span,
 }
 
 /// A method declared in an object type.
@@ -444,6 +471,10 @@ pub struct MethodHeader {
     pub return_type: Option<PascalType>,
     pub is_virtual: bool,
     pub is_abstract: bool,
+    /// `override`: replaces the parent's virtual method of the same name.
+    pub is_override: bool,
+    /// `class procedure` / `class function`: `Self` is the class.
+    pub is_class_method: bool,
     pub span: Span,
 }
 
@@ -851,6 +882,8 @@ pub enum BinOp {
     Shl,
     Shr, // logical shift, as in FPC
     In,  // element membership: x in S
+    Is,  // `Obj is TClass`
+    As,  // `Obj as TClass`
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

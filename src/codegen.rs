@@ -23,6 +23,7 @@ use std::fmt;
 use std::path::Path;
 
 mod arc;
+mod classes;
 mod closures;
 mod forin;
 mod layout;
@@ -169,8 +170,16 @@ pub struct CodeGen<'ctx> {
     bypass_user: bool,
     // Objects named by enclosing `with` statements, innermost last.
     with_objects: Vec<(String, PointerValue<'ctx>)>,
+    // Class instances named by enclosing `with` statements: the class and
+    // the hidden variable referring to the instance.
+    with_classes: Vec<(String, String)>,
     // Object types (lowered to records) and the method being compiled.
     objects: HashMap<String, objects::ObjectInfo>,
+    // Whether the program declares classes, so statements are rewritten
+    // (see `classes.rs`).
+    has_classes: bool,
+    // Classes whose instance cleanup routines still need bodies.
+    class_cleanups: Vec<String>,
     current_object: Option<String>,
     method_context: Option<objects::MethodContext<'ctx>>,
     // Each routine's dummy slot for `end`-line breakpoint markers.
@@ -271,7 +280,10 @@ impl<'ctx> CodeGen<'ctx> {
             end_bp_slots: HashMap::new(),
             debug_pointer_depth: std::cell::Cell::new(0),
             objects: HashMap::new(),
+            has_classes: false,
+            class_cleanups: Vec::new(),
             with_objects: Vec::new(),
+            with_classes: Vec::new(),
             bypass_user: false,
             overloads: HashMap::new(),
             external_symbols: HashMap::new(),
@@ -544,6 +556,18 @@ impl<'ctx> CodeGen<'ctx> {
         // declaration order, so their fields can use any other type and
         // each one's parent is ready before it.
         for td in &program.type_decls {
+            // A class's name means a reference to an instance.
+            if let PascalType::Object(decl) = &td.ty
+                && decl.is_class
+            {
+                self.has_classes = true;
+                self.type_defs.insert(
+                    td.name.clone(),
+                    PascalType::Pointer(Box::new(PascalType::Named(classes::instance_type_name(
+                        &td.name,
+                    )))),
+                );
+            }
             if matches!(td.ty, PascalType::Object(_)) {
                 continue;
             }
@@ -564,7 +588,9 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         for td in &program.type_decls {
-            if let PascalType::Object(decl) = &td.ty {
+            if let PascalType::Object(decl) = &td.ty
+                && !decl.is_forward
+            {
                 self.register_object(&td.name, decl, td.span)?;
             }
         }
@@ -677,6 +703,8 @@ impl<'ctx> CodeGen<'ctx> {
             .build_return(Some(&self.context.i64_type().const_int(0, false)))
             .map_err(|e| CodeGenError::new(e.to_string(), None))?;
 
+        self.in_runtime = false;
+        self.emit_class_cleanups()?;
         self.di_builder.finalize();
 
         // A debugging aid: `BRUTO_DUMP_IR=file` writes the module's IR.
@@ -1059,6 +1087,7 @@ impl<'ctx> CodeGen<'ctx> {
             match &resolved_ty {
                 PascalType::SizedInt { .. }
                 | PascalType::Object(_)
+                | PascalType::ClassOf(_)
                 | PascalType::ShortString { .. } => {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
@@ -1633,6 +1662,8 @@ impl<'ctx> CodeGen<'ctx> {
             .clone()
             .or_else(|| method.as_ref().and_then(|(_, m)| m.return_type.clone()));
         let is_constructor = matches!(&method, Some((_, m)) if m.kind == RoutineKind::Constructor);
+        let frees_instance = matches!(&method, Some((_, m)) if m.frees_instance);
+        let is_class_method = matches!(&method, Some((_, m)) if m.is_class_method);
 
         // Build parameter type list
         let mut param_llvm_types: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
@@ -1650,6 +1681,14 @@ impl<'ctx> CodeGen<'ctx> {
                     "__vmt_arg".to_string(),
                     ParamMode::Value,
                     PascalType::Pointer(Box::new(PascalType::Untyped)),
+                ));
+            }
+            if frees_instance {
+                param_llvm_types.push(self.context.i64_type().into());
+                param_info.push((
+                    "__free_arg".to_string(),
+                    ParamMode::Value,
+                    PascalType::Integer,
                 ));
             }
         }
@@ -1838,8 +1877,28 @@ impl<'ctx> CodeGen<'ctx> {
             self.method_context = Some(objects::MethodContext {
                 self_ptr,
                 in_constructor: is_constructor,
+                in_class_method: is_class_method,
             });
-            self.bind_object_fields(owner, self_ptr, proc.span)?;
+            // In a class's method, `Self` is a reference: the instance's
+            // address, or in a class method, the class.
+            if self.objects[owner].is_class {
+                let slot = self
+                    .entry_alloca(self.context.ptr_type(AddressSpace::default()), "self")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
+                self.builder
+                    .build_store(slot, self_ptr)
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
+                self.variables.insert("self".to_string(), slot);
+                let self_ty = if is_class_method {
+                    PascalType::ClassOf(owner.clone())
+                } else {
+                    PascalType::Named(owner.clone())
+                };
+                self.var_types.insert("self".to_string(), self_ty);
+            }
+            if !is_class_method {
+                self.bind_object_fields(owner, self_ptr, proc.span)?;
+            }
         }
 
         // Nested in a method: the object's methods are reachable through
@@ -1848,10 +1907,26 @@ impl<'ctx> CodeGen<'ctx> {
             && let (Some(object), Some(self_ptr)) =
                 (enclosing_object, self.variables.get("self").copied())
         {
+            // A class's `Self` is captured as its slot.
+            let in_class_method =
+                matches!(self.var_types.get("self"), Some(PascalType::ClassOf(_)));
+            let self_ptr = if self.objects[&object].is_class {
+                self.builder
+                    .build_load(
+                        self.context.ptr_type(AddressSpace::default()),
+                        self_ptr,
+                        "self",
+                    )
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?
+                    .into_pointer_value()
+            } else {
+                self_ptr
+            };
             self.current_object = Some(object);
             self.method_context = Some(objects::MethodContext {
                 self_ptr,
                 in_constructor: false,
+                in_class_method,
             });
         }
 
@@ -2043,6 +2118,13 @@ impl<'ctx> CodeGen<'ctx> {
             );
             locals.retain(|(_, ty)| self.needs_arc(ty));
             self.arc_release_locals(&locals, proc.body.end_span)?;
+        }
+
+        // A class's destructor frees the instance.
+        if frees_instance {
+            let self_ptr = self.method_context.unwrap().self_ptr;
+            let flag = func.get_nth_param(1).unwrap().into_int_value();
+            self.free_instance_if(self_ptr, flag, proc.body.end_span)?;
         }
 
         // Return (profiler exit first so the routine's time closes)
@@ -2461,6 +2543,17 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_statement(&mut self, stmt: &Statement) -> Result<(), CodeGenError> {
+        let rewritten;
+        let stmt = match self.has_classes {
+            true => match self.desugar_classes(stmt)? {
+                Some(s) => {
+                    rewritten = s;
+                    &rewritten
+                }
+                None => stmt,
+            },
+            false => stmt,
+        };
         // Free the strings the statement made and didn't store. A block's
         // statements do this one by one; a statement holding a label is
         // left to the enclosing one (a jump to the label would skip the
@@ -3214,9 +3307,32 @@ impl<'ctx> CodeGen<'ctx> {
         if let Some(object) = object {
             self.with_objects.push((object.clone(), address));
         }
+        // A class's properties too, through a hidden reference to the
+        // instance.
+        let class = object
+            .as_ref()
+            .filter(|o| self.objects[o.as_str()].is_class)
+            .cloned();
+        if let Some(class) = &class {
+            self.hidden_count += 1;
+            let name = format!("__with{}", self.hidden_count);
+            let slot = self
+                .entry_alloca(self.context.ptr_type(AddressSpace::default()), &name)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.builder
+                .build_store(slot, address)
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.variables.insert(name.clone(), slot);
+            self.var_types
+                .insert(name.clone(), PascalType::Named(class.clone()));
+            self.with_classes.push((class.clone(), name));
+        }
 
         let result = self.compile_block(body);
 
+        if class.is_some() {
+            self.with_classes.pop();
+        }
         if object.is_some() {
             self.with_objects.pop();
         }
@@ -3408,6 +3524,7 @@ impl<'ctx> CodeGen<'ctx> {
         match ty {
             // Object declarations are lowered to records when registered.
             PascalType::Object(_) => 0,
+            PascalType::ClassOf(_) => 8,
             PascalType::ShortString { max } => *max as u64 + 1,
             PascalType::Integer
             | PascalType::Enum { .. }
@@ -3816,6 +3933,7 @@ impl<'ctx> CodeGen<'ctx> {
                     self_ptr,
                     dispatch: objects::Dispatch::Virtual,
                     vmt: None,
+                    class: None,
                 },
                 name,
                 args,
@@ -5440,8 +5558,9 @@ impl<'ctx> CodeGen<'ctx> {
                 // `if not TAncestor.Init(...) then Fail`, `if not
                 // Conn.Connect(...) then`: a constructor used as a value
                 // says whether it succeeded.
-                if self.ancestor_constructor(object, method)
-                    || self.is_constructor_call(object, method)
+                if (self.ancestor_constructor(object, method)
+                    || self.is_constructor_call(object, method))
+                    && self.class_receiver(object).is_none()
                 {
                     return Ok(self
                         .builder
@@ -5538,6 +5657,7 @@ impl<'ctx> CodeGen<'ctx> {
                         self_ptr,
                         dispatch: objects::Dispatch::Virtual,
                         vmt: None,
+                        class: None,
                     },
                     name,
                     &[],
@@ -5901,6 +6021,7 @@ impl<'ctx> CodeGen<'ctx> {
                                 self_ptr,
                                 dispatch: objects::Dispatch::Virtual,
                                 vmt: None,
+                                class: None,
                             },
                             name,
                             args,
@@ -6650,6 +6771,12 @@ impl<'ctx> CodeGen<'ctx> {
                 self.compile_set_constructor(elements, *span)
             }
             Expr::BinOp {
+                op: op @ (BinOp::Is | BinOp::As),
+                left,
+                right,
+                span,
+            } => self.compile_class_test(*op, left, right, *span),
+            Expr::BinOp {
                 op,
                 left,
                 right,
@@ -7227,6 +7354,10 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Untyped | PascalType::Object(_) => {
                 self.context.i8_type().as_basic_type_enum()
             }
+            PascalType::ClassOf(_) => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .as_basic_type_enum(),
             // Constant-expression types are folded by the semantic pass;
             // `ArrayExpr` can't reach here.
             PascalType::Integer
@@ -7859,7 +7990,9 @@ impl<'ctx> CodeGen<'ctx> {
                     .builder
                     .build_right_shift(l, r, false, "shr")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::RealDiv | BinOp::In => unreachable!("handled above"),
+                BinOp::RealDiv | BinOp::In | BinOp::Is | BinOp::As => {
+                    unreachable!("handled above")
+                }
             };
 
             return Ok(result.into());
@@ -8411,7 +8544,7 @@ impl<'ctx> CodeGen<'ctx> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let i64_ty = self.context.i64_type();
         match target {
-            PascalType::Pointer(_) | PascalType::Proc { .. } => {
+            PascalType::Pointer(_) | PascalType::Proc { .. } | PascalType::ClassOf(_) => {
                 if val.is_pointer_value() {
                     Ok(val)
                 } else if self.is_ustr(val) {
@@ -8640,6 +8773,11 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::RecordInit { .. } | Expr::ArrayInit { .. } => PascalType::Integer,
+            Expr::MethodCall { object, method, .. } if self.class_receiver(object).is_some() => {
+                let class = self.class_receiver(object).unwrap();
+                self.method_result_type(&class, method)
+                    .unwrap_or(PascalType::Integer)
+            }
             Expr::MethodCall { object, method, .. }
                 if self.ancestor_constructor(object, method) =>
             {
@@ -8690,7 +8828,12 @@ impl<'ctx> CodeGen<'ctx> {
                     | BinOp::Gt
                     | BinOp::Lte
                     | BinOp::Gte
-                    | BinOp::In => PascalType::Boolean,
+                    | BinOp::In
+                    | BinOp::Is => PascalType::Boolean,
+                    BinOp::As => match right.as_ref() {
+                        Expr::Var(class, _) => PascalType::Named(class.clone()),
+                        _ => PascalType::Integer,
+                    },
                     // Logical on booleans, bitwise on integers.
                     BinOp::And | BinOp::Or | BinOp::Xor => {
                         if self.resolve_type(&self.infer_expr_type(left)) == PascalType::Boolean {
@@ -8891,7 +9034,12 @@ impl<'ctx> CodeGen<'ctx> {
     fn method_result_type(&self, object: &str, method: &str) -> Option<PascalType> {
         let m = self.objects.get(object)?.methods.get(method)?;
         match m.kind {
-            // Used as a value, a constructor says whether it succeeded.
+            // A class's constructor gives the new instance.
+            RoutineKind::Constructor if self.objects[object].is_class => {
+                Some(PascalType::Named(object.to_string()))
+            }
+            // Used as a value, an object's constructor says whether it
+            // succeeded.
             RoutineKind::Constructor => Some(PascalType::Boolean),
             _ => m.return_type.clone(),
         }

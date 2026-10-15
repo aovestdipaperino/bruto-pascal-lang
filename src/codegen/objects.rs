@@ -29,8 +29,10 @@ use std::collections::HashMap;
 
 /// Name of the hidden VMT pointer field.
 pub(super) const VMT_FIELD: &str = "__vmt";
-/// Bytes before the first slot in a VMT: size, -size, parent link.
-const VMT_HEADER_WORDS: u64 = 3;
+/// Words before the first slot in a class's VMT: size, -size, parent
+/// link, class name (a short string), and the routine that releases the
+/// strings an instance holds (or nil).
+pub(super) const CLASS_VMT_HEADER_WORDS: u64 = 5;
 
 /// What code generation knows about an object type.
 #[derive(Debug, Clone)]
@@ -46,6 +48,12 @@ pub(super) struct ObjectInfo {
     /// The routine in each virtual slot: a method symbol, or `None` for an
     /// abstract method.
     pub slots: Vec<Option<String>>,
+    /// An Object Pascal class rather than a TP object.
+    pub is_class: bool,
+    /// A class's properties by (lower-case) name, own and inherited.
+    pub properties: HashMap<String, PropertyDecl>,
+    /// The name of a class's default array property.
+    pub default_property: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,14 +66,22 @@ pub(super) struct MethodInfo {
     /// Its virtual slot, if virtual.
     pub slot: Option<usize>,
     pub is_abstract: bool,
+    /// A class method: its hidden `Self` is the class (a VMT).
+    pub is_class_method: bool,
+    /// A class's destructor: it takes a flag, after `Self`, saying whether
+    /// to free the instance when it is done (not for `inherited Destroy`).
+    pub frees_instance: bool,
 }
 
 /// The method being compiled: its object type and `Self`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MethodContext<'ctx> {
+    /// The instance, or in a class method, the class.
     pub self_ptr: PointerValue<'ctx>,
     /// In a constructor's own body, where `Fail` can be used.
     pub in_constructor: bool,
+    /// In a class method, where `Self` is a class.
+    pub in_class_method: bool,
 }
 
 /// The object a method is called on, and how.
@@ -77,6 +93,9 @@ pub(super) struct Receiver<'a, 'ctx> {
     pub dispatch: Dispatch,
     /// The VMT argument, for a constructor.
     pub vmt: Option<PointerValue<'ctx>>,
+    /// A call on a class rather than an instance (`TFoo.Create`,
+    /// `C.Create` with a class reference `C`): the class's VMT.
+    pub class: Option<PointerValue<'ctx>>,
 }
 
 /// How a call reaches a method.
@@ -97,7 +116,17 @@ impl<'ctx> CodeGen<'ctx> {
         decl: &ObjectType,
         span: Span,
     ) -> Result<(), CodeGenError> {
-        let parent = match &decl.parent {
+        // Every class descends from TObject.
+        // (`BrutoTObject` where the program has a TObject of its own; the
+        // first class declared is the root itself.)
+        let root = ["tobject", "brutotobject"]
+            .into_iter()
+            .find(|r| self.objects.get(*r).is_some_and(|o| o.is_class));
+        let parent_name = match (&decl.parent, root) {
+            (None, Some(root)) if decl.is_class => Some(root.to_string()),
+            (other, _) => other.clone(),
+        };
+        let parent = match &parent_name {
             Some(p) => Some(self.objects.get(p).cloned().ok_or_else(|| {
                 CodeGenError::new(
                     format!("'{p}' is not an object type declared before '{name}'"),
@@ -113,8 +142,20 @@ impl<'ctx> CodeGen<'ctx> {
             },
             None => Vec::new(),
         };
+        if let Some(p) = &parent
+            && p.is_class != decl.is_class
+        {
+            return Err(CodeGenError::new(
+                format!(
+                    "'{}' can't descend from '{}': classes and objects don't mix",
+                    self.display(name),
+                    self.display(parent_name.as_deref().unwrap_or_default())
+                ),
+                Some(span),
+            ));
+        }
         let mut vmt_field = parent.as_ref().and_then(|p| p.vmt_field);
-        if vmt_field.is_none() && decl.methods.iter().any(|m| m.is_virtual) {
+        if vmt_field.is_none() && (decl.is_class || decl.methods.iter().any(|m| m.is_virtual)) {
             vmt_field = Some(fields.len());
             fields.push((
                 VMT_FIELD.to_string(),
@@ -140,7 +181,20 @@ impl<'ctx> CodeGen<'ctx> {
         for m in &decl.methods {
             let symbol = format!("{name}.{}", m.name);
             let slot = if m.is_virtual {
+                // An object's `virtual` method replaces its parent's; a
+                // class's replaces it only with `override`.
                 let inherited = methods.get(&m.name).and_then(|prev| prev.slot);
+                if m.is_override && inherited.is_none() {
+                    return Err(CodeGenError::new(
+                        format!(
+                            "'{}' overrides nothing: no virtual '{}' in an ancestor",
+                            self.display(&m.name),
+                            self.display(&m.name)
+                        ),
+                        Some(m.span),
+                    ));
+                }
+                let inherited = inherited.filter(|_| !decl.is_class || m.is_override);
                 let slot = inherited.unwrap_or_else(|| {
                     slots.push(None);
                     slots.len() - 1
@@ -159,8 +213,22 @@ impl<'ctx> CodeGen<'ctx> {
                     return_type: m.return_type.clone(),
                     slot,
                     is_abstract: m.is_abstract,
+                    is_class_method: m.is_class_method,
+                    frees_instance: decl.is_class && m.kind == RoutineKind::Destructor,
                 },
             );
+        }
+
+        let mut properties = parent
+            .as_ref()
+            .map(|p| p.properties.clone())
+            .unwrap_or_default();
+        let mut default_property = parent.as_ref().and_then(|p| p.default_property.clone());
+        for prop in &decl.properties {
+            if prop.is_default {
+                default_property = Some(prop.name.clone());
+            }
+            properties.insert(prop.name.clone(), prop.clone());
         }
 
         let record = PascalType::Record {
@@ -168,13 +236,23 @@ impl<'ctx> CodeGen<'ctx> {
             variant: None,
             object: Some(name.to_string()),
         };
-        self.type_defs.insert(name.to_string(), record.clone());
+        // A class's name means a reference to an instance (see
+        // `class_instance_type`); the record is the instance itself.
+        let record_name = if decl.is_class {
+            super::classes::instance_type_name(name)
+        } else {
+            name.to_string()
+        };
+        self.type_defs.insert(record_name, record.clone());
         let info = ObjectInfo {
-            parent: decl.parent.clone(),
+            parent: parent_name,
             record,
             vmt_field,
             methods,
             slots,
+            is_class: decl.is_class,
+            properties,
+            default_property,
         };
 
         // Declare this type's own methods so calls and VMTs can refer to
@@ -214,6 +292,9 @@ impl<'ctx> CodeGen<'ctx> {
         let mut params: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
         if method.kind == RoutineKind::Constructor {
             params.push(ptr.into());
+        }
+        if method.frees_instance {
+            params.push(self.context.i64_type().into());
         }
         for group in &method.params {
             let ty = self.resolve_type(&group.ty);
@@ -270,16 +351,41 @@ impl<'ctx> CodeGen<'ctx> {
                 .map(|g| g.as_pointer_value())
                 .unwrap_or_else(|| ptr.const_null());
             let slots_ty = ptr.array_type(slot_values.len() as u32);
-            let vmt_ty = self.context.struct_type(
-                &[i64_ty.into(), i64_ty.into(), ptr.into(), slots_ty.into()],
-                false,
-            );
-            let init = vmt_ty.const_named_struct(&[
-                size.into(),
-                size.const_neg().into(),
-                parent_link.into(),
-                ptr.const_array(&slot_values).into(),
-            ]);
+            let (vmt_ty, init) = if info.is_class {
+                let [class_name, cleanup] = self.class_header_words(name);
+                let vmt_ty = self.context.struct_type(
+                    &[
+                        i64_ty.into(),
+                        i64_ty.into(),
+                        ptr.into(),
+                        ptr.into(),
+                        ptr.into(),
+                        slots_ty.into(),
+                    ],
+                    false,
+                );
+                let init = vmt_ty.const_named_struct(&[
+                    size.into(),
+                    size.const_neg().into(),
+                    parent_link.into(),
+                    class_name.into(),
+                    cleanup.into(),
+                    ptr.const_array(&slot_values).into(),
+                ]);
+                (vmt_ty, init)
+            } else {
+                let vmt_ty = self.context.struct_type(
+                    &[i64_ty.into(), i64_ty.into(), ptr.into(), slots_ty.into()],
+                    false,
+                );
+                let init = vmt_ty.const_named_struct(&[
+                    size.into(),
+                    size.const_neg().into(),
+                    parent_link.into(),
+                    ptr.const_array(&slot_values).into(),
+                ]);
+                (vmt_ty, init)
+            };
             let vmt = self.module.add_global(vmt_ty, None, &format!("vmt.{name}"));
             vmt.set_linkage(Linkage::Internal);
             vmt.set_constant(true);
@@ -299,13 +405,24 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// The function an abstract VMT slot points at: runtime error 211.
     pub(super) fn abstract_error_fn(&self) -> FunctionValue<'ctx> {
-        if let Some(f) = self.module.get_function("bruto_abstract_error") {
+        self.runtime_error_fn(211, "abstract method called")
+    }
+
+    /// A function that reports runtime error `code` and stops the
+    /// program, as FPC does.
+    pub(super) fn runtime_error_fn(&self, code: u32, what: &str) -> FunctionValue<'ctx> {
+        let name = if code == 211 {
+            "bruto_abstract_error".to_string()
+        } else {
+            format!("bruto_runtime_error_{code}")
+        };
+        if let Some(f) = self.module.get_function(&name) {
             return f;
         }
         let void_ty = self.context.void_type();
         let f = self
             .module
-            .add_function("bruto_abstract_error", void_ty.fn_type(&[], false), None);
+            .add_function(&name, void_ty.fn_type(&[], false), None);
         f.set_linkage(Linkage::Internal);
         let builder = self.context.create_builder();
         let entry = self.context.append_basic_block(f, "entry");
@@ -313,9 +430,9 @@ impl<'ctx> CodeGen<'ctx> {
         let i32_ty = self.context.i32_type();
         let i64_ty = self.context.i64_type();
         let ptr = self.context.ptr_type(AddressSpace::default());
-        let message = "Runtime error 211: abstract method called\n";
+        let message = format!("Runtime error {code}: {what}\n");
         let text = builder
-            .build_global_string_ptr(message, "abstract_msg")
+            .build_global_string_ptr(&message, "runtime_error_msg")
             .unwrap()
             .as_pointer_value();
         let write = self.module.get_function("write").unwrap_or_else(|| {
@@ -341,7 +458,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .add_function("exit", void_ty.fn_type(&[i32_ty.into()], false), None)
         });
         builder
-            .build_call(exit, &[i32_ty.const_int(211, false).into()], "")
+            .build_call(exit, &[i32_ty.const_int(code as u64, false).into()], "")
             .unwrap();
         builder.build_unreachable().unwrap();
         f
@@ -427,6 +544,7 @@ impl<'ctx> CodeGen<'ctx> {
             self_ptr,
             dispatch,
             vmt,
+            class,
         } = receiver;
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let info = self.objects.get(object).cloned().ok_or_else(|| {
@@ -439,9 +557,44 @@ impl<'ctx> CodeGen<'ctx> {
             )
         })?;
         let ptr = self.context.ptr_type(AddressSpace::default());
-        let mut call_args: Vec<BasicMetadataValueEnum> = vec![self_ptr.into()];
+        // Inside a class method, `Self` is the class.
+        let class = class.or_else(|| {
+            self.method_context
+                .filter(|c| c.in_class_method && c.self_ptr == self_ptr)
+                .map(|c| c.self_ptr)
+        });
+        // The hidden `Self`, and the VMT a virtual call goes through when
+        // it isn't the instance's.
+        let (hidden_self, dispatch_vmt) = if m.is_class_method {
+            let vmt = match class {
+                Some(c) => c,
+                None => self.load_vmt(object, self_ptr, span)?,
+            };
+            (vmt, Some(vmt))
+        } else if let Some(c) = class {
+            if m.kind != RoutineKind::Constructor {
+                return Err(CodeGenError::new(
+                    format!(
+                        "'{}.{}' needs an instance to call it on",
+                        self.display(object),
+                        self.display(method)
+                    ),
+                    Some(span),
+                ));
+            }
+            // `TFoo.Create`: a new instance.
+            (ptr.const_null(), Some(c))
+        } else {
+            (self_ptr, None)
+        };
+        let mut call_args: Vec<BasicMetadataValueEnum> = vec![hidden_self.into()];
         if m.kind == RoutineKind::Constructor {
-            call_args.push(vmt.unwrap_or_else(|| ptr.const_null()).into());
+            call_args.push(class.or(vmt).unwrap_or_else(|| ptr.const_null()).into());
+        }
+        if m.frees_instance {
+            // Free the instance, unless this is `inherited Destroy`.
+            let free = u64::from(dispatch == Dispatch::Virtual);
+            call_args.push(self.context.i64_type().const_int(free, false).into());
         }
         let hidden = call_args.len();
         call_args.extend(self.compile_call_args(&m.symbol, args, span)?);
@@ -463,16 +616,21 @@ impl<'ctx> CodeGen<'ctx> {
 
         let result = match (dispatch, m.slot, info.vmt_field) {
             (Dispatch::Virtual, Some(slot), Some(vmt_index)) => {
-                let record_ty = self.llvm_type_for(&info.record);
-                let vmt_addr = self
-                    .builder
-                    .build_struct_gep(record_ty, self_ptr, vmt_index as u32, "vmt_addr")
-                    .map_err(err)?;
-                let vmt = self
-                    .builder
-                    .build_load(ptr, vmt_addr, "vmt")
-                    .map_err(err)?
-                    .into_pointer_value();
+                let vmt = match dispatch_vmt {
+                    Some(v) => v,
+                    None => {
+                        let record_ty = self.llvm_type_for(&info.record);
+                        let vmt_addr = self
+                            .builder
+                            .build_struct_gep(record_ty, self_ptr, vmt_index as u32, "vmt_addr")
+                            .map_err(err)?;
+                        self.builder
+                            .build_load(ptr, vmt_addr, "vmt")
+                            .map_err(err)?
+                            .into_pointer_value()
+                    }
+                };
+                let header = self.vmt_header_words(object);
                 let slot_addr = unsafe {
                     self.builder
                         .build_in_bounds_gep(
@@ -481,7 +639,7 @@ impl<'ctx> CodeGen<'ctx> {
                             &[self
                                 .context
                                 .i64_type()
-                                .const_int(VMT_HEADER_WORDS + slot as u64, false)],
+                                .const_int(header + slot as u64, false)],
                             "slot_addr",
                         )
                         .map_err(err)?
@@ -531,6 +689,28 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
         // `TAncestor.Method(...)` inside a method: that type's
         // implementation, called on Self without virtual dispatch.
+        // `TFoo.Create(...)`, `TFoo.ClassName`: a call on the class.
+        if let Expr::Var(type_name, _) = object
+            && self.is_class_name(type_name)
+            && self.objects[type_name.as_str()]
+                .methods
+                .get(method)
+                .is_some_and(|m| m.kind == RoutineKind::Constructor || m.is_class_method)
+        {
+            let class = Some(self.vmt_of(type_name));
+            return self.call_method(
+                Receiver {
+                    object: type_name,
+                    self_ptr: self.context.ptr_type(AddressSpace::default()).const_null(),
+                    dispatch: Dispatch::Virtual,
+                    vmt: None,
+                    class,
+                },
+                method,
+                args,
+                span,
+            );
+        }
         if let Expr::Var(type_name, _) = object
             && self.lookup_var(type_name).is_none()
             && self.objects.contains_key(type_name)
@@ -549,8 +729,41 @@ impl<'ctx> CodeGen<'ctx> {
                 self_ptr: ctx.self_ptr,
                 dispatch: Dispatch::Static,
                 vmt: None,
+                class: None,
             };
             return self.call_method(receiver, method, args, span);
+        }
+        // On a class reference or an instance of a class: the value.
+        let declared = self.infer_declared_type(object);
+        if let Some(name) = self.class_ref_of(&declared) {
+            let class = self.compile_expr(object)?.into_pointer_value();
+            return self.call_method(
+                Receiver {
+                    object: &name,
+                    self_ptr: self.context.ptr_type(AddressSpace::default()).const_null(),
+                    dispatch: Dispatch::Virtual,
+                    vmt: None,
+                    class: Some(class),
+                },
+                method,
+                args,
+                span,
+            );
+        }
+        if let Some(name) = self.class_instance_of(&declared) {
+            let self_ptr = self.compile_expr(object)?.into_pointer_value();
+            return self.call_method(
+                Receiver {
+                    object: &name,
+                    self_ptr,
+                    dispatch: Dispatch::Virtual,
+                    vmt: None,
+                    class: None,
+                },
+                method,
+                args,
+                span,
+            );
         }
         let (self_ptr, ty) = self.resolve_array_base(object, span)?;
         let name = self.object_name_of(&ty).ok_or_else(|| {
@@ -567,6 +780,7 @@ impl<'ctx> CodeGen<'ctx> {
                 self_ptr,
                 dispatch: Dispatch::Virtual,
                 vmt,
+                class: None,
             },
             method,
             args,
@@ -604,6 +818,7 @@ impl<'ctx> CodeGen<'ctx> {
                 self_ptr: ctx.self_ptr,
                 dispatch: Dispatch::Static,
                 vmt: None,
+                class: None,
             },
             method,
             args,
@@ -644,6 +859,7 @@ impl<'ctx> CodeGen<'ctx> {
                 self_ptr: null,
                 dispatch: Dispatch::Static,
                 vmt,
+                class: None,
             },
             constructor,
             args,
