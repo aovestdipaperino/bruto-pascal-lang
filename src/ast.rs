@@ -116,6 +116,12 @@ pub struct ProcDecl {
     pub owner: Option<String>,
     /// A `forward` declaration or a unit interface header: no body here.
     pub is_forward: bool,
+    /// `external ['lib'] [name 'sym']`: implemented outside Pascal, by the
+    /// C function `sym` (the routine's own name if not given).
+    pub external: Option<String>,
+    /// `varargs`: an external C function that takes further arguments
+    /// after its declared parameters.
+    pub varargs: bool,
     pub consts: Vec<ConstDecl>,
     pub type_decls: Vec<TypeDecl>,
     pub vars: Vec<VarDecl>,
@@ -148,6 +154,8 @@ impl ProcDecl {
             kind,
             owner: None,
             is_forward: false,
+            external: None,
+            varargs: false,
             consts: Vec::new(),
             type_decls: Vec::new(),
             vars: Vec::new(),

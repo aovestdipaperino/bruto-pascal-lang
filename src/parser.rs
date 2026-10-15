@@ -1393,7 +1393,14 @@ impl Parser {
         let impl_consts = implementation.consts;
         let impl_types = implementation.type_decls;
         let impl_vars = implementation.vars;
-        let procedures = implementation.procedures;
+        // External routines declared in the interface have no body in
+        // the implementation, so they are kept from the headers.
+        let mut procedures: Vec<ProcDecl> = interface_proc_headers
+            .iter()
+            .filter(|p| p.external.is_some())
+            .cloned()
+            .collect();
+        procedures.extend(implementation.procedures);
 
         // Optional unit initialization block. Accepts both Turbo Pascal
         // (`begin ... end.`) and Delphi (`initialization ... end.`)
@@ -1486,7 +1493,7 @@ impl Parser {
             None
         };
         self.expect(&Tok::Semi)?;
-        self.skip_routine_modifiers(&[
+        let mods = self.skip_routine_modifiers(&[
             "inline",
             "overload",
             "cdecl",
@@ -1501,9 +1508,41 @@ impl Parser {
             "platform",
             "experimental",
             "unimplemented",
+            "varargs",
         ])?;
         let mut decl = ProcDecl::header(name, kind, params, return_type, span);
         decl.owner = owner;
+        decl.varargs = mods.iter().any(|m| m == "varargs");
+        // `external ['lib'] [name 'sym'];`, then possibly more modifiers.
+        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("external")) {
+            self.advance();
+            let mut symbol = decl.name.clone();
+            if matches!(self.peek(), Tok::StrLit(_) | Tok::Ident(_))
+                && !matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("name"))
+            {
+                self.advance();
+            }
+            if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("name")) {
+                self.advance();
+                match self.peek().clone() {
+                    Tok::StrLit(sym) => {
+                        self.advance();
+                        symbol = sym;
+                    }
+                    other => {
+                        return Err(ParseError {
+                            message: format!("expected the external symbol's name, found {other}"),
+                            span: self.span(),
+                        });
+                    }
+                }
+            }
+            self.expect(&Tok::Semi)?;
+            let more = self.skip_routine_modifiers(&["cdecl", "varargs", "inline", "overload"])?;
+            decl.varargs |= more.iter().any(|m| m == "varargs");
+            decl.external = Some(symbol);
+            decl.is_forward = true;
+        }
         Ok(decl)
     }
 
@@ -1880,13 +1919,15 @@ impl Parser {
             Tok::Ident(name) => {
                 let mut name = name.clone();
                 self.advance();
-                // `Objects.TRect`: units share one namespace here, so the
-                // unit qualifier is dropped.
+                // `Objects.TRect` keeps its qualifier until the unit
+                // scopes are resolved; only the last two parts matter.
                 while *self.peek() == Tok::Dot
                     && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
                 {
                     self.advance();
-                    name = self.expect_ident()?.0;
+                    let part = self.expect_ident()?.0;
+                    let unit = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    name = format!("{unit}.{part}");
                 }
                 Ok(PascalType::Named(name))
             }
@@ -2211,6 +2252,9 @@ impl Parser {
 
     fn parse_proc_decl(&mut self) -> Result<ProcDecl, ParseError> {
         let mut decl = self.parse_routine_heading()?;
+        if decl.external.is_some() {
+            return Ok(decl);
+        }
 
         // Forward declaration: procedure Foo; forward;
         if *self.peek() == Tok::KwForward {

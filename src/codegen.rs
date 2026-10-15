@@ -136,6 +136,8 @@ pub struct CodeGen<'ctx> {
     debug_pointer_depth: std::cell::Cell<u32>,
     // Overloaded routines: base name -> one symbol per signature.
     overloads: HashMap<String, Vec<String>>,
+    // External routines: Pascal name -> the C function implementing it.
+    external_symbols: HashMap<String, String>,
     // Compiling a `System.X` call: built-ins win over methods and the
     // program's own routines.
     bypass_user: bool,
@@ -240,6 +242,7 @@ impl<'ctx> CodeGen<'ctx> {
             with_objects: Vec::new(),
             bypass_user: false,
             overloads: HashMap::new(),
+            external_symbols: HashMap::new(),
             current_object: None,
             method_context: None,
             current_function: None,
@@ -515,6 +518,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.emit_vmts();
 
         self.declare_system_variables();
+        self.register_exit_procs();
 
         // Program-level constants and variables become LLVM globals before
         // any procedure is compiled, so every routine can reach them.
@@ -546,7 +550,7 @@ impl<'ctx> CodeGen<'ctx> {
         // any routine (a unit's implementation calls routines implemented
         // further down; calls to overloads are resolved by signature).
         for proc in &program.procedures {
-            if proc.owner.is_none() && !proc.is_forward {
+            if proc.owner.is_none() && (!proc.is_forward || proc.external.is_some()) {
                 let mut header = proc.clone();
                 header.is_forward = true;
                 self.compile_proc_decl(&header)?;
@@ -1092,10 +1096,12 @@ impl<'ctx> CodeGen<'ctx> {
     /// The spelling the user wrote for a (lower-cased) identifier, for
     /// debug info, watch metadata and the profiler map.
     fn display(&self, name: &str) -> String {
+        // A name split between units (`initvideo@video`) shows as written.
+        let base = name.split_once('@').map_or(name, |(base, _)| base);
         self.display_names
-            .get(name)
+            .get(base)
             .cloned()
-            .unwrap_or_else(|| name.to_string())
+            .unwrap_or_else(|| base.to_string())
     }
 
     /// The type a name denotes in `low`, `high` or `sizeof`: a variable's
@@ -1495,13 +1501,31 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         // Build function type
+        let varargs = proc.varargs && proc.external.is_some();
         let fn_type = match &method {
             Some((_, m)) => self.method_fn_type(m),
             None => match &return_type {
-                Some(ret_ty) => self.abi_type_for(ret_ty).fn_type(&param_llvm_types, false),
-                None => self.context.void_type().fn_type(&param_llvm_types, false),
+                Some(ret_ty) => self
+                    .abi_type_for(ret_ty)
+                    .fn_type(&param_llvm_types, varargs),
+                None => self.context.void_type().fn_type(&param_llvm_types, varargs),
             },
         };
+
+        // An external routine is the C function itself, under its own
+        // symbol; calls by the Pascal name are redirected to it.
+        if let Some(c_symbol) = &proc.external {
+            if self.module.get_function(c_symbol).is_none() {
+                self.module
+                    .add_function(c_symbol, fn_type, Some(Linkage::External));
+            }
+            self.external_symbols
+                .insert(proc.name.clone(), c_symbol.clone());
+            self.proc_return_types
+                .insert(c_symbol.clone(), return_type.clone());
+            self.proc_param_modes.insert(c_symbol.clone(), param_info);
+            return Ok(());
+        }
 
         // Reuse existing function if this is the real definition after a
         // forward declaration (or a method's prototype)
@@ -2771,33 +2795,7 @@ impl<'ctx> CodeGen<'ctx> {
             let is_last = i == chain.len() - 1;
             match access {
                 LValueAccess::Field(field) => {
-                    let (field_idx, field_ty) = match &cur_type {
-                        PascalType::Record { fields, .. } => {
-                            let idx =
-                                fields.iter().position(|(n, _)| n == field).ok_or_else(|| {
-                                    CodeGenError::new(
-                                        format!("no field '{field}' in record"),
-                                        Some(span),
-                                    )
-                                })?;
-                            (idx, fields[idx].1.clone())
-                        }
-                        _ => {
-                            return Err(CodeGenError::new(
-                                "field access on non-record",
-                                Some(span),
-                            ));
-                        }
-                    };
-                    let gep = self
-                        .builder
-                        .build_struct_gep(
-                            self.llvm_type_for(&cur_type),
-                            ptr,
-                            field_idx as u32,
-                            "chain_field",
-                        )
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    let (gep, field_ty) = self.field_address(ptr, &cur_type, field, span)?;
                     if is_last {
                         self.store_value(gep, val, &field_ty, span)?;
                         return Ok(());
@@ -2857,7 +2855,7 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let sel_val = self.compile_expr(expr)?;
+        let sel_val = self.case_label(expr, span)?;
         let func = self.current_fn.unwrap();
         let end_bb = self.context.append_basic_block(func, "case_end");
 
@@ -2869,7 +2867,7 @@ impl<'ctx> CodeGen<'ctx> {
             for val in &branch.values {
                 let cmp = match val {
                     CaseValue::Single(v) => {
-                        let v_val = self.compile_expr(v)?;
+                        let v_val = self.case_label(v, span)?;
                         self.builder
                             .build_int_compare(
                                 inkwell::IntPredicate::EQ,
@@ -2880,8 +2878,8 @@ impl<'ctx> CodeGen<'ctx> {
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                     CaseValue::Range(lo, hi) => {
-                        let lo_val = self.compile_expr(lo)?;
-                        let hi_val = self.compile_expr(hi)?;
+                        let lo_val = self.case_label(lo, span)?;
+                        let hi_val = self.case_label(hi, span)?;
                         let ge = self
                             .builder
                             .build_int_compare(
@@ -3258,6 +3256,23 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.builder.position_at_end(after_bb);
         Ok(())
+    }
+
+    /// A case label as a 64-bit ordinal; a one-character string literal
+    /// is that character.
+    fn case_label(
+        &mut self,
+        label: &Expr,
+        span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        if let Expr::StrLit(s, _) = label
+            && s.chars().count() == 1
+        {
+            let code = s.chars().next().unwrap() as u64;
+            return Ok(self.context.i64_type().const_int(code, false).into());
+        }
+        let val = self.compile_expr(label)?;
+        Ok(self.to_i64(val, span)?.into())
     }
 
     /// Extend an integer value (boolean, char or narrower integer) to
@@ -5183,6 +5198,23 @@ impl<'ctx> CodeGen<'ctx> {
                 if args.len() == 1
                     && let Some(target) = self.cast_target(name)
                 {
+                    // `T(P^)` with an untyped pointer `P`: the memory it
+                    // points at, read as a `T`.
+                    if let Expr::Deref(inner, _) = &args[0]
+                        && let PascalType::Pointer(pointed) =
+                            self.resolve_type(&self.infer_declared_type(inner))
+                        && *pointed == PascalType::Untyped
+                    {
+                        let address = self.compile_expr(inner)?.into_pointer_value();
+                        if let PascalType::ShortString { .. } = target {
+                            return self.short_to_c_string(address, *span);
+                        }
+                        let loaded = self
+                            .builder
+                            .build_load(self.llvm_type_for(&target), address, "reinterpret")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                        return self.widen_loaded(loaded, &target, *span);
+                    }
                     // A record, array or set seen through a variable of
                     // another type: load it from that variable's memory.
                     if matches!(
@@ -5658,6 +5690,14 @@ impl<'ctx> CodeGen<'ctx> {
                                 }
                                 PascalType::Boolean => {
                                     return Ok(self.context.i64_type().const_int(1, false).into());
+                                }
+                                // A short string's capacity.
+                                PascalType::ShortString { max } => {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(*max as u64, false)
+                                        .into());
                                 }
                                 PascalType::Integer => {
                                     return Ok(self
@@ -7275,10 +7315,78 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
 
+        // Records compare field by field.
+        if matches!(op, BinOp::Eq | BinOp::Neq) && lhs.is_struct_value() && rhs.is_struct_value() {
+            let err =
+                |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+            let equal = self.aggregate_equal(lhs, rhs).map_err(err)?;
+            return Ok(if op == BinOp::Eq {
+                equal.into()
+            } else {
+                self.builder.build_not(equal, "ne").map_err(err)?.into()
+            });
+        }
+
         Err(CodeGenError::new(
             "unsupported operand types for binary operator",
             Some(span),
         ))
+    }
+
+    /// Whether two values of the same record (or array) type are equal,
+    /// element by element.
+    fn aggregate_equal(
+        &self,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, inkwell::builder::BuilderError> {
+        let bld = &self.builder;
+        if a.is_int_value() {
+            return bld.build_int_compare(
+                inkwell::IntPredicate::EQ,
+                a.into_int_value(),
+                b.into_int_value(),
+                "field_eq",
+            );
+        }
+        if a.is_float_value() {
+            return bld.build_float_compare(
+                inkwell::FloatPredicate::OEQ,
+                a.into_float_value(),
+                b.into_float_value(),
+                "field_eq",
+            );
+        }
+        if a.is_pointer_value() {
+            let i64_ty = self.context.i64_type();
+            let x = bld.build_ptr_to_int(a.into_pointer_value(), i64_ty, "pa")?;
+            let y = bld.build_ptr_to_int(b.into_pointer_value(), i64_ty, "pb")?;
+            return bld.build_int_compare(inkwell::IntPredicate::EQ, x, y, "field_eq");
+        }
+        let count = if a.is_struct_value() {
+            a.into_struct_value().get_type().count_fields()
+        } else if a.is_array_value() {
+            a.into_array_value().get_type().len()
+        } else {
+            0
+        };
+        let mut all = self.context.bool_type().const_int(1, false);
+        for i in 0..count {
+            let (x, y) = if a.is_struct_value() {
+                (
+                    bld.build_extract_value(a.into_struct_value(), i, "fa")?,
+                    bld.build_extract_value(b.into_struct_value(), i, "fb")?,
+                )
+            } else {
+                (
+                    bld.build_extract_value(a.into_array_value(), i, "ea")?,
+                    bld.build_extract_value(b.into_array_value(), i, "eb")?,
+                )
+            };
+            let eq = self.aggregate_equal(x, y)?;
+            all = bld.build_and(all, eq, "all_eq")?;
+        }
+        Ok(all)
     }
 
     fn compile_unaryop(
@@ -7429,6 +7537,26 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 };
                 Ok((gep, pointed))
+            }
+            // `s[i]` on a dynamic string, as a place (`Move(s[1], ...)`):
+            // character i of the buffer the string points at.
+            PascalType::String => {
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let chars = self
+                    .builder
+                    .build_load(ptr_ty, base_ptr, "str_base")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into_pointer_value();
+                let offset = self
+                    .builder
+                    .build_int_sub(idx, self.context.i64_type().const_int(1, false), "str_off")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                let gep = unsafe {
+                    self.builder
+                        .build_gep(self.context.i8_type(), chars, &[offset], "str_char")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                };
+                Ok((gep, PascalType::Char))
             }
             _ => Err(CodeGenError::new("indexing non-array", Some(span))),
         }
@@ -8035,6 +8163,9 @@ impl<'ctx> CodeGen<'ctx> {
     /// for an overloaded name, the overload whose parameters best fit the
     /// argument types.
     fn resolve_overload(&self, name: &str, args: &[Expr]) -> String {
+        if let Some(c_symbol) = self.external_symbols.get(name) {
+            return c_symbol.clone();
+        }
         let Some(candidates) = self.overloads.get(name) else {
             return name.to_string();
         };

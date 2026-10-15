@@ -23,6 +23,95 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// A libc function, declared on first use.
+    /// `bruto_setlength(old, n) -> ptr`: a new string of `n` characters,
+    /// starting with `old`'s (nil is empty) and padded with spaces.
+    fn set_length_fn(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("bruto_setlength") {
+            return f;
+        }
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let i8_ty = self.context.i8_type();
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let f = self.module.add_function(
+            "bruto_setlength",
+            ptr.fn_type(&[ptr.into(), i64_ty.into()], false),
+            None,
+        );
+        f.set_linkage(inkwell::module::Linkage::Internal);
+        let malloc = self.libc("malloc", ptr.fn_type(&[i64_ty.into()], false));
+        let memset = self.libc(
+            "memset",
+            ptr.fn_type(&[ptr.into(), i32_ty.into(), i64_ty.into()], false),
+        );
+        let strlen = self.libc("strlen", i64_ty.fn_type(&[ptr.into()], false));
+        let b = self.context.create_builder();
+        let entry = self.context.append_basic_block(f, "entry");
+        let measure = self.context.append_basic_block(f, "measure");
+        let copy = self.context.append_basic_block(f, "copy");
+        b.position_at_end(entry);
+        let old = f.get_nth_param(0).unwrap().into_pointer_value();
+        let n = f.get_nth_param(1).unwrap().into_int_value();
+        let zero = i64_ty.const_zero();
+        let n = b
+            .build_select(
+                b.build_int_compare(inkwell::IntPredicate::SLT, n, zero, "neg")
+                    .unwrap(),
+                zero,
+                n,
+                "n",
+            )
+            .unwrap()
+            .into_int_value();
+        let size = b
+            .build_int_add(n, i64_ty.const_int(1, false), "size")
+            .unwrap();
+        let buf = b
+            .build_call(malloc, &[size.into()], "buf")
+            .unwrap()
+            .try_as_basic_value()
+            .basic()
+            .unwrap()
+            .into_pointer_value();
+        b.build_call(
+            memset,
+            &[
+                buf.into(),
+                i32_ty.const_int(b' ' as u64, false).into(),
+                n.into(),
+            ],
+            "",
+        )
+        .unwrap();
+        let end = unsafe { b.build_in_bounds_gep(i8_ty, buf, &[n], "end").unwrap() };
+        b.build_store(end, i8_ty.const_zero()).unwrap();
+        let is_nil = b.build_is_null(old, "nil").unwrap();
+        let done = self.context.append_basic_block(f, "done");
+        b.build_conditional_branch(is_nil, done, measure).unwrap();
+        b.position_at_end(measure);
+        let old_len = b
+            .build_call(strlen, &[old.into()], "old_len")
+            .unwrap()
+            .try_as_basic_value()
+            .basic()
+            .unwrap()
+            .into_int_value();
+        let shorter = b
+            .build_int_compare(inkwell::IntPredicate::ULT, old_len, n, "shorter")
+            .unwrap();
+        let kept = b
+            .build_select(shorter, old_len, n, "kept")
+            .unwrap()
+            .into_int_value();
+        b.build_unconditional_branch(copy).unwrap();
+        b.position_at_end(copy);
+        b.build_memcpy(buf, 1, old, 1, kept).unwrap();
+        b.build_unconditional_branch(done).unwrap();
+        b.position_at_end(done);
+        b.build_return(Some(&buf)).unwrap();
+        f
+    }
+
     fn libc(&self, name: &str, ty: inkwell::types::FunctionType<'ctx>) -> FunctionValue<'ctx> {
         self.module
             .get_function(name)
@@ -105,6 +194,37 @@ impl<'ctx> CodeGen<'ctx> {
                 self.builder
                     .build_call(memset, &[dst.into(), value.into(), count.into()], "")
                     .map_err(err)?;
+            }
+            // SetLength(S, N): a short string's length byte, or a dynamic
+            // string reallocated (new characters are spaces, since a
+            // dynamic string ends at its first NUL).
+            ("setlength", 2) => {
+                let (slot, ty) = self.resolve_array_base(&args[0], span)?;
+                let n = self.int_arg(&args[1], span)?;
+                match self.resolve_type(&ty) {
+                    PascalType::ShortString { .. } => {
+                        let len = self
+                            .builder
+                            .build_int_truncate(n, self.context.i8_type(), "len")
+                            .map_err(err)?;
+                        self.builder.build_store(slot, len).map_err(err)?;
+                    }
+                    PascalType::String => {
+                        let old = self.builder.build_load(ptr, slot, "old").map_err(err)?;
+                        let f = self.set_length_fn();
+                        let new = self
+                            .builder
+                            .build_call(f, &[old.into(), n.into()], "resized")
+                            .map_err(err)?
+                            .try_as_basic_value()
+                            .basic()
+                            .unwrap();
+                        self.builder.build_store(slot, new).map_err(err)?;
+                    }
+                    _ => {
+                        return Err(CodeGenError::new("SetLength needs a string", Some(span)));
+                    }
+                }
             }
             // GetMem(P, Size)
             ("getmem", 2) => {
@@ -471,17 +591,75 @@ impl<'ctx> CodeGen<'ctx> {
             ("stdinputhandle", longint.clone(), 0),
             ("stdoutputhandle", longint.clone(), 1),
             ("stderrorhandle", longint, 2),
+            // The exit procedure chain, run when the program ends.
+            (
+                "exitproc",
+                PascalType::Pointer(Box::new(PascalType::Untyped)),
+                0,
+            ),
         ] {
-            let llvm_ty = self.llvm_type_for(&ty).into_int_type();
+            let llvm_ty = self.llvm_type_for(&ty);
             let global = self
                 .module
                 .add_global(llvm_ty, None, &format!("pascal.{name}"));
             global.set_linkage(inkwell::module::Linkage::Internal);
-            global.set_initializer(&llvm_ty.const_int(initial, false));
+            if llvm_ty.is_pointer_type() {
+                global.set_initializer(&llvm_ty.into_pointer_type().const_null());
+            } else {
+                global.set_initializer(&llvm_ty.into_int_type().const_int(initial, false));
+            }
             self.global_vars
                 .insert(name.to_string(), global.as_pointer_value());
             self.global_types.insert(name.to_string(), ty);
         }
+    }
+
+    /// Have the C library run the `ExitProc` chain when the program ends,
+    /// normally or through `Halt`: each procedure is taken off the chain
+    /// before it runs, and may install another.
+    pub(super) fn register_exit_procs(&self) {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let void = self.context.void_type();
+        let runner =
+            self.module
+                .add_function("bruto_run_exit_procs", void.fn_type(&[], false), None);
+        runner.set_linkage(inkwell::module::Linkage::Internal);
+        let Some(slot) = self.module.get_global("pascal.exitproc") else {
+            return;
+        };
+        let slot = slot.as_pointer_value();
+        let b = self.context.create_builder();
+        let entry = self.context.append_basic_block(runner, "entry");
+        let check = self.context.append_basic_block(runner, "check");
+        let call = self.context.append_basic_block(runner, "call");
+        let done = self.context.append_basic_block(runner, "done");
+        b.position_at_end(entry);
+        b.build_unconditional_branch(check).unwrap();
+        b.position_at_end(check);
+        let proc = b
+            .build_load(ptr, slot, "proc")
+            .unwrap()
+            .into_pointer_value();
+        let is_nil = b.build_is_null(proc, "nil").unwrap();
+        b.build_conditional_branch(is_nil, done, call).unwrap();
+        b.position_at_end(call);
+        b.build_store(slot, ptr.const_null()).unwrap();
+        b.build_indirect_call(void.fn_type(&[], false), proc, &[], "")
+            .unwrap();
+        b.build_unconditional_branch(check).unwrap();
+        b.position_at_end(done);
+        b.build_return(None).unwrap();
+        let atexit = self.libc(
+            "atexit",
+            self.context.i32_type().fn_type(&[ptr.into()], false),
+        );
+        self.builder
+            .build_call(
+                atexit,
+                &[runner.as_global_value().as_pointer_value().into()],
+                "",
+            )
+            .unwrap();
     }
 
     /// Declare the `argc` / `argv` globals `main` fills in.

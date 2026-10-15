@@ -7,6 +7,8 @@ pub mod parser;
 mod pascal_syntax;
 pub mod prof_runtime;
 mod rename;
+mod rtl;
+mod scope;
 pub mod sema;
 pub mod source_map;
 
@@ -421,6 +423,8 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
         )?;
     }
 
+    scope::separate_unit_scopes(program, &mut loaded);
+
     // `loaded` is in post-order (deepest dependency first). To
     // preserve that ordering when prepending to the program, build
     // a single combined batch then splice it once at the front. This
@@ -533,7 +537,7 @@ fn find_unit_file(name: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
             }
         }
     }
-    None
+    rtl::unit_file(name)
 }
 
 fn capitalize(name: &str) -> String {
@@ -2766,6 +2770,162 @@ end.
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&result.console_capture_path);
         (status.success(), captured)
+    }
+
+    #[test]
+    fn units_keep_same_named_declarations_apart() {
+        let low: &[u8] = b"unit Low;
+interface
+var Width: Integer;
+procedure Init;
+function Twice(X: Integer): Integer;
+implementation
+procedure Init;
+begin
+  Width := 80;
+  writeln('Low.Init');
+end;
+function Twice(X: Integer): Integer;
+begin
+  Twice := X * 2;
+end;
+end.
+";
+        let high: &[u8] = b"unit High;
+interface
+uses Low;
+var Width: Integer;
+procedure Init;
+implementation
+procedure Init;
+var Twice: Integer;
+begin
+  Low.Init;
+  Twice := 3;
+  Width := Low.Width + Twice;
+  writeln('High.Init ', Width);
+end;
+end.
+";
+        let (ok, out) = build_and_run_in_dir(
+            "bruto_unit_scopes_test",
+            &[("Low.pas", low), ("High.pas", high)],
+            "program Main;
+uses Low, High;
+begin
+  Init;
+  writeln(Width, ' ', Low.Width, ' ', Twice(High.Width));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "Low.Init\nHigh.Init 83\n83 80 166\n");
+    }
+
+    #[test]
+    fn external_c_functions() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+function CLength(P: PChar): LongInt; cdecl; external 'c' name 'strlen';
+function snprintf(Buf: PChar; N: QWord; Fmt: PChar): LongInt; cdecl; varargs; external 'c';
+var Buf: array[0..31] of Char;
+begin
+  writeln(CLength('hello'));
+  snprintf(@Buf, 32, '%d-%d', 12, 345);
+  writeln(CLength(@Buf));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "5\n6\n");
+    }
+
+    #[test]
+    fn records_compare_and_strings_resize() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TKey = record
+    Code: Word;
+    Ch: Char;
+    Flags: set of 0..7;
+  end;
+  TPoint = record X, Y: Integer; end;
+  TEvent = record
+    What: Word;
+    case Integer of
+      0: (Where: TPoint);
+      1: (Code: Word);
+  end;
+const
+  NoKey: TKey = (Code: 0; Ch: #0; Flags: []);
+var
+  A, B: TKey;
+  E: TEvent;
+  S: AnsiString;
+  Short: string[20];
+  N: LongInt;
+  P: Pointer;
+
+procedure Bye;
+begin
+  writeln('bye');
+end;
+
+begin
+  A := NoKey;
+  B := NoKey;
+  writeln(A = B, ' ', A <> NoKey);
+  B.Flags := [3];
+  writeln(A = B);
+  case 'q' of
+    'a'..'p': writeln('early');
+    'q'..'z': writeln('late');
+  end;
+  E.Where.X := 4;
+  E.Where.Y := 5;
+  writeln(E.Where.X + E.Where.Y);
+  S := 'abc';
+  SetLength(S, 5);
+  writeln('[', S, '] ', Length(S));
+  SetLength(S, 2);
+  writeln('[', S, ']');
+  Short := 'hello';
+  writeln(High(Short));
+  N := 42;
+  P := @N;
+  writeln(LongInt(P^));
+  ExitProc := @Bye;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "true false\nfalse\nlate\n9\n[abc  ] 5\n[ab]\n20\n42\nbye\n"
+        );
+    }
+
+    #[test]
+    fn console_units_ship_with_the_compiler() {
+        // Only the parts that don't need a terminal.
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses Video, Keyboard, Mouse, BaseUnix, Unix, TermIO;
+var
+  K: TKeyEvent;
+  TV: TimeVal;
+begin
+  K := $3B00 or (LongWord(kbAlt) shl 16);
+  writeln(GetKeyEventCode(K), ' ', GetKeyEventShiftState(K));
+  writeln(GetCapabilities and cpColor, ' ', DetectMouse);
+  writeln(FpGetTimeOfDay(@TV, nil), ' ', TV.tv_sec > 0);
+  writeln(PollEnhancedKeyEvent = NilEnhancedKeyEvent);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "15104 8\n4 3\n0 true\ntrue\n");
     }
 
     #[test]

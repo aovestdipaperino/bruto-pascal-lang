@@ -1,0 +1,333 @@
+{ Bruto Pascal runtime: FPC's Video unit on an ANSI terminal. The screen
+  is a buffer of cells (character in the low byte, attribute in the high
+  one, code page 437); UpdateScreen sends the cells that changed. }
+unit Video;
+
+interface
+
+uses BrutoConsole;
+
+type
+  PVideoMode = ^TVideoMode;
+  TVideoMode = record
+    Col, Row: Word;
+    Color: Boolean;
+  end;
+  TVideoCell = Word;
+  PVideoCell = ^TVideoCell;
+  TVideoBuf = array[0..32759] of TVideoCell;
+  PVideoBuf = ^TVideoBuf;
+
+const
+  Black = 0;
+  Blue = 1;
+  Green = 2;
+  Cyan = 3;
+  Red = 4;
+  Magenta = 5;
+  Brown = 6;
+  LightGray = 7;
+  DarkGray = 8;
+  LightBlue = 9;
+  LightGreen = 10;
+  LightCyan = 11;
+  LightRed = 12;
+  LightMagenta = 13;
+  Yellow = 14;
+  White = 15;
+  Blink = 128;
+
+  cpUnderLine = $0001;
+  cpBlink = $0002;
+  cpColor = $0004;
+  cpChangeFont = $0008;
+  cpChangeMode = $0010;
+  cpChangeCursor = $0020;
+
+  crHidden = 0;
+  crUnderLine = 1;
+  crBlock = 2;
+  crHalfBlock = 3;
+
+  vioOK = 0;
+  errVioBase = 1000;
+  errVioInit = errVioBase + 1;
+  errVioNotSupported = errVioBase + 2;
+  errVioNoSuchMode = errVioBase + 3;
+  errOk = 0;
+
+  LowAscii = True;
+  NoExtendedFrame = False;
+  FVMaxWidth = 1024;
+
+var
+  ScreenWidth, ScreenHeight: Word;
+  ScreenColor: Boolean;
+  CursorX, CursorY: Word;
+  VideoBuf, OldVideoBuf: PVideoBuf;
+  VideoBufSize: LongInt;
+  CursorLines: Byte;
+  ErrorCode: LongInt;
+  ErrorInfo: Pointer;
+
+procedure InitVideo;
+procedure DoneVideo;
+procedure InitEnhancedVideo;
+procedure DoneEnhancedVideo;
+function GetCapabilities: Word;
+procedure ClearScreen;
+procedure UpdateScreen(Force: Boolean);
+procedure UpdateScreenArea(const X1, Y1, X2, Y2: Word; Force: Boolean);
+procedure SetCursorPos(NewCursorX, NewCursorY: Word);
+function GetCursorType: Word;
+procedure SetCursorType(NewType: Word);
+procedure LockScreenUpdate;
+procedure UnlockScreenUpdate;
+function GetLockScreenCount: Integer;
+procedure GetVideoMode(var Mode: TVideoMode);
+function SetVideoMode(const Mode: TVideoMode): Boolean;
+function GetVideoModeCount: Word;
+function GetVideoModeData(Index: Word; var Data: TVideoMode): Boolean;
+
+implementation
+
+const
+  { DOS color number -> ANSI color number. }
+  AnsiColor: array[0..7] of Byte = (0, 4, 2, 6, 1, 5, 3, 7);
+
+var
+  Initialized: Boolean;
+  LockCount: Integer;
+  CursorType: Word;
+  LastAttr: LongInt;
+
+procedure OutAttr(Attr: Byte);
+var
+  Fg, Bg: Byte;
+begin
+  Fg := Attr and $0F;
+  Bg := (Attr shr 4) and $07;
+  ConsoleOutStr(#27'[0;');
+  if Fg >= 8 then
+    ConsoleOutNum(90 + AnsiColor[Fg - 8])
+  else
+    ConsoleOutNum(30 + AnsiColor[Fg]);
+  ConsoleOutChar(';');
+  if (Attr and $80) <> 0 then
+    ConsoleOutNum(100 + AnsiColor[Bg])
+  else
+    ConsoleOutNum(40 + AnsiColor[Bg]);
+  ConsoleOutChar('m');
+end;
+
+procedure OutGoto(X, Y: LongInt);
+begin
+  ConsoleOutStr(#27'[');
+  ConsoleOutNum(Y + 1);
+  ConsoleOutChar(';');
+  ConsoleOutNum(X + 1);
+  ConsoleOutChar('H');
+end;
+
+procedure OutCursor;
+begin
+  if (CursorType = crHidden) or (CursorX >= ScreenWidth) or (CursorY >= ScreenHeight) then
+    ConsoleOutStr(#27'[?25l')
+  else
+  begin
+    OutGoto(CursorX, CursorY);
+    ConsoleOutStr(#27'[?25h');
+  end;
+end;
+
+procedure AllocBuffers;
+var
+  I: LongInt;
+begin
+  VideoBufSize := LongInt(ScreenWidth) * ScreenHeight * SizeOf(TVideoCell);
+  GetMem(VideoBuf, VideoBufSize);
+  GetMem(OldVideoBuf, VideoBufSize);
+  for I := 0 to LongInt(ScreenWidth) * ScreenHeight - 1 do
+  begin
+    VideoBuf^[I] := $0720;
+    OldVideoBuf^[I] := $0720;
+  end;
+end;
+
+procedure InitVideo;
+begin
+  ErrorCode := vioOK;
+  if Initialized then
+    Exit;
+  ConsoleSize(ScreenWidth, ScreenHeight);
+  ScreenColor := True;
+  CursorX := 0;
+  CursorY := 0;
+  CursorType := crUnderLine;
+  CursorLines := 0;
+  AllocBuffers;
+  { The alternate screen, cleared, with the cursor hidden. }
+  ConsoleOutStr(#27'[?1049h'#27'[0m'#27'[2J'#27'[?25l');
+  ConsoleFlush;
+  LastAttr := -1;
+  Initialized := True;
+end;
+
+procedure DoneVideo;
+begin
+  if not Initialized then
+    Exit;
+  ConsoleOutStr(#27'[0m'#27'[?25h'#27'[?1049l');
+  ConsoleFlush;
+  FreeMem(VideoBuf, VideoBufSize);
+  FreeMem(OldVideoBuf, VideoBufSize);
+  VideoBuf := nil;
+  OldVideoBuf := nil;
+  Initialized := False;
+end;
+
+procedure InitEnhancedVideo;
+begin
+  InitVideo;
+end;
+
+procedure DoneEnhancedVideo;
+begin
+  DoneVideo;
+end;
+
+function GetCapabilities: Word;
+begin
+  GetCapabilities := cpColor or cpChangeCursor;
+end;
+
+procedure ClearScreen;
+var
+  I: LongInt;
+begin
+  if not Initialized then
+    Exit;
+  for I := 0 to LongInt(ScreenWidth) * ScreenHeight - 1 do
+    VideoBuf^[I] := $0720;
+  UpdateScreen(True);
+end;
+
+procedure SendCells(X1, Y1, X2, Y2: LongInt; Force: Boolean);
+var
+  X, Y, I, NextX, NextY: LongInt;
+  Cell: Word;
+begin
+  NextX := -1;
+  NextY := -1;
+  for Y := Y1 to Y2 do
+    for X := X1 to X2 do
+    begin
+      I := Y * ScreenWidth + X;
+      Cell := VideoBuf^[I];
+      if Force or (Cell <> OldVideoBuf^[I]) then
+      begin
+        if (X <> NextX) or (Y <> NextY) then
+          OutGoto(X, Y);
+        if (Cell shr 8) <> LastAttr then
+        begin
+          OutAttr(Cell shr 8);
+          LastAttr := Cell shr 8;
+        end;
+        ConsoleOutCP437(Cell and $FF);
+        OldVideoBuf^[I] := Cell;
+        NextX := X + 1;
+        NextY := Y;
+      end;
+    end;
+end;
+
+procedure UpdateScreen(Force: Boolean);
+begin
+  if (not Initialized) or (LockCount > 0) then
+    Exit;
+  if Force then
+    LastAttr := -1;
+  SendCells(0, 0, ScreenWidth - 1, ScreenHeight - 1, Force);
+  OutCursor;
+  ConsoleFlush;
+end;
+
+procedure UpdateScreenArea(const X1, Y1, X2, Y2: Word; Force: Boolean);
+begin
+  if (not Initialized) or (LockCount > 0) then
+    Exit;
+  if (X2 >= ScreenWidth) or (Y2 >= ScreenHeight) or (X1 > X2) or (Y1 > Y2) then
+    Exit;
+  SendCells(X1, Y1, X2, Y2, Force);
+  OutCursor;
+  ConsoleFlush;
+end;
+
+procedure SetCursorPos(NewCursorX, NewCursorY: Word);
+begin
+  CursorX := NewCursorX;
+  CursorY := NewCursorY;
+  if Initialized and (LockCount = 0) then
+  begin
+    OutCursor;
+    ConsoleFlush;
+  end;
+end;
+
+function GetCursorType: Word;
+begin
+  GetCursorType := CursorType;
+end;
+
+procedure SetCursorType(NewType: Word);
+begin
+  CursorType := NewType;
+  if Initialized and (LockCount = 0) then
+  begin
+    OutCursor;
+    ConsoleFlush;
+  end;
+end;
+
+procedure LockScreenUpdate;
+begin
+  LockCount := LockCount + 1;
+end;
+
+procedure UnlockScreenUpdate;
+begin
+  if LockCount > 0 then
+    LockCount := LockCount - 1;
+end;
+
+function GetLockScreenCount: Integer;
+begin
+  GetLockScreenCount := LockCount;
+end;
+
+procedure GetVideoMode(var Mode: TVideoMode);
+begin
+  Mode.Col := ScreenWidth;
+  Mode.Row := ScreenHeight;
+  Mode.Color := ScreenColor;
+end;
+
+function SetVideoMode(const Mode: TVideoMode): Boolean;
+begin
+  { The terminal decides the size; only the current mode is valid. }
+  SetVideoMode := (Mode.Col = ScreenWidth) and (Mode.Row = ScreenHeight);
+end;
+
+function GetVideoModeCount: Word;
+begin
+  GetVideoModeCount := 1;
+end;
+
+function GetVideoModeData(Index: Word; var Data: TVideoMode): Boolean;
+begin
+  GetVideoModeData := Index = 0;
+  if Index = 0 then
+    GetVideoMode(Data);
+end;
+
+end.

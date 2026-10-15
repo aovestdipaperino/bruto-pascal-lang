@@ -10,6 +10,19 @@ use crate::ast::*;
 pub(crate) trait Rename {
     fn rename(&self, name: &str) -> String;
 
+    /// Maps the name of a field or method, which lives in its type rather
+    /// than in a scope. The same as [`Rename::rename`] unless overridden.
+    fn rename_member(&self, name: &str) -> String {
+        self.rename(name)
+    }
+
+    /// Called when the walk enters a routine, after its own name is
+    /// renamed and before its parameters and declarations are.
+    fn enter_routine(&self, _proc: &ProcDecl) {}
+
+    /// Called when the walk leaves the routine last entered.
+    fn leave_routine(&self) {}
+
     /// Called on every expression before its parts are walked, so a pass
     /// can rewrite the node itself.
     fn rewrite_expr_node(&self, _expr: &mut Expr) {}
@@ -46,11 +59,51 @@ pub(crate) fn rewrite_program<R: Rename>(program: &mut Program, n: &R) {
     rewrite_block(&mut program.body, n);
 }
 
-fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
-    p.name = n.rename(&p.name);
-    if let Some(owner) = &mut p.owner {
-        *owner = n.rename(owner);
+pub(crate) fn rewrite_unit<R: Rename>(unit: &mut Unit, n: &R) {
+    for c in unit
+        .interface_consts
+        .iter_mut()
+        .chain(&mut unit.impl_consts)
+    {
+        c.name = n.rename(&c.name);
+        if let Some(ty) = &mut c.ty {
+            rewrite_type(ty, n);
+        }
+        rewrite_expr(&mut c.value, n);
     }
+    for td in unit.interface_types.iter_mut().chain(&mut unit.impl_types) {
+        td.name = n.rename(&td.name);
+        rewrite_type(&mut td.ty, n);
+    }
+    for v in unit.interface_vars.iter_mut().chain(&mut unit.impl_vars) {
+        for name in &mut v.names {
+            *name = n.rename(name);
+        }
+        if let Some(target) = &mut v.absolute {
+            *target = n.rename(target);
+        }
+        rewrite_type(&mut v.ty, n);
+    }
+    for p in unit
+        .interface_proc_headers
+        .iter_mut()
+        .chain(&mut unit.procedures)
+    {
+        rewrite_proc(p, n);
+    }
+    if let Some(init) = &mut unit.init {
+        rewrite_block(init, n);
+    }
+}
+
+fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
+    if let Some(owner) = &mut p.owner {
+        p.name = n.rename_member(&p.name);
+        *owner = n.rename(owner);
+    } else {
+        p.name = n.rename(&p.name);
+    }
+    n.enter_routine(p);
     for c in &mut p.consts {
         c.name = n.rename(&c.name);
         if let Some(ty) = &mut c.ty {
@@ -84,6 +137,7 @@ fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
         rewrite_proc(np, n);
     }
     rewrite_block(&mut p.body, n);
+    n.leave_routine();
 }
 
 fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
@@ -93,11 +147,11 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
                 *parent = n.rename(parent);
             }
             for (fname, fty) in &mut obj.fields {
-                *fname = n.rename(fname);
+                *fname = n.rename_member(fname);
                 rewrite_type(fty, n);
             }
             for m in &mut obj.methods {
-                m.name = n.rename(&m.name);
+                m.name = n.rename_member(&m.name);
                 for group in &mut m.params {
                     for name in &mut group.names {
                         *name = n.rename(name);
@@ -119,18 +173,18 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
             fields, variant, ..
         } => {
             for (fname, fty) in fields {
-                *fname = n.rename(fname);
+                *fname = n.rename_member(fname);
                 rewrite_type(fty, n);
             }
             if let Some(var) = variant {
-                var.tag_name = n.rename(&var.tag_name);
+                var.tag_name = n.rename_member(&var.tag_name);
                 rewrite_type(&mut var.tag_type, n);
                 for (labels, vfields) in &mut var.variants {
                     for label in labels.iter_mut() {
                         rewrite_const_expr(label, n);
                     }
                     for (fname, fty) in vfields {
-                        *fname = n.rename(fname);
+                        *fname = n.rename_member(fname);
                         rewrite_type(fty, n);
                     }
                 }
@@ -229,13 +283,13 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
             ..
         } => {
             rewrite_expr(object, n);
-            *method = n.rename(method);
+            *method = n.rename_member(method);
             for a in args {
                 rewrite_expr(a, n);
             }
         }
         Statement::Inherited { method, args, .. } => {
-            *method = n.rename(method);
+            *method = n.rename_member(method);
             for a in args {
                 rewrite_expr(a, n);
             }
@@ -313,7 +367,7 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
         } => {
             rewrite_expr(target, n);
             if let Some((name, args)) = method {
-                *name = n.rename(name);
+                *name = n.rename_member(name);
                 for a in args {
                     rewrite_expr(a, n);
                 }
@@ -348,7 +402,7 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
             ..
         } => {
             *target = n.rename(target);
-            *field = n.rename(field);
+            *field = n.rename_member(field);
             rewrite_expr(expr, n);
         }
         Statement::ProcCall { name, args, .. } => {
@@ -393,7 +447,7 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
             *target = n.rename(target);
             for step in chain {
                 match step {
-                    LValueAccess::Field(f) => *f = n.rename(f),
+                    LValueAccess::Field(f) => *f = n.rename_member(f),
                     LValueAccess::Index(e) => rewrite_expr(e, n),
                     LValueAccess::Deref => {}
                 }
@@ -427,7 +481,7 @@ fn rewrite_expr<R: Rename>(e: &mut Expr, n: &R) {
         }
         Expr::RecordInit { fields, .. } => {
             for (name, value) in fields {
-                *name = n.rename(name);
+                *name = n.rename_member(name);
                 rewrite_expr(value, n);
             }
         }
@@ -443,13 +497,13 @@ fn rewrite_expr<R: Rename>(e: &mut Expr, n: &R) {
             ..
         } => {
             rewrite_expr(object, n);
-            *method = n.rename(method);
+            *method = n.rename_member(method);
             for a in args {
                 rewrite_expr(a, n);
             }
         }
         Expr::Inherited { method, args, .. } => {
-            *method = n.rename(method);
+            *method = n.rename_member(method);
             for a in args {
                 rewrite_expr(a, n);
             }
@@ -473,7 +527,7 @@ fn rewrite_expr<R: Rename>(e: &mut Expr, n: &R) {
         }
         Expr::FieldAccess { record, field, .. } => {
             rewrite_expr(record, n);
-            *field = n.rename(field);
+            *field = n.rename_member(field);
         }
         Expr::SetConstructor { elements, .. } => {
             for el in elements {

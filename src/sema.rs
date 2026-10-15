@@ -161,7 +161,12 @@ impl UnitQualifiers {
 
 impl Rename for UnitQualifiers {
     fn rename(&self, name: &str) -> String {
-        name.to_string()
+        // A qualified type name, `objects.trect`. (`system.x` is kept: it
+        // marks a call that must reach the built-in.)
+        match name.split_once('.') {
+            Some((unit, base)) if unit != "system" && self.units.contains(unit) => base.to_string(),
+            _ => name.to_string(),
+        }
     }
 
     fn rewrite_expr_node(&self, expr: &mut Expr) {
