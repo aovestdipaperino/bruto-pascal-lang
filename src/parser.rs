@@ -92,6 +92,7 @@ enum Tok {
     IntLit(i64),
     RealLit(f64),
     CharLit(u8),
+    WideCharLit(u16),
     StrLit(String),
     // Identifier
     Ident(String),
@@ -194,6 +195,7 @@ impl fmt::Display for Tok {
             Tok::IntLit(n) => write!(f, "{n}"),
             Tok::RealLit(r) => write!(f, "{r}"),
             Tok::CharLit(c) => write!(f, "#{c}"),
+            Tok::WideCharLit(c) => write!(f, "#{c}"),
             Tok::StrLit(s) => write!(f, "'{s}'"),
             Tok::Ident(s) => write!(f, "identifier '{s}'"),
             Tok::Plus => write!(f, "'+'"),
@@ -316,6 +318,10 @@ fn predefined_symbols() -> Vec<&'static str> {
         "CPULLVM",
         "ENDIAN_LITTLE",
         "FPC_LITTLE_ENDIAN",
+        // The string types Bruto has, as FPC announces them.
+        "FPC_HAS_FEATURE_ANSISTRINGS",
+        "FPC_HAS_FEATURE_UNICODESTRINGS",
+        "FPC_HAS_FEATURE_WIDESTRINGS",
     ];
     if cfg!(unix) {
         symbols.push("UNIX");
@@ -792,14 +798,20 @@ impl Lexer {
                         let d = self.advance().to_digit(radix).unwrap_or(0);
                         n = n.wrapping_mul(radix).wrapping_add(d);
                     }
-                    s.push(char::from(n as u8));
+                    // Codes above 255 are UTF-16 code units (FPC's
+                    // WideChar); a lone surrogate can't be held here.
+                    s.push(char::from_u32(n & 0xFFFF).unwrap_or('\u{FFFD}'));
                 }
                 _ => break,
             }
             pieces += 1;
         }
         if pieces == 1 && only_codes {
-            return (Tok::CharLit(s.chars().next().unwrap_or('\0') as u8), span);
+            let code = u32::from(s.chars().next().unwrap_or('\0'));
+            return match u8::try_from(code) {
+                Ok(c) => (Tok::CharLit(c), span),
+                Err(_) => (Tok::WideCharLit(code as u16), span),
+            };
         }
         (Tok::StrLit(s), span)
     }
@@ -2925,6 +2937,28 @@ impl Parser {
         let span = self.span();
         self.expect(&Tok::For)?;
         let (var, _) = self.expect_ident()?;
+        if *self.peek() == Tok::KwIn {
+            self.advance();
+            let collection = self.parse_expr()?;
+            self.expect(&Tok::Do)?;
+            let body = match self.parse_statement()? {
+                Statement::Block(b) => b,
+                other => {
+                    let s = other.span();
+                    Block {
+                        span: s,
+                        end_span: s,
+                        statements: vec![other],
+                    }
+                }
+            };
+            return Ok(Statement::ForIn {
+                var,
+                collection,
+                body,
+                span,
+            });
+        }
         self.expect(&Tok::Assign)?;
         let from = self.parse_expr()?;
         let downto = match self.peek() {
@@ -3414,6 +3448,11 @@ impl Parser {
                 let span = self.span();
                 self.advance();
                 Ok(Expr::CharLit(c, span))
+            }
+            Tok::WideCharLit(c) => {
+                let span = self.span();
+                self.advance();
+                Ok(Expr::WideCharLit(c, span))
             }
             Tok::StrLit(s) => {
                 let span = self.span();

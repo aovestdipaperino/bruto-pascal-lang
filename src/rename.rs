@@ -233,6 +233,8 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
         | PascalType::String
         | PascalType::Boolean
         | PascalType::Char
+        | PascalType::WideChar
+        | PascalType::UnicodeString
         | PascalType::Subrange { .. } => {}
     }
 }
@@ -330,6 +332,16 @@ fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
             *var = n.rename(var);
             rewrite_expr(from, n);
             rewrite_expr(to, n);
+            rewrite_block(body, n);
+        }
+        Statement::ForIn {
+            var,
+            collection,
+            body,
+            ..
+        } => {
+            *var = n.rename(var);
+            rewrite_expr(collection, n);
             rewrite_block(body, n);
         }
         Statement::RepeatUntil {
@@ -543,6 +555,7 @@ fn rewrite_expr<R: Rename>(e: &mut Expr, n: &R) {
         Expr::IntLit(..)
         | Expr::RealLit(..)
         | Expr::CharLit(..)
+        | Expr::WideCharLit(..)
         | Expr::StrLit(..)
         | Expr::BoolLit(..)
         | Expr::Nil(_) => {}

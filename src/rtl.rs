@@ -12,6 +12,10 @@ use std::path::PathBuf;
 
 const SYSTEM_PRELUDE: &str = include_str!("../rtl/system.pp");
 
+/// The UnicodeString routines code generation calls; every program gets
+/// them.
+const USTRINGS: &str = include_str!("../rtl/ustrings.pp");
+
 const UNITS: &[(&str, &str)] = &[
     ("unixtype.pp", include_str!("../rtl/unixtype.pp")),
     ("baseunix.pp", include_str!("../rtl/baseunix.pp")),
@@ -19,6 +23,8 @@ const UNITS: &[(&str, &str)] = &[
     ("termio.pp", include_str!("../rtl/termio.pp")),
     ("dos.pp", include_str!("../rtl/dos.pp")),
     ("cwstring.pp", include_str!("../rtl/cwstring.pp")),
+    ("fpwidestring.pp", include_str!("../rtl/fpwidestring.pp")),
+    ("graphemebreakproperty.pp", include_str!("../rtl/graphemebreakproperty.pp")),
     ("sysutils.pp", include_str!("../rtl/sysutils.pp")),
     ("brutoconsole.pp", include_str!("../rtl/brutoconsole.pp")),
     ("video.pp", include_str!("../rtl/video.pp")),
@@ -43,22 +49,33 @@ pub(crate) fn unit_file(name: &str) -> Option<PathBuf> {
 /// Add the System routines and types written in Pascal (`rtl/system.pp`)
 /// that the program and its units don't declare themselves.
 pub(crate) fn add_system_prelude(program: &mut Program) -> Result<(), String> {
+    add_prelude(program, "system.pp", SYSTEM_PRELUDE)
+}
+
+/// Add the UnicodeString routines (`rtl/ustrings.pp`).
+pub(crate) fn add_unicode_strings(program: &mut Program) -> Result<(), String> {
+    add_prelude(program, "ustrings.pp", USTRINGS)
+}
+
+/// Add the types and routines of the prelude unit `source` that the
+/// program doesn't declare itself.
+fn add_prelude(program: &mut Program, file: &str, source: &str) -> Result<(), String> {
     let path = std::env::temp_dir()
         .join(format!("bruto-rtl-{}", env!("CARGO_PKG_VERSION")))
-        .join("system.pp");
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(SYSTEM_PRELUDE) {
+        .join(file);
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let _ = std::fs::write(&path, SYSTEM_PRELUDE);
+        let _ = std::fs::write(&path, source);
     }
     let unit = Parser::with_options(
-        SYSTEM_PRELUDE,
+        source,
         &ParseOptions {
             file: Some(path),
             include_dirs: Vec::new(),
         },
     )
     .parse_unit()
-    .map_err(|e| format!("parse error in the System prelude: {e}"))?;
+    .map_err(|e| format!("parse error in the System prelude ({file}): {e}"))?;
     let declared: HashSet<String> = program
         .consts
         .iter()

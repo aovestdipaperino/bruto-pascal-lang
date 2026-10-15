@@ -23,9 +23,11 @@ use std::fmt;
 use std::path::Path;
 
 mod closures;
+mod forin;
 mod objects;
 mod strings;
 mod system;
+mod unicode;
 
 const UNTYPED_DEREF: &str =
     "an untyped pointer can't be dereferenced; cast it to a typed pointer first";
@@ -132,6 +134,8 @@ pub struct CodeGen<'ctx> {
     // Reset on entry to each routine: a nested procedure can't break out
     // of its parent's loop.
     loop_targets: Vec<(BasicBlock<'ctx>, BasicBlock<'ctx>)>,
+    /// Hidden locals made so far (for `for-in` loops), for unique names.
+    hidden_count: u32,
     // How many pointers `create_debug_type` is currently inside.
     debug_pointer_depth: std::cell::Cell<u32>,
     // Overloaded routines: base name -> one symbol per signature.
@@ -235,6 +239,7 @@ impl<'ctx> CodeGen<'ctx> {
             current_scope: None,
             label_blocks: HashMap::new(),
             loop_targets: Vec::new(),
+            hidden_count: 0,
             exit_block: None,
             end_bp_slots: HashMap::new(),
             debug_pointer_depth: std::cell::Cell::new(0),
@@ -627,6 +632,11 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(|e| CodeGenError::new(e.to_string(), None))?;
 
         self.di_builder.finalize();
+
+        // A debugging aid: `BRUTO_DUMP_IR=file` writes the module's IR.
+        if let Ok(path) = std::env::var("BRUTO_DUMP_IR") {
+            let _ = std::fs::write(path, self.print_ir());
+        }
 
         // Verify module
         if let Err(msg) = self.module.verify() {
@@ -1026,9 +1036,18 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_store(alloca, self.context.bool_type().const_int(0, false))
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
-                PascalType::Char => {
+                PascalType::Char | PascalType::WideChar | PascalType::UnicodeString => {
                     self.builder
-                        .build_store(alloca, self.context.i8_type().const_int(0, false))
+                        .build_store(alloca, llvm_ty.const_zero())
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
+                }
+                // UnicodeStrings inside start out empty (nil), as FPC
+                // initializes managed fields.
+                PascalType::Array { .. } | PascalType::Record { .. }
+                    if self.holds_unicode_string(&resolved_ty) =>
+                {
+                    self.builder
+                        .build_store(alloca, llvm_ty.const_zero())
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::String => {
@@ -1203,10 +1222,15 @@ impl<'ctx> CodeGen<'ctx> {
     /// (Pascal strings are byte strings, so `#129` is the byte 129, not a
     /// UTF-8 sequence), NUL-terminated.
     fn string_literal(&self, text: &str) -> PointerValue<'ctx> {
-        let bytes: Vec<u8> = text
-            .chars()
-            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
-            .collect();
+        // Characters above 255 (from a UTF-8 source, or `#$2500`) are
+        // written in UTF-8, the code page of AnsiStrings on Unix.
+        let mut bytes: Vec<u8> = Vec::with_capacity(text.len());
+        for c in text.chars() {
+            match u8::try_from(u32::from(c)) {
+                Ok(b) => bytes.push(b),
+                Err(_) => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+            }
+        }
         let value = self.context.const_string(&bytes, true);
         let global = self.module.add_global(value.get_type(), None, "str_lit");
         global.set_linkage(Linkage::Private);
@@ -1357,11 +1381,52 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(())
             }
             // `array[0..2] of Char = #218#196#191`: the characters, then
-            // zeros.
-            (Expr::StrLit(text, span), PascalType::Array { lo, hi, elem })
-                if self.resolve_type(elem) == PascalType::Char =>
+            // zeros; for `array of WideChar`, their UTF-16 units.
+            (_, PascalType::Array { lo, hi, elem })
+                if self.resolve_type(elem) == PascalType::WideChar
+                    && literal_text(value).is_some() =>
             {
-                let bytes: Vec<u8> = text.chars().map(|c| c as u32 as u8).collect();
+                let span = &value.span();
+                let units: Vec<u16> = literal_text(value).unwrap().encode_utf16().collect();
+                let len = (hi - lo + 1) as usize;
+                if units.len() > len {
+                    return Err(CodeGenError::new(
+                        format!(
+                            "the string has {} characters but the array holds {len}",
+                            units.len()
+                        ),
+                        Some(*span),
+                    ));
+                }
+                let i16_ty = self.context.i16_type();
+                let i64_ty = self.context.i64_type();
+                for i in 0..len {
+                    let addr = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(
+                                i16_ty,
+                                slot,
+                                &[i64_ty.const_int(i as u64, false)],
+                                "init_wchar",
+                            )
+                            .map_err(err)?
+                    };
+                    let unit = units.get(i).copied().unwrap_or(0);
+                    self.builder
+                        .build_store(addr, i16_ty.const_int(u64::from(unit), false))
+                        .map_err(err)?;
+                }
+                Ok(())
+            }
+            (_, PascalType::Array { lo, hi, elem })
+                if self.resolve_type(elem) == PascalType::Char && literal_text(value).is_some() =>
+            {
+                let span = &value.span();
+                let bytes: Vec<u8> = literal_text(value)
+                    .unwrap()
+                    .chars()
+                    .map(|c| c as u32 as u8)
+                    .collect();
                 let len = (hi - lo + 1) as usize;
                 if bytes.len() > len {
                     return Err(CodeGenError::new(
@@ -1990,6 +2055,20 @@ impl<'ctx> CodeGen<'ctx> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let resolved = self.resolve_type(ty);
         let target = self.llvm_type_for(&resolved);
+        match resolved {
+            PascalType::UnicodeString => return self.to_ustr(val, span),
+            PascalType::WideChar => return self.to_wide_char(val, span),
+            _ => {}
+        }
+        // A UnicodeString or WideChar stored as an AnsiString.
+        let val = if matches!(
+            resolved,
+            PascalType::String | PascalType::ShortString { .. }
+        ) {
+            self.ustr_to_ansi(val, span)?
+        } else {
+            val
+        };
         // A one-character string stored into a char.
         let val = if resolved == PascalType::Char {
             self.first_char_if_string(val, span)?
@@ -2014,8 +2093,9 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_int_truncate(iv, it, "trunc")
                         .map_err(err)?
                         .into()
-                } else if from < to && from <= 8 {
-                    // Booleans and chars are unsigned.
+                } else if from < to && from <= 16 {
+                    // Booleans, chars and WideChars are unsigned (other
+                    // integers are 64 bits wide by now).
                     self.builder
                         .build_int_z_extend(iv, it, "zext")
                         .map_err(err)?
@@ -2106,6 +2186,7 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<(), CodeGenError> {
         // Into a short string: copy (and truncate) the characters.
         if let PascalType::ShortString { max } = self.resolve_type(ty) {
+            let val = self.ustr_to_ansi(val, span)?;
             return self.store_short_string(ptr, val, max, span);
         }
         let val = self.convert_for_store(val, ty, span)?;
@@ -2346,6 +2427,12 @@ impl<'ctx> CodeGen<'ctx> {
                 body,
                 span,
             } => self.compile_for(var, from, to, *downto, body, *span),
+            Statement::ForIn {
+                var,
+                collection,
+                body,
+                span,
+            } => self.compile_for_in(var, collection, body, *span),
             Statement::RepeatUntil {
                 body,
                 condition,
@@ -2374,6 +2461,9 @@ impl<'ctx> CodeGen<'ctx> {
                 let resolved = self.resolve_type(&var_type);
                 if resolved == PascalType::String {
                     return self.set_string_char(alloca, idx_val, val, *span);
+                }
+                if resolved == PascalType::UnicodeString {
+                    return self.set_ustr_char(alloca, idx_val, val, *span);
                 }
                 let (gep, elem_ty) =
                     self.gep_array_elem(alloca, &resolved, idx_val.into_int_value(), *span)?;
@@ -2772,6 +2862,13 @@ impl<'ctx> CodeGen<'ctx> {
                     let idx = self.compile_expr(index)?;
                     return self.set_string_char(slot, idx, val, *span);
                 }
+                if let Expr::Index { array, index, .. } = target
+                    && self.is_unicode_type(&self.infer_declared_type(array))
+                {
+                    let (slot, _) = self.resolve_array_base(array, *span)?;
+                    let idx = self.compile_expr(index)?;
+                    return self.set_ustr_char(slot, idx, val, *span);
+                }
                 let (ptr, ty) = self.resolve_array_base(target, *span)?;
                 self.store_value(ptr, val, &ty, *span)
             }
@@ -2982,6 +3079,9 @@ impl<'ctx> CodeGen<'ctx> {
                     if is_last && self.resolve_type(&cur_type) == PascalType::String {
                         return self.set_string_char(ptr, idx_val, val, span);
                     }
+                    if is_last && self.resolve_type(&cur_type) == PascalType::UnicodeString {
+                        return self.set_ustr_char(ptr, idx_val, val, span);
+                    }
                     let idx_val = self.first_char_if_string(idx_val, span)?;
                     let resolved = self.resolve_type(&cur_type);
                     let (gep, elem_ty) =
@@ -3128,7 +3228,8 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Real => 8,
             PascalType::Boolean => 1,
             PascalType::Char => 1,
-            PascalType::String | PascalType::Pointer(_) => 8,
+            PascalType::WideChar => 2,
+            PascalType::String | PascalType::UnicodeString | PascalType::Pointer(_) => 8,
             PascalType::File { .. } => 8, // pointer to opaque struct
             PascalType::Proc { .. } => 8, // function pointer
             PascalType::ConformantArray { .. } => 8, // base pointer
@@ -3705,6 +3806,15 @@ impl<'ctx> CodeGen<'ctx> {
         let idx = self.to_i64(idx, span)?;
         let cnt = self.compile_expr(&args[2])?;
         let cnt = self.to_i64(cnt, span)?;
+        if self.is_ustr(s_val) {
+            let s = self.ustr_ptr(s_val, span)?;
+            let result = self.ustr_runtime(
+                "bruto_ustr_delete",
+                &[s.into(), idx.into(), cnt.into()],
+                span,
+            )?;
+            return self.store_value(slot, result, &ty, span);
+        }
         let f = self.module.get_function("bruto_str_delete").unwrap();
         let result = self
             .builder
@@ -3720,6 +3830,22 @@ impl<'ctx> CodeGen<'ctx> {
     /// and store it back.
     fn compile_str_insert(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
+        if self.is_unicode_type(&self.infer_declared_type(&args[1])) {
+            let source = self.compile_expr(&args[0])?;
+            let source = self.to_ustr(source, span)?;
+            let source = self.ustr_ptr(source, span)?;
+            let (slot, ty) = self.resolve_array_base(&args[1], span)?;
+            let s = self.compile_expr(&args[1])?;
+            let s = self.ustr_ptr(s, span)?;
+            let idx = self.compile_expr(&args[2])?;
+            let idx = self.to_i64(idx, span)?;
+            let result = self.ustr_runtime(
+                "bruto_ustr_insert",
+                &[source.into(), s.into(), idx.into()],
+                span,
+            )?;
+            return self.store_value(slot, result, &ty, span);
+        }
         let source = self.compile_expr(&args[0])?;
         let source = if source.is_int_value() {
             // A single character: make it a one-character string.
@@ -3905,49 +4031,41 @@ impl<'ctx> CodeGen<'ctx> {
         self.store_value(slot, text.into(), &target_ty, span)
     }
 
+    /// `Val(S, X, Code)`: X is an integer or a real, `Code` the position
+    /// of the first character that isn't part of the number (0 if none).
     fn compile_val(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
+        if args.len() != 3 {
+            return Err(CodeGenError::new(
+                "Val needs a string, a variable and a code variable",
+                Some(span),
+            ));
+        }
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let s_val = self.compile_expr(&args[0])?;
-        let x_name = match &args[1] {
-            Expr::Var(name, _) => name.clone(),
-            _ => {
-                return Err(CodeGenError::new(
-                    "val requires a variable as 2nd arg",
-                    Some(span),
-                ));
-            }
+        let s_val = self.ustr_to_ansi(s_val, span)?;
+        let s_val = self.as_string_value(s_val, span)?;
+        if !self.is_addressable(&args[1]) || !self.is_addressable(&args[2]) {
+            return Err(CodeGenError::new(
+                "Val needs variables for the value and the code",
+                Some(span),
+            ));
+        }
+        let (target, target_ty) = self.resolve_array_base(&args[1], span)?;
+        let i64_ty = self.context.i64_type();
+        let code_slot = self.entry_alloca(i64_ty, "val_code").map_err(err)?;
+        let helper = if self.resolve_type(&target_ty) == PascalType::Real {
+            "bruto_val_real"
+        } else {
+            "bruto_val_int"
         };
-        let alloca = *self.lookup_var(x_name.as_str()).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{x_name}'"), Some(span))
-        })?;
-        let f = self.module.get_function("bruto_str_to_int").unwrap();
-        let result = self
-            .builder
-            .build_call(f, &[s_val.into()], "val_result")
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-            .try_as_basic_value()
-            .basic()
+        let value = self
+            .call_ustr_runtime(helper, &[s_val.into(), code_slot.into()], span)?
             .unwrap();
-        self.builder
-            .build_store(alloca, result)
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        // Set code to 0 (success)
-        let code_name = match &args[2] {
-            Expr::Var(name, _) => name.clone(),
-            _ => {
-                return Err(CodeGenError::new(
-                    "val requires a variable as 3rd arg",
-                    Some(span),
-                ));
-            }
-        };
-        let code_alloca = *self.lookup_var(code_name.as_str()).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{code_name}'"), Some(span))
-        })?;
-        self.builder
-            .build_store(code_alloca, self.context.i64_type().const_int(0, false))
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        Ok(())
+        self.store_value(target, value, &target_ty, span)?;
+        let code = self.builder.build_load(i64_ty, code_slot, "code").map_err(err)?;
+        let (code_target, code_ty) = self.resolve_array_base(&args[2], span)?;
+        self.store_value(code_target, code, &code_ty, span)
     }
 
     fn compile_file_assign(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
@@ -3964,7 +4082,7 @@ impl<'ctx> CodeGen<'ctx> {
         let alloca = *self.lookup_var(f_name.as_str()).ok_or_else(|| {
             CodeGenError::new(format!("undefined variable '{f_name}'"), Some(span))
         })?;
-        let path_val = self.compile_expr(&args[1])?;
+        let path_val = self.ansi_arg(&args[1], span)?;
         let new_fn = self.module.get_function("bruto_file_new").unwrap();
         let new_struct = self
             .builder
@@ -4521,7 +4639,14 @@ impl<'ctx> CodeGen<'ctx> {
 
         for arg in &args[start_idx..] {
             let val = self.compile_expr(&arg.expr)?;
-            let arg_type = self.infer_expr_type(&arg.expr);
+            let mut arg_type = self.infer_expr_type(&arg.expr);
+            // UnicodeStrings and WideChars are written in UTF-8.
+            let val = if self.is_ustr(val) || Self::is_wide_char(val) {
+                arg_type = PascalType::String;
+                self.ustr_to_ansi(val, span)?
+            } else {
+                val
+            };
 
             // File output path
             if let Some(fp) = file_target {
@@ -4878,6 +5003,24 @@ impl<'ctx> CodeGen<'ctx> {
                 let (address, _) = self.resolve_array_base(&args[0], span)?;
                 Ok((address, target))
             }
+            // A typed pointer value that isn't a variable, such as
+            // `PCell(@Dest)` in `PCell(@Dest)[I]`: held in a temporary,
+            // so it is indexed as a pointer variable would be.
+            _ if matches!(
+                self.resolve_type(&self.infer_declared_type(expr)),
+                PascalType::Pointer(ref p) if **p != PascalType::Untyped
+            ) =>
+            {
+                let ty = self.infer_declared_type(expr);
+                let value = self.compile_expr(expr)?;
+                let slot = self
+                    .entry_alloca(self.context.ptr_type(AddressSpace::default()), "ptr_tmp")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                self.builder
+                    .build_store(slot, value)
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                Ok((slot, ty))
+            }
             _ => Err(CodeGenError::new(
                 "array indexing requires a variable",
                 Some(span),
@@ -5142,6 +5285,11 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::IntLit(n, _) => Ok(self.context.i64_type().const_int(*n as u64, true).into()),
             Expr::RealLit(r, _) => Ok(self.context.f64_type().const_float(*r).into()),
             Expr::CharLit(c, _) => Ok(self.context.i8_type().const_int(*c as u64, false).into()),
+            Expr::WideCharLit(c, _) => Ok(self
+                .context
+                .i16_type()
+                .const_int(u64::from(*c), false)
+                .into()),
             Expr::StrLit(s, _) => Ok(self.string_literal(s).into()),
             Expr::BoolLit(b, _) => Ok(self
                 .context
@@ -5269,6 +5417,14 @@ impl<'ctx> CodeGen<'ctx> {
                 let s = self.compile_expr(array)?.into_pointer_value();
                 let idx = self.compile_expr(index)?;
                 self.string_char_at(s, idx, *span)
+            }
+            Expr::Index { array, index, span }
+                if self.is_unicode_type(&self.infer_declared_type(array)) =>
+            {
+                let s = self.compile_expr(array)?;
+                let idx = self.compile_expr(index)?;
+                let idx = self.to_i64(idx, *span)?;
+                self.ustr_char_at(s, idx, *span)
             }
             Expr::Index { array, index, span } => {
                 let (base_ptr, base_type) = self.resolve_array_base(array, *span)?;
@@ -5440,6 +5596,21 @@ impl<'ctx> CodeGen<'ctx> {
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                         return self.widen_loaded(loaded, &target, *span);
                     }
+                    // `UnicodeString(Rec)` (or any other non-short-string
+                    // type) of an untyped `var`/`const` parameter: the
+                    // memory it refers to, read as that type.
+                    if !matches!(target, PascalType::ShortString { .. })
+                        && self.is_addressable(&args[0])
+                        && self.resolve_type(&self.infer_declared_type(&args[0]))
+                            == PascalType::Untyped
+                    {
+                        let (address, _) = self.resolve_array_base(&args[0], *span)?;
+                        let loaded = self
+                            .builder
+                            .build_load(self.llvm_type_for(&target), address, "reinterpret")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                        return self.widen_loaded(loaded, &target, *span);
+                    }
                     // `ShortString(Buf)` with an untyped `Buf`: the short
                     // string stored there.
                     if let PascalType::ShortString { .. } = target
@@ -5467,6 +5638,19 @@ impl<'ctx> CodeGen<'ctx> {
                             .builder
                             .build_load(ty, address, "reinterpret")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)));
+                    }
+                    // `UnicodeString(P)` of a raw pointer (a collection item)
+                    // takes the pointer as the string: a reinterpretation,
+                    // not a conversion from a C string.
+                    if target == PascalType::UnicodeString
+                        && matches!(
+                            self.resolve_type(&self.infer_declared_type(&args[0])),
+                            PascalType::Pointer(ref p)
+                                if !matches!(**p, PascalType::Char)
+                        )
+                    {
+                        let val = self.compile_expr(&args[0])?;
+                        return self.wrap_ustr(val.into_pointer_value(), *span);
                     }
                     let val = self.compile_expr(&args[0])?;
                     return self.compile_cast_to(&target, val, *span);
@@ -5588,6 +5772,9 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_is_not_null(val.into_pointer_value(), "assigned")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
                         .into());
+                }
+                if let Some(result) = self.unicode_builtin(name, args, *span)? {
+                    return Ok(result);
                 }
                 // Built-in functions
                 if name == "length" && args.len() == 1 {
@@ -6670,6 +6857,29 @@ impl<'ctx> CodeGen<'ctx> {
                 .create_basic_type("char", 8, 0x08, DIFlags::ZERO)
                 .ok()
                 .map(|t| t.as_type()),
+            // DW_ATE_UTF, so lldb shows the character.
+            PascalType::WideChar => self
+                .di_builder
+                .create_basic_type("char16_t", 16, 0x10, DIFlags::ZERO)
+                .ok()
+                .map(|t| t.as_type()),
+            PascalType::UnicodeString => {
+                let unit = self
+                    .di_builder
+                    .create_basic_type("char16_t", 16, 0x10, DIFlags::ZERO)
+                    .ok()?;
+                Some(
+                    self.di_builder
+                        .create_pointer_type(
+                            "char16_t *",
+                            unit.as_type(),
+                            64,
+                            0,
+                            AddressSpace::default(),
+                        )
+                        .as_type(),
+                )
+            }
             PascalType::String => {
                 // char * — pointer to char, so lldb shows the string content
                 let char_ty = self
@@ -6886,6 +7096,8 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Real => self.context.f64_type().as_basic_type_enum(),
             PascalType::Boolean => self.context.bool_type().as_basic_type_enum(),
             PascalType::Char => self.context.i8_type().as_basic_type_enum(),
+            PascalType::WideChar => self.context.i16_type().as_basic_type_enum(),
+            PascalType::UnicodeString => self.ustr_type().as_basic_type_enum(),
             PascalType::String | PascalType::Pointer(_) => self
                 .context
                 .ptr_type(AddressSpace::default())
@@ -7078,6 +7290,10 @@ impl<'ctx> CodeGen<'ctx> {
         if let Some(result) = self.pointer_arithmetic(op, lhs, rhs, left, span)? {
             return Ok(result);
         }
+        let (lhs, rhs) = match self.unicode_binop(op, lhs, rhs, span)? {
+            Ok(result) => return Ok(result),
+            Err(operands) => operands,
+        };
         // `c + 'x'`, `#3 + Title`: adding characters builds a string.
         let is_char_value = |v: &BasicValueEnum| {
             v.is_int_value() && v.into_int_value().get_type().get_bit_width() == 8
@@ -7137,6 +7353,10 @@ impl<'ctx> CodeGen<'ctx> {
                 .builder
                 .build_int_unsigned_div(ord, sixty_four, "word_idx")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let word_idx = self
+                .builder
+                .build_and(word_idx, i64_ty.const_int(3, false), "word_idx")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             let bit_idx = self
                 .builder
                 .build_int_unsigned_rem(ord, sixty_four, "bit_idx")
@@ -7162,6 +7382,20 @@ impl<'ctx> CodeGen<'ctx> {
             let result = self
                 .builder
                 .build_int_compare(inkwell::IntPredicate::NE, anded, zero, "in_result")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            // A WideChar above 255 is in no set.
+            let in_range = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::ULT,
+                    ord,
+                    i64_ty.const_int(256, false),
+                    "in_range",
+                )
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            let result = self
+                .builder
+                .build_and(result, in_range, "in_set")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return Ok(result.into());
         }
@@ -7383,6 +7617,10 @@ impl<'ctx> CodeGen<'ctx> {
             } else {
                 (l, r)
             };
+            // Values narrower than 64 bits are chars, WideChars and
+            // booleans, all unsigned (#$82 is above #32).
+            let narrow = l.get_type().get_bit_width() < 64;
+            let ordering = |signed, unsigned| if narrow { unsigned } else { signed };
 
             let result = match op {
                 BinOp::Add => {
@@ -7430,19 +7668,39 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
                 BinOp::Lt => self
                     .builder
-                    .build_int_compare(inkwell::IntPredicate::SLT, l, r, "lt")
+                    .build_int_compare(
+                        ordering(inkwell::IntPredicate::SLT, inkwell::IntPredicate::ULT),
+                        l,
+                        r,
+                        "lt",
+                    )
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
                 BinOp::Gt => self
                     .builder
-                    .build_int_compare(inkwell::IntPredicate::SGT, l, r, "gt")
+                    .build_int_compare(
+                        ordering(inkwell::IntPredicate::SGT, inkwell::IntPredicate::UGT),
+                        l,
+                        r,
+                        "gt",
+                    )
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
                 BinOp::Lte => self
                     .builder
-                    .build_int_compare(inkwell::IntPredicate::SLE, l, r, "lte")
+                    .build_int_compare(
+                        ordering(inkwell::IntPredicate::SLE, inkwell::IntPredicate::ULE),
+                        l,
+                        r,
+                        "lte",
+                    )
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
                 BinOp::Gte => self
                     .builder
-                    .build_int_compare(inkwell::IntPredicate::SGE, l, r, "gte")
+                    .build_int_compare(
+                        ordering(inkwell::IntPredicate::SGE, inkwell::IntPredicate::UGE),
+                        l,
+                        r,
+                        "gte",
+                    )
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
                 BinOp::And => self
                     .builder
@@ -7864,6 +8122,25 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 Ok((gep, PascalType::Char))
             }
+            // The same for a UnicodeString: code unit i.
+            PascalType::UnicodeString => {
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let units = self
+                    .builder
+                    .build_load(ptr_ty, base_ptr, "ustr_base")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into_pointer_value();
+                let offset = self
+                    .builder
+                    .build_int_sub(idx, self.context.i64_type().const_int(1, false), "ustr_off")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                let gep = unsafe {
+                    self.builder
+                        .build_gep(self.context.i16_type(), units, &[offset], "ustr_char")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                };
+                Ok((gep, PascalType::WideChar))
+            }
             _ => Err(CodeGenError::new("indexing non-array", Some(span))),
         }
     }
@@ -8011,6 +8288,9 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Pointer(_) | PascalType::Proc { .. } => {
                 if val.is_pointer_value() {
                     Ok(val)
+                } else if self.is_ustr(val) {
+                    // `Pointer(S)`: the string's code units.
+                    Ok(self.ustr_ptr(val, span)?.into())
                 } else if val.is_int_value() {
                     let iv = self.to_i64(val, span)?;
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
@@ -8061,6 +8341,13 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::String | PascalType::ShortString { .. } if val.is_pointer_value() => {
                 Ok(val)
             }
+            PascalType::String | PascalType::ShortString { .. }
+                if self.is_ustr(val) || Self::is_wide_char(val) =>
+            {
+                self.ustr_to_ansi(val, span)
+            }
+            PascalType::WideChar => self.to_wide_char(val, span),
+            PascalType::UnicodeString => self.to_ustr(val, span),
             _ => Err(CodeGenError::new(
                 "this kind of type cast is not supported yet",
                 Some(span),
@@ -8250,6 +8537,7 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::IntLit(..) => PascalType::Integer,
             Expr::RealLit(..) => PascalType::Real,
             Expr::CharLit(..) => PascalType::Char,
+            Expr::WideCharLit(..) => PascalType::WideChar,
             Expr::StrLit(..) => PascalType::String,
             Expr::BoolLit(..) => PascalType::Boolean,
             Expr::Var(name, _) => self
@@ -8308,7 +8596,16 @@ impl<'ctx> CodeGen<'ctx> {
                         let (lr, rr) = (self.resolve_type(&lt), self.resolve_type(&rt));
                         let textual =
                             |t: &PascalType| matches!(t, PascalType::String | PascalType::Char);
-                        if matches!(lt, PascalType::Set { .. })
+                        let wide = |t: &PascalType| {
+                            matches!(t, PascalType::UnicodeString | PascalType::WideChar)
+                        };
+                        if *op == BinOp::Add
+                            && (wide(&lr) || wide(&rr))
+                            && (textual(&lr) || wide(&lr))
+                            && (textual(&rr) || wide(&rr))
+                        {
+                            PascalType::UnicodeString
+                        } else if matches!(lt, PascalType::Set { .. })
                             || matches!(rt, PascalType::Set { .. })
                         {
                             PascalType::Set {
@@ -8362,6 +8659,9 @@ impl<'ctx> CodeGen<'ctx> {
                 {
                     return target;
                 }
+                if let Some(ty) = self.unicode_builtin_type(name, args) {
+                    return ty;
+                }
                 // Built-in functions
                 match name.as_str() {
                     "assigned" => PascalType::Boolean,
@@ -8404,6 +8704,7 @@ impl<'ctx> CodeGen<'ctx> {
                         *elem
                     }
                     PascalType::String | PascalType::ShortString { .. } => PascalType::Char,
+                    PascalType::UnicodeString => PascalType::WideChar,
                     PascalType::Pointer(elem) if *elem != PascalType::Untyped => *elem,
                     _ => PascalType::Integer,
                 }
@@ -8678,6 +8979,16 @@ fn collect_captures_stmt(
             collect_captures_expr(to, locals, parent_types, out, seen);
             collect_captures(body, locals, parent_types, out, seen);
         }
+        Statement::ForIn {
+            var,
+            collection,
+            body,
+            ..
+        } => {
+            record(var, out, seen);
+            collect_captures_expr(collection, locals, parent_types, out, seen);
+            collect_captures(body, locals, parent_types, out, seen);
+        }
         Statement::RepeatUntil {
             body, condition, ..
         } => {
@@ -8892,6 +9203,23 @@ fn collect_captures_expr(
             }
         }
         _ => {}
+    }
+}
+
+/// The text of a constant string: a literal, a character, or literals
+/// joined with `+` (`#$250C#$2500 + #$2510`).
+fn literal_text(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::StrLit(text, _) => Some(text.clone()),
+        Expr::CharLit(c, _) => Some(char::from(*c).to_string()),
+        Expr::WideCharLit(c, _) => char::from_u32(u32::from(*c)).map(|c| c.to_string()),
+        Expr::BinOp {
+            op: BinOp::Add,
+            left,
+            right,
+            ..
+        } => Some(literal_text(left)? + &literal_text(right)?),
+        _ => None,
     }
 }
 

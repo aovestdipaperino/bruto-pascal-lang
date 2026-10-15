@@ -11,10 +11,13 @@ uses UnixType, BaseUnix;
 
 type
   { A key: Code is the DOS scan code in the high byte and the character
-    in the low one; Shift holds kbLeftShift/kbCtrl/kbAlt-style bits. }
+    in the low one (code page 437); Shift holds kbLeftShift/kbCtrl/kbAlt
+    style bits; Unicode is the character typed as a UTF-16 unit (0 for
+    keys that type none). }
   TConsoleKey = record
     Code: Word;
     Shift: Byte;
+    Unicode: Word;
   end;
 
   TConsoleMouse = record
@@ -289,7 +292,7 @@ begin
   InLen := InLen - N;
 end;
 
-procedure PushKey(Code: Word; Shift: Byte);
+procedure PushUnicodeKey(Code: Word; Shift: Byte; Unicode: Word);
 var
   Slot: LongInt;
 begin
@@ -298,7 +301,19 @@ begin
   Slot := (KeyHead + KeyCount) mod KeyQueueSize;
   Keys[Slot].Code := Code;
   Keys[Slot].Shift := Shift;
+  Keys[Slot].Unicode := Unicode;
   KeyCount := KeyCount + 1;
+end;
+
+{ A key whose character, if any, is its code page 437 one. }
+procedure PushKey(Code: Word; Shift: Byte);
+begin
+  if (Code and $FF) = 0 then
+    PushUnicodeKey(Code, Shift, 0)
+  else if (Code and $FF) < 128 then
+    PushUnicodeKey(Code, Shift, Code and $FF)
+  else
+    PushUnicodeKey(Code, Shift, CP437[Code and $FF]);
 end;
 
 procedure ConsolePutMouse(const M: TConsoleMouse);
@@ -593,13 +608,19 @@ begin
   else U := B and $07;
   for I := 1 to Len - 1 do
     U := (U shl 6) or (InBuf[I] and $3F);
+  { The legacy character: the code page 437 one, or '?'. }
+  B := Ord('?');
   for I := 128 to 255 do
     if CP437[I] = U then
-    begin
-      PushKey(I, 0);
-      Exit;
-    end;
-  PushKey(Ord('?'), 0);
+      B := I;
+  if U > $FFFF then
+  begin
+    { Outside the BMP: two keys, one per UTF-16 surrogate. }
+    PushUnicodeKey(B, 0, $D800 + ((U - $10000) shr 10));
+    PushUnicodeKey(B, 0, $DC00 + ((U - $10000) and $3FF));
+  end
+  else
+    PushUnicodeKey(B, 0, U);
 end;
 
 procedure ConsoleAddSequence(const Seq: string; Proc: TConsoleProc);

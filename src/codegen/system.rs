@@ -194,7 +194,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_call(unlink, &[path.into()], "unlink")
                         .map_err(err)?
                 } else {
-                    let new_name = self.compile_expr(&args[1])?;
+                    let new_name = self.ansi_arg(&args[1], span)?;
                     let rename =
                         self.libc("rename", i32_ty.fn_type(&[ptr.into(), ptr.into()], false));
                     let status = self
@@ -263,7 +263,7 @@ impl<'ctx> CodeGen<'ctx> {
             }
             // ChDir / MkDir / RmDir(Path), reporting failure in InOutRes.
             ("chdir" | "mkdir" | "rmdir", 1) => {
-                let path = self.compile_expr(&args[0])?;
+                let path = self.ansi_arg(&args[0], span)?;
                 let status = match name {
                     "mkdir" => {
                         let mkdir =
@@ -364,6 +364,17 @@ impl<'ctx> CodeGen<'ctx> {
                             .map_err(err)?
                             .try_as_basic_value()
                             .basic()
+                            .unwrap();
+                        self.builder.build_store(slot, new).map_err(err)?;
+                    }
+                    PascalType::UnicodeString => {
+                        let old = self.builder.build_load(ptr, slot, "old").map_err(err)?;
+                        let new = self
+                            .call_ustr_runtime(
+                                "bruto_ustr_setlength",
+                                &[old.into(), n.into()],
+                                span,
+                            )?
                             .unwrap();
                         self.builder.build_store(slot, new).map_err(err)?;
                     }
@@ -592,31 +603,6 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?
                     .into()
             }
-            // UnicodeToUtf8(Dest, MaxBytes, Source, Chars): Bruto's wide
-            // strings are 8-bit (Latin-1), encoded here as UTF-8.
-            ("unicodetoutf8", 4) => {
-                let dest = self.compile_expr(&args[0])?;
-                let max = self.int_arg(&args[1], span)?;
-                let src = self.compile_expr(&args[2])?;
-                let chars = self.int_arg(&args[3], span)?;
-                if !dest.is_pointer_value() || !src.is_pointer_value() {
-                    return Err(CodeGenError::new(
-                        "UnicodeToUtf8 takes two pointers and two counts",
-                        Some(span),
-                    ));
-                }
-                let f = self.latin1_to_utf8_fn();
-                self.builder
-                    .build_call(
-                        f,
-                        &[dest.into(), max.into(), src.into(), chars.into()],
-                        "utf8_len",
-                    )
-                    .map_err(err)?
-                    .try_as_basic_value()
-                    .basic()
-                    .unwrap()
-            }
             // SysUtils.Format(Fmt, [Args]): SysUtils' BrutoCFormat makes the
             // format C's, then snprintf fills it in.
             ("format", 2) if self.module.get_function("brutocformat").is_some() => {
@@ -640,6 +626,7 @@ impl<'ctx> CodeGen<'ctx> {
                         ));
                     };
                     let v = self.compile_expr(e)?;
+                    let v = self.ustr_to_ansi(v, span)?;
                     let v = self.as_string_value(v, span)?;
                     let v: BasicValueEnum = if v.is_int_value() {
                         self.to_i64(v, span)?.into()
@@ -872,7 +859,7 @@ impl<'ctx> CodeGen<'ctx> {
             return None;
         }
         Some(match (name, arg_count) {
-            ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) | ("unicodetoutf8", 4) => {
+            ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) => {
                 PascalType::Integer
             }
             ("paramstr", 1) | ("hexstr", 2) | ("format", 2) => PascalType::String,

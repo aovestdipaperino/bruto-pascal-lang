@@ -406,7 +406,7 @@ impl Drop for PascalBuildJob {
 /// in dependency order. Detects cycles and missing files.
 pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Result<(), String> {
     if program.uses.is_empty() {
-        return Ok(());
+        return rtl::add_unicode_strings(program);
     }
 
     let mut loaded: Vec<ast::Unit> = Vec::new();
@@ -470,7 +470,8 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
     program.procedures.splice(0..0, procs);
     program.body.statements.splice(0..0, init_stmts);
 
-    rtl::add_system_prelude(program)
+    rtl::add_system_prelude(program)?;
+    rtl::add_unicode_strings(program)
 }
 
 fn load_unit_recursive(
@@ -631,7 +632,7 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
             insert_line(lines, *span);
             collect_block_lines(body, lines);
         }
-        ast::Statement::For { body, span, .. } => {
+        ast::Statement::For { body, span, .. } | ast::Statement::ForIn { body, span, .. } => {
             insert_line(lines, *span);
             collect_block_lines(body, lines);
         }
@@ -3162,6 +3163,210 @@ end.
             out,
             "$00FF|-7|ab|    r\n42 AB MIX [t]\nchild\nbase 3\ntrue [he] [i]\nabc/ 4\n"
         );
+    }
+
+    #[test]
+    fn unicode_strings_and_wide_chars() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TCell = record
+    EGC: UnicodeString;
+    Attr: Byte;
+  end;
+const
+  Frame: array[0..2] of WideChar = #$250C#$2500 + #$2510;
+var
+  U, V: UnicodeString;
+  C: WideChar;
+  A: AnsiString;
+  Cells: array[0..1] of TCell;
+  I: Integer;
+
+procedure Append(var S: UnicodeString; W: WideChar);
+begin
+  S := S + W;
+end;
+
+begin
+  U := 'h\u{e9}llo \u{6253}';
+  A := U;
+  writeln(Length(U), ' ', Length(A), ' ', A);
+  C := #$2502;
+  Append(U, C);
+  writeln(U, ' ', Ord(U[2]), ' ', Ord(C));
+  V := Copy(U, 2, 3);
+  Delete(U, 1, 1);
+  Insert('<', U, 1);
+  writeln(V, ' ', U, ' ', Pos('l', U), ' ', U > V, ' ', V = '\u{e9}ll');
+  U[1] := '>';
+  SetLength(U, 3);
+  writeln(U, Length(U), ' ', UpCase(UnicodeString('\u{e9}a')), ' ', Frame[0], Frame[2]);
+  for I := 0 to 1 do
+    Cells[I].EGC := WideChar(Ord('a') + I);
+  writeln(Cells[0].EGC, Cells[1].EGC, ' ', Cells[1].Attr);
+  case C of
+    'a': writeln('a');
+    #$2500..#$25FF: writeln('box');
+  end;
+  writeln(C in ['a'..'z'], ' ', WideChar('x') = 'x');
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "7 10 h\u{e9}llo \u{6253}\n\
+             h\u{e9}llo \u{6253}\u{2502} 233 9474\n\
+             \u{e9}ll <\u{e9}llo \u{6253}\u{2502} 3 false true\n\
+             >\u{e9}l3 \u{c9}A \u{250c}\u{2510}\n\
+             ab 0\n\
+             box\n\
+             false true\n"
+        );
+    }
+
+    #[test]
+    fn for_in_loops() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TWords = object
+    S: String;
+    P: Integer;
+    Current: String;
+    constructor Create(const AText: String);
+    function MoveNext: Boolean;
+  end;
+
+constructor TWords.Create(const AText: String);
+begin
+  S := AText;
+  P := 1;
+end;
+
+function TWords.MoveNext: Boolean;
+var Start: Integer;
+begin
+  while (P <= Length(S)) and (S[P] = ' ') do Inc(P);
+  Start := P;
+  while (P <= Length(S)) and (S[P] <> ' ') do Inc(P);
+  Current := Copy(S, Start, P - Start);
+  MoveNext := P > Start;
+end;
+
+var
+  C: Char;
+  I: Integer;
+  A: array[3..5] of Integer;
+  W: String;
+begin
+  for C in 'abc' do write(C, '.');
+  writeln;
+  A[3] := 10; A[4] := 20; A[5] := 30;
+  for I in A do write(I, ' ');
+  writeln;
+  for W in TWords.Create('  the quick  brown fox ') do
+  begin
+    if W = 'brown' then continue;
+    write('[', W, ']');
+  end;
+  writeln;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "a.b.c.\n10 20 30 \n[the][quick][fox]\n");
+    }
+
+    #[test]
+    fn grapheme_clusters_and_display_widths() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses Video, GraphemeBreakProperty;
+var
+  EGC: UnicodeString;
+  N: Integer;
+begin
+  N := 0;
+  for EGC in TUnicodeStringExtendedGraphemeClustersEnumerator.Create('a\u{44a}\u{301}\u{6253}\u{1f4a9}') do
+  begin
+    write(Length(EGC), ':', ExtendedGraphemeClusterDisplayWidth(EGC), ' ');
+    Inc(N);
+  end;
+  writeln(N, ' ', StringDisplayWidth('ab\u{6253}'));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "1:1 2:1 1:2 2:2 4 4\n");
+    }
+
+    #[test]
+    fn val_reports_where_the_number_ends() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type TRec = record W: Word; end;
+var
+  I: LongInt;
+  R: Real;
+  Code: SmallInt;
+  Rec: TRec;
+begin
+  Val('42', I, Code); writeln(I, ' ', Code);
+  Val('$1F', I, Code); writeln(I, ' ', Code);
+  Val('12x', I, Code); writeln(Code);
+  Val('', I, Code); writeln(Code);
+  Val('2.5', R, Code); writeln(R:3:1, ' ', Code);
+  Val('7', Rec.W, Code); writeln(Rec.W);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "42 0\n31 0\n3\n1\n2.5 0\n7\n");
+    }
+
+    #[test]
+    fn casts_reinterpret_untyped_parameters() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+var
+  U, Back: UnicodeString;
+  P: Pointer;
+
+procedure SetIt(var Rec);
+begin
+  writeln(UnicodeString(Rec));
+  UnicodeString(Rec) := 'set';
+end;
+
+begin
+  U := 'given';
+  SetIt(U);
+  writeln(U);
+  P := Pointer(U);
+  Back := UnicodeString(P);
+  writeln(Back);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "given\nset\nset\n");
+    }
+
+    #[test]
+    fn chars_compare_unsigned() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+var a, b: Char;
+begin
+  a := #$82; b := #32;
+  writeln(a < b, ' ', a > b, ' ', #200 >= #100);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "false true true\n");
     }
 
     #[test]

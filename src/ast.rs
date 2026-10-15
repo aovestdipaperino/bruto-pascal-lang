@@ -207,6 +207,15 @@ pub enum PascalType {
     String,
     Boolean,
     Char,
+    /// FPC's `WideChar`: one UTF-16 code unit. An `i16` in memory and
+    /// in expressions (so it can be told apart from a `Char`, an `i8`,
+    /// and from integers, which are widened to 64 bits).
+    WideChar,
+    /// FPC's `UnicodeString`: UTF-16 code units, NUL-terminated, behind
+    /// one pointer (nil is the empty string). In expressions it is the
+    /// struct `{ ptr }`, so conversions to and from `String` (UTF-8) can
+    /// be chosen from the value alone.
+    UnicodeString,
     Pointer(Box<PascalType>),
     Array {
         lo: i64,
@@ -353,6 +362,7 @@ impl ConstExpr {
         Some(match expr {
             Expr::IntLit(n, _) => ConstExpr::Int(*n),
             Expr::CharLit(c, _) => ConstExpr::Char(*c),
+            Expr::WideCharLit(c, _) => ConstExpr::Int(i64::from(*c)),
             Expr::StrLit(s, _) if s.len() == 1 => ConstExpr::Char(s.as_bytes()[0]),
             Expr::Var(name, _) => ConstExpr::Name(name.clone()),
             Expr::UnaryOp {
@@ -479,6 +489,15 @@ pub enum Statement {
         from: Expr,
         to: Expr,
         downto: bool,
+        body: Block,
+        span: Span,
+    },
+    /// `for var in collection do body`: the characters of a string, the
+    /// elements of an array, or what an enumerator object (`T.Create(...)`
+    /// with `MoveNext` and `Current`) yields.
+    ForIn {
+        var: String,
+        collection: Expr,
         body: Block,
         span: Span,
     },
@@ -648,6 +667,7 @@ impl Statement {
             | Self::If { span, .. }
             | Self::While { span, .. }
             | Self::For { span, .. }
+            | Self::ForIn { span, .. }
             | Self::RepeatUntil { span, .. }
             | Self::WriteLn { span, .. }
             | Self::Write { span, .. }
@@ -696,6 +716,8 @@ pub enum Expr {
     IntLit(i64, Span),
     RealLit(f64, Span),
     CharLit(u8, Span),
+    /// A character code above 255, `#$2502`: a `WideChar`.
+    WideCharLit(u16, Span),
     StrLit(String, Span),
     BoolLit(bool, Span),
     Var(String, Span),
@@ -782,6 +804,7 @@ impl Expr {
             Self::IntLit(_, s)
             | Self::RealLit(_, s)
             | Self::CharLit(_, s)
+            | Self::WideCharLit(_, s)
             | Self::StrLit(_, s)
             | Self::BoolLit(_, s)
             | Self::Var(_, s) => *s,

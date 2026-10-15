@@ -226,6 +226,8 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
         | PascalType::String
         | PascalType::Boolean
         | PascalType::Char
+        | PascalType::WideChar
+        | PascalType::UnicodeString
         | PascalType::Subrange { .. }
         | PascalType::SubrangeExpr { .. } => {}
     }

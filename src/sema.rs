@@ -480,11 +480,11 @@ fn basic_type(name: &str) -> Option<PascalType> {
 fn builtin_size(name: &str) -> Option<i64> {
     Some(match name {
         "byte" | "shortint" | "int8" | "uint8" | "char" | "ansichar" | "boolean" => 1,
-        "word" | "smallint" | "int16" | "uint16" => 2,
+        "word" | "smallint" | "int16" | "uint16" | "widechar" | "unicodechar" => 2,
         "longint" | "longword" | "cardinal" | "dword" | "int32" | "uint32" => 4,
         "integer" | "int64" | "qword" | "uint64" | "ptrint" | "ptruint" | "sizeint"
         | "sizeuint" | "nativeint" | "nativeuint" | "real" | "double" | "pointer"
-        | "codepointer" | "string" => 8,
+        | "codepointer" | "string" | "unicodestring" | "widestring" | "ansistring" => 8,
         _ => return None,
     })
 }
@@ -503,11 +503,12 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
     }
     Some(match name {
         "ansichar" => PascalType::Char,
-        "widechar" | "unicodechar" => sized(16, false),
+        "widechar" | "unicodechar" => PascalType::WideChar,
         // `OpenString` (a `var` parameter taking any short string) is
         // treated as the longest one.
         "shortstring" | "openstring" => PascalType::ShortString { max: 255 },
-        "ansistring" | "rawbytestring" | "unicodestring" | "widestring" => PascalType::String,
+        "ansistring" | "rawbytestring" | "utf8string" => PascalType::String,
+        "unicodestring" | "widestring" => PascalType::UnicodeString,
         "single" | "double" | "extended" | "currency" | "comp" => PascalType::Real,
         // A file variable is one pointer to the runtime's file record;
         // seen as FPC's `FileRec` / `TextRec`, that pointer is the handle.
@@ -763,6 +764,8 @@ impl ConstEnv {
             | PascalType::String
             | PascalType::Boolean
             | PascalType::Char
+        | PascalType::WideChar
+        | PascalType::UnicodeString
             | PascalType::Enum { .. }
             | PascalType::Subrange { .. }
             | PascalType::SizedInt { .. }

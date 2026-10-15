@@ -1,11 +1,15 @@
 { Bruto Pascal runtime: FPC's Video unit on an ANSI terminal. The screen
   is a buffer of cells (character in the low byte, attribute in the high
-  one, code page 437); UpdateScreen sends the cells that changed. }
+  one, code page 437); UpdateScreen sends the cells that changed.
+
+  After InitEnhancedVideo (Free Vision's Unicode build) the screen is
+  EnhancedVideoBuf instead: each cell holds an extended grapheme cluster
+  and an attribute, and a wide cluster covers the cell to its right too. }
 unit Video;
 
 interface
 
-uses BrutoConsole;
+uses BrutoConsole, GraphemeBreakProperty;
 
 type
   PVideoMode = ^TVideoMode;
@@ -18,6 +22,17 @@ type
   TVideoBuf = array[0..32759] of TVideoCell;
   PVideoBuf = ^TVideoBuf;
   TSystemCodePage = Word;
+
+  { FPC's cell also has 24-bit colors and attributes such as italics,
+    behind properties; Free Vision uses only these two. }
+  TEnhancedVideoCell = record
+    ExtendedGraphemeCluster: UnicodeString;
+    Attribute: Byte;
+  end;
+  PEnhancedVideoCell = ^TEnhancedVideoCell;
+  TEnhancedVideoCells = array[0..32759] of TEnhancedVideoCell;
+  { A dynamic array in FPC; Free Vision only takes its address. }
+  TEnhancedVideoBuf = ^TEnhancedVideoCells;
 
 const
   Black = 0;
@@ -70,6 +85,7 @@ var
   CursorLines: Byte;
   ErrorCode: LongInt;
   ErrorInfo: Pointer;
+  EnhancedVideoBuf, OldEnhancedVideoBuf: TEnhancedVideoBuf;
 
 procedure InitVideo;
 procedure DoneVideo;
@@ -95,6 +111,11 @@ function GetLegacyCodePage: TSystemCodePage;
 procedure ActivateCodePage(CodePage: TSystemCodePage);
 function GetSupportedCodePageCount: Integer;
 function GetSupportedCodePage(Index: Integer): TSystemCodePage;
+{ How many cells a cluster takes on the screen: 2 for wide characters
+  and emoji, else 1. }
+function ExtendedGraphemeClusterDisplayWidth(const EGC: UnicodeString): Integer;
+{ How many cells S takes on the screen. }
+function StringDisplayWidth(const S: UnicodeString): Integer;
 
 implementation
 
@@ -104,6 +125,8 @@ const
 
 var
   Initialized: Boolean;
+  Enhanced: Boolean;
+  EnhancedCells: LongInt;
   LockCount: Integer;
   CursorType: Word;
   LastAttr: LongInt;
@@ -193,13 +216,65 @@ begin
   Initialized := False;
 end;
 
+function ExtendedGraphemeClusterDisplayWidth(const EGC: UnicodeString): Integer;
+var
+  Units: Int64;
+begin
+  if Length(EGC) = 0 then
+    ExtendedGraphemeClusterDisplayWidth := 1
+  else if IsWideCodePoint(CodePointAt(EGC, 1, Units)) or (Pos(WideChar($FE0F), EGC) > 0) then
+    ExtendedGraphemeClusterDisplayWidth := 2
+  else
+    ExtendedGraphemeClusterDisplayWidth := 1;
+end;
+
+function StringDisplayWidth(const S: UnicodeString): Integer;
+var
+  EGC: UnicodeString;
+  W: Integer;
+begin
+  W := 0;
+  for EGC in TUnicodeStringExtendedGraphemeClustersEnumerator.Create(S) do
+    W := W + ExtendedGraphemeClusterDisplayWidth(EGC);
+  StringDisplayWidth := W;
+end;
+
+procedure FillEnhanced(Buf: TEnhancedVideoBuf);
+var
+  I: LongInt;
+begin
+  for I := 0 to EnhancedCells - 1 do
+  begin
+    Buf^[I].ExtendedGraphemeCluster := ' ';
+    Buf^[I].Attribute := $07;
+  end;
+end;
+
 procedure InitEnhancedVideo;
 begin
   InitVideo;
+  if Enhanced then
+    Exit;
+  EnhancedCells := LongInt(ScreenWidth) * ScreenHeight;
+  GetMem(EnhancedVideoBuf, EnhancedCells * SizeOf(TEnhancedVideoCell));
+  GetMem(OldEnhancedVideoBuf, EnhancedCells * SizeOf(TEnhancedVideoCell));
+  FillChar(EnhancedVideoBuf^, EnhancedCells * SizeOf(TEnhancedVideoCell), 0);
+  FillChar(OldEnhancedVideoBuf^, EnhancedCells * SizeOf(TEnhancedVideoCell), 0);
+  FillEnhanced(EnhancedVideoBuf);
+  FillEnhanced(OldEnhancedVideoBuf);
+  Enhanced := True;
 end;
 
 procedure DoneEnhancedVideo;
 begin
+  if Enhanced then
+  begin
+    FreeMem(EnhancedVideoBuf, EnhancedCells * SizeOf(TEnhancedVideoCell));
+    FreeMem(OldEnhancedVideoBuf, EnhancedCells * SizeOf(TEnhancedVideoCell));
+    EnhancedVideoBuf := nil;
+    OldEnhancedVideoBuf := nil;
+    Enhanced := False;
+  end;
   DoneVideo;
 end;
 
@@ -216,6 +291,8 @@ begin
     Exit;
   for I := 0 to LongInt(ScreenWidth) * ScreenHeight - 1 do
     VideoBuf^[I] := $0720;
+  if Enhanced then
+    FillEnhanced(EnhancedVideoBuf);
   UpdateScreen(True);
 end;
 
@@ -248,13 +325,87 @@ begin
     end;
 end;
 
+{ Write one cluster: control characters as their code page 437
+  pictures, as the legacy cells show them. }
+procedure OutCluster(const EGC: UnicodeString);
+var
+  S: AnsiString;
+begin
+  if Length(EGC) = 0 then
+    ConsoleOutChar(' ')
+  else if (Length(EGC) = 1) and (Ord(EGC[1]) < 32) then
+    ConsoleOutCP437(Ord(EGC[1]))
+  else
+  begin
+    S := EGC;
+    ConsoleOutStr(S);
+  end;
+end;
+
+procedure SendEnhancedCells(X1, Y1, X2, Y2: LongInt; Force: Boolean);
+var
+  X, Y, I, W, OldW, NextX, NextY: LongInt;
+  Redraw: Boolean;
+begin
+  NextX := -1;
+  NextY := -1;
+  for Y := Y1 to Y2 do
+  begin
+    { A wide cluster that changed (or went) leaves its right half to
+      redraw. }
+    Redraw := False;
+    X := X1;
+    { Start at the cluster covering X1. }
+    if (X > 0) and (ExtendedGraphemeClusterDisplayWidth(
+      EnhancedVideoBuf^[Y * ScreenWidth + X - 1].ExtendedGraphemeCluster) = 2) then
+      X := X - 1;
+    while X <= X2 do
+    begin
+      I := Y * ScreenWidth + X;
+      W := ExtendedGraphemeClusterDisplayWidth(EnhancedVideoBuf^[I].ExtendedGraphemeCluster);
+      if X + W > ScreenWidth then
+        W := 1;
+      if Force or Redraw
+        or (EnhancedVideoBuf^[I].Attribute <> OldEnhancedVideoBuf^[I].Attribute)
+        or (EnhancedVideoBuf^[I].ExtendedGraphemeCluster <> OldEnhancedVideoBuf^[I].ExtendedGraphemeCluster) then
+      begin
+        OldW := ExtendedGraphemeClusterDisplayWidth(OldEnhancedVideoBuf^[I].ExtendedGraphemeCluster);
+        if (X <> NextX) or (Y <> NextY) then
+          OutGoto(X, Y);
+        if EnhancedVideoBuf^[I].Attribute <> LastAttr then
+        begin
+          OutAttr(EnhancedVideoBuf^[I].Attribute);
+          LastAttr := EnhancedVideoBuf^[I].Attribute;
+        end;
+        OutCluster(EnhancedVideoBuf^[I].ExtendedGraphemeCluster);
+        OldEnhancedVideoBuf^[I] := EnhancedVideoBuf^[I];
+        NextX := X + W;
+        NextY := Y;
+        Redraw := (OldW = 2) and (W = 1);
+      end
+      else
+        Redraw := False;
+      { The cell a wide cluster covers is not drawn by itself. }
+      if W = 2 then
+      begin
+        OldEnhancedVideoBuf^[I + 1] := EnhancedVideoBuf^[I + 1];
+        Redraw := False;
+      end;
+      X := X + W;
+    end;
+  end;
+end;
+
 procedure UpdateScreen(Force: Boolean);
 begin
   if (not Initialized) or (LockCount > 0) then
     Exit;
   if Force then
     LastAttr := -1;
-  SendCells(0, 0, ScreenWidth - 1, ScreenHeight - 1, Force);
+  if Enhanced then
+    SendEnhancedCells(0, 0, ScreenWidth - 1, ScreenHeight - 1, Force)
+  else
+    SendCells(0, 0, ScreenWidth - 1, ScreenHeight - 1, Force);
   OutCursor;
   ConsoleFlush;
 end;
@@ -265,7 +416,10 @@ begin
     Exit;
   if (X2 >= ScreenWidth) or (Y2 >= ScreenHeight) or (X1 > X2) or (Y1 > Y2) then
     Exit;
-  SendCells(X1, Y1, X2, Y2, Force);
+  if Enhanced then
+    SendEnhancedCells(X1, Y1, X2, Y2, Force)
+  else
+    SendCells(X1, Y1, X2, Y2, Force);
   OutCursor;
   ConsoleFlush;
 end;

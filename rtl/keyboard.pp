@@ -149,7 +149,7 @@ begin
   E.VirtualKeyCode := K.Code;
   E.VirtualScanCode := K.Code;
   E.AsciiChar := Chr(K.Code and $FF);
-  E.UnicodeChar := WideChar(K.Code and $FF);
+  E.UnicodeChar := WideChar(K.Unicode);
   E.ShiftState := [];
   if (K.Shift and ConsoleShift) <> 0 then
     E.ShiftState := E.ShiftState + [essShift, essLeftShift];
