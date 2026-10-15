@@ -118,6 +118,8 @@ function UnicodeToUtf8(Dest: PChar; MaxDestBytes: SizeUInt; Source: PUnicodeChar
 function UTF8ToString(const S: RawByteString): UnicodeString;
 function UTF8Decode(const S: RawByteString): UnicodeString;
 function UTF8Encode(const S: UnicodeString): RawByteString;
+{ N copies of C. }
+function StringOfChar(C: Char; N: Int64): AnsiString;
 
 implementation
 
@@ -1223,6 +1225,19 @@ end;
 function UTF8Encode(const S: UnicodeString): RawByteString;
 begin
   UTF8Encode := S;
+end;
+
+function StringOfChar(C: Char; N: Int64): AnsiString;
+var
+  S: AnsiString;
+begin
+  S := '';
+  if N > 0 then
+  begin
+    SetLength(S, N);
+    FillChar(S[1], N, C);
+  end;
+  StringOfChar := S;
 end;
 
 end.

@@ -111,7 +111,23 @@ pub struct ParamGroup {
     pub mode: ParamMode,
     pub names: Vec<String>,
     pub ty: PascalType,
+    /// `X: T = Value`: the value a call that leaves the parameter out
+    /// passes.
+    pub default: Option<DefaultValue>,
 }
+
+/// A parameter's default value. Two declarations are the same whatever
+/// their defaults (an implementation may repeat or leave them out).
+#[derive(Debug, Clone)]
+pub struct DefaultValue(pub Expr);
+
+impl PartialEq for DefaultValue {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DefaultValue {}
 
 /// Procedure or function declaration
 #[derive(Debug, Clone)]
@@ -241,6 +257,9 @@ pub enum PascalType {
     /// `class of T`: a class reference, the address of T's (or a
     /// descendant's) VMT.
     ClassOf(String),
+    /// A `var` / `out` (or untyped `const`) parameter of a procedural
+    /// type: passed by reference.
+    VarParam(Box<PascalType>),
     /// Enumerated type: (val1, val2, val3)
     Enum {
         /// The type name (e.g., "Color") — set during type section parsing

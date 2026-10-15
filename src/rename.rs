@@ -120,6 +120,9 @@ pub(crate) fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
             *name = n.rename(name);
         }
         rewrite_type(&mut group.ty, n);
+        if let Some(d) = &mut group.default {
+            rewrite_expr(&mut d.0, n);
+        }
     }
     if let Some(rt) = &mut p.return_type {
         rewrite_type(rt, n);
@@ -157,6 +160,9 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
                         *name = n.rename(name);
                     }
                     rewrite_type(&mut group.ty, n);
+                    if let Some(d) = &mut group.default {
+                        rewrite_expr(&mut d.0, n);
+                    }
                 }
                 if let Some(rt) = &mut m.return_type {
                     rewrite_type(rt, n);
@@ -169,6 +175,9 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
                         *name = n.rename(name);
                     }
                     rewrite_type(&mut group.ty, n);
+                    if let Some(d) = &mut group.default {
+                        rewrite_expr(&mut d.0, n);
+                    }
                 }
                 rewrite_type(&mut p.ty, n);
                 for accessor in [&mut p.read, &mut p.write].into_iter().flatten() {
@@ -181,6 +190,7 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
             }
         }
         PascalType::ClassOf(name) => *name = n.rename(name),
+        PascalType::VarParam(inner) => rewrite_type(inner, n),
         PascalType::Enum { name, values } => {
             *name = n.rename(name);
             for v in values {

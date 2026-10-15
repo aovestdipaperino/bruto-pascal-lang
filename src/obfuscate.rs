@@ -177,6 +177,7 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
             }
         }
         PascalType::ClassOf(_) => {}
+        PascalType::VarParam(inner) => collect_type(inner, n),
         PascalType::Enum { name, values } => {
             n.declare(name);
             for v in values {

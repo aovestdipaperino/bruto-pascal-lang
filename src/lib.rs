@@ -448,8 +448,9 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
     let mut vars = Vec::new();
     let mut procs = Vec::new();
     let mut init_stmts = Vec::new();
-    for unit in loaded {
+    for mut unit in loaded {
         program.uses_exceptions |= unit.uses_exceptions;
+        copy_interface_defaults(&mut unit);
         consts.extend(unit.interface_consts);
         consts.extend(unit.impl_consts);
         types.extend(unit.interface_types);
@@ -473,6 +474,30 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
 
     rtl::add_system_prelude(program)?;
     rtl::add_string_runtime(program)
+}
+
+/// Parameter defaults are often written only in a unit's interface:
+/// give the implementations the defaults their headers declare.
+fn copy_interface_defaults(unit: &mut ast::Unit) {
+    for header in &unit.interface_proc_headers {
+        if !header.params.iter().any(|g| g.default.is_some()) {
+            continue;
+        }
+        for proc in unit
+            .procedures
+            .iter_mut()
+            .filter(|p| p.owner.is_none() && p.name.eq_ignore_ascii_case(&header.name))
+        {
+            if proc.params.len() != header.params.len() {
+                continue;
+            }
+            for (group, declared) in proc.params.iter_mut().zip(&header.params) {
+                if group.default.is_none() {
+                    group.default = declared.default.clone();
+                }
+            }
+        }
+    }
 }
 
 fn load_unit_recursive(
@@ -4216,6 +4241,168 @@ end.
             out,
             "6 kiwi 2 -1 changes 6\npear,kiwi,Apple,banana,_under,cherry\n_under,Apple,banana,cherry,kiwi,pear\nkiwi,pear,Apple,_under,banana,cherry\n[pear;_under;banana;Apple;cherry;]\n6\n<one><two three><four><say \"hi\"><><last>\none,\"two three\",four,\"say \"\"hi\"\"\",,last\n4 a b;c;;d\nTRUE port 80 other.org 1\n2\n4 line4\nA,c,m,x 3\nEStringListError: String list does not allow duplicates\nEStringListError: List index (10) out of bounds\n4 TRUE TRUE\n1 2 3 4 5 6 7 8 9 10 \n8 2 10 6\nList index (50) out of bounds\nhello 12345 13 13\n37\n4 line4\nabcdef bcd 6\nUnable to open file \"/nonexistent/x.txt\": No such file or directory\n"
         );
+    }
+
+    #[test]
+    fn overloaded_methods_and_default_parameters() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes;
+type
+  TClient = class
+  private
+    FHost: string;
+    FPort: Word;
+  public
+    constructor Create(const AHost: string); overload;
+    constructor Create(const AHost: string; APort: Word); overload;
+    function Get(const URL: string): string; overload;
+    procedure Get(const URL: string; Stream: TStream); overload;
+    function Describe: string; virtual;
+    function Sum(A, B: Integer): Integer; overload;
+    function Sum(A, B: Double): Double; overload;
+    function Sum(const A, B: string): string; overload;
+  end;
+  TSecureClient = class(TClient)
+  public
+    function Describe: string; override;
+    function Get(const URL: string; Retries: Integer): string; overload;
+  end;
+
+constructor TClient.Create(const AHost: string);
+begin
+  Create(AHost, 80);
+end;
+
+constructor TClient.Create(const AHost: string; APort: Word);
+begin
+  inherited Create;
+  FHost := AHost;
+  FPort := APort;
+end;
+
+function TClient.Get(const URL: string): string;
+begin
+  Result := 'GET ' + Describe + URL;
+end;
+
+procedure TClient.Get(const URL: string; Stream: TStream);
+var S: string;
+begin
+  S := Get(URL);
+  Stream.WriteBuffer(S[1], Length(S));
+end;
+
+function TClient.Describe: string;
+begin
+  Result := FHost + ':' + IntToStr(FPort);
+end;
+
+function TClient.Sum(A, B: Integer): Integer; begin Result := A + B; end;
+function TClient.Sum(A, B: Double): Double; begin Result := A + B + 0.5; end;
+function TClient.Sum(const A, B: string): string; begin Result := A + '+' + B; end;
+
+function TSecureClient.Describe: string;
+begin
+  Result := 'tls://' + inherited Describe;
+end;
+
+function TSecureClient.Get(const URL: string; Retries: Integer): string;
+begin
+  Result := Get(URL) + ' x' + IntToStr(Retries);
+end;
+
+var
+  C: TClient;
+  S: TSecureClient;
+  M: TStringStream;
+begin
+  C := TClient.Create('example.com');
+  WriteLn(C.Get('/a'));
+  M := TStringStream.Create('');
+  C.Get('/b', M);
+  WriteLn(M.DataString);
+  WriteLn(C.Sum(1, 2), ' ', C.Sum(1.5, 2.0):0:1, ' ', C.Sum('x', 'y'));
+  S := TSecureClient.Create('secure.org', 443);
+  WriteLn(S.Get('/c'), ' | ', S.Get('/d', 3));
+  M.Free; C.Free; S.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "GET example.com:80/a\nGET example.com:80/b\n3 4.0 x+y\nGET tls://secure.org:443/c | GET tls://secure.org:443/d x3\n"
+        );
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  TA = class
+    constructor Create(const H: string; P: Word; X: TObject = nil);
+    function Join(const A: string; const Sep: string = ', '; Times: Integer = 1): string;
+  end;
+constructor TA.Create(const H: string; P: Word; X: TObject);
+begin
+  writeln(H, P, ' ', X = nil);
+end;
+function TA.Join(const A: string; const Sep: string; Times: Integer): string;
+var I: Integer;
+begin
+  Result := A;
+  for I := 2 to Times do Result := Result + Sep + A;
+end;
+procedure F(A: Integer; B: Integer = 7); begin writeln(A + B); end;
+var A: TA;
+begin
+  F(1);
+  F(1, 2);
+  A := TA.Create('h', 80);
+  writeln(A.Join('x'), '|', A.Join('y', '-'), '|', A.Join('z', '+', 3));
+  TA.Create('i', 81, A).Free;
+  A.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "8\n3\nh80 TRUE\nx|y|z+z+z\ni81 FALSE\n");
+    }
+
+    #[test]
+    fn var_parameters_of_procedural_types() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+type
+  TVerifyEvent = procedure(Sender: TObject; var Allow: Boolean) of object;
+  TFiller = procedure(out S: string; N: Integer);
+  TForm = class
+    procedure Check(Sender: TObject; var Allow: Boolean);
+  end;
+procedure TForm.Check(Sender: TObject; var Allow: Boolean);
+begin
+  Allow := False;
+end;
+procedure Fill(out S: string; N: Integer);
+begin
+  S := StringOfChar('*', N);
+end;
+var F: TForm; E: TVerifyEvent; Ok: Boolean; P: TFiller; T: string;
+begin
+  F := TForm.Create;
+  E := @F.Check;
+  Ok := True;
+  E(nil, Ok);
+  WriteLn(Ok);
+  P := @Fill;
+  P(T, 3);
+  WriteLn(T);
+  F.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "FALSE\n***\n");
     }
 
     #[test]

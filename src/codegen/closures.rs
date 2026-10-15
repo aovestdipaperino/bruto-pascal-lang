@@ -76,6 +76,12 @@ impl<'ctx> CodeGen<'ctx> {
             method_code = Some(code);
         }
         for (param, arg) in params.iter().zip(args) {
+            // A `var` parameter: the argument's address.
+            if let PascalType::VarParam(_) = param {
+                param_types.push(ptr.into());
+                call_args.push(self.address_of_arg(arg, span)?.into());
+                continue;
+            }
             let param = self.resolve_type(param);
             param_types.push(self.abi_type_for(&param).into());
             let val = self.compile_expr(arg)?;

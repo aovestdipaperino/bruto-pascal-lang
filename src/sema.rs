@@ -49,6 +49,7 @@ pub fn resolve_program(program: &Program) -> Result<Resolved, SemaError> {
     let display_names = fold_identifier_case(&mut program);
     strip_unit_qualifiers(&mut program);
     name_overloads(&mut program);
+    name_method_overloads(&mut program);
     name_nested_routines(&mut program);
     avoid_c_symbols(&mut program);
     let program = fold_constant_bounds(&program)?;
@@ -267,6 +268,97 @@ fn name_overloads(program: &mut Program) {
         .filter(|(_, v)| v.len() > 1)
         .map(|(name, v)| (name, v.into_iter().map(|(_, s)| s).collect()))
         .collect();
+}
+
+/// Give each distinct signature of an overloaded method its own name, as
+/// `name_overloads` does for routines: `get`, `get$2`... A method with
+/// the signature of an ancestor's keeps the ancestor's name (so
+/// `override` finds its slot); the implementations are renamed to match.
+/// Code generation picks the overload for each call by argument types.
+fn name_method_overloads(program: &mut Program) {
+    fn signature(params: &[ParamGroup]) -> String {
+        let params: Vec<String> = params
+            .iter()
+            .flat_map(|g| {
+                g.names
+                    .iter()
+                    .map(move |_| format!("{:?} {:?}", g.mode, g.ty))
+            })
+            .collect();
+        format!("{params:?}")
+    }
+    // Per type: method name -> (signature, key) for every overload, own
+    // and inherited.
+    let mut known: HashMap<String, HashMap<String, Vec<(String, String)>>> = HashMap::new();
+    // Per type: (key, base name, signature) of its own methods.
+    let mut own: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    let mut renamed = false;
+    for td in program.type_decls.iter_mut() {
+        let PascalType::Object(obj) = &mut td.ty else {
+            continue;
+        };
+        if obj.is_forward {
+            continue;
+        }
+        let parent = obj.parent.clone().or_else(|| {
+            obj.is_class
+                .then(|| "tobject".to_string())
+                .filter(|p| *p != td.name)
+        });
+        let mut table = parent
+            .and_then(|p| known.get(&p).cloned())
+            .unwrap_or_default();
+        let mut mine: Vec<(String, String, String)> = Vec::new();
+        let is_class = obj.is_class;
+        for m in obj.methods.iter_mut() {
+            let sig = signature(&m.params);
+            let declared_here = mine.iter().any(|(_, base, _)| *base == m.name);
+            let variants = table.entry(m.name.clone()).or_default();
+            let key = match variants.iter().find(|(s, _)| *s == sig) {
+                Some((_, key)) => key.clone(),
+                // In a class, another signature is an overload, callable
+                // beside the ancestor's. In a TP object it hides the
+                // ancestor's method, unless the type declares both.
+                None => {
+                    let key = if variants.is_empty() || (!is_class && !declared_here) {
+                        m.name.clone()
+                    } else {
+                        renamed = true;
+                        format!("{}${}", m.name, variants.len() + 1)
+                    };
+                    variants.push((sig.clone(), key.clone()));
+                    key
+                }
+            };
+            mine.push((key.clone(), m.name.clone(), sig));
+            m.name = key;
+        }
+        known.insert(td.name.clone(), table);
+        own.insert(td.name.clone(), mine);
+    }
+    if !renamed {
+        return;
+    }
+    for proc in program.procedures.iter_mut() {
+        let Some(owner) = &proc.owner else { continue };
+        let Some(methods) = own.get(owner) else {
+            continue;
+        };
+        let candidates: Vec<&(String, String, String)> = methods
+            .iter()
+            .filter(|(_, base, _)| *base == proc.name)
+            .collect();
+        if candidates.len() < 2 {
+            if let Some((key, _, _)) = candidates.first() {
+                proc.name = key.clone();
+            }
+            continue;
+        }
+        let sig = signature(&proc.params);
+        if let Some((key, _, _)) = candidates.iter().find(|(_, _, s)| *s == sig) {
+            proc.name = key.clone();
+        }
+    }
 }
 
 /// Drop `Unit.` qualifiers: units share one namespace here, so
@@ -719,6 +811,7 @@ impl ConstEnv {
                 }
             }
             PascalType::ClassOf(_) => {}
+            PascalType::VarParam(inner) => self.resolve_type(inner, span)?,
             PascalType::ArrayExpr { lo, hi, elem } => {
                 let lo = self.eval_at(lo, span)?;
                 let hi = self.eval_at(hi, span)?;

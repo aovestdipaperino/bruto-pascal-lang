@@ -2574,6 +2574,7 @@ impl Parser {
                 mode: ParamMode::Value,
                 names: vec![pname],
                 ty,
+                default: None,
             });
         }
 
@@ -2608,6 +2609,7 @@ impl Parser {
                 mode: ParamMode::Var,
                 names,
                 ty: PascalType::Untyped,
+                default: None,
             });
         }
         self.expect(&Tok::Colon)?;
@@ -2616,7 +2618,19 @@ impl Parser {
             Some("var" | "out" | "constref") => ParamMode::Var,
             _ => ParamMode::Value,
         };
-        Ok(ParamGroup { mode, names, ty })
+        // `X: T = Value`.
+        let default = if *self.peek() == Tok::Eq {
+            self.advance();
+            Some(DefaultValue(self.parse_expr()?))
+        } else {
+            None
+        };
+        Ok(ParamGroup {
+            mode,
+            names,
+            ty,
+            default,
+        })
     }
 
     /// Parse the rest of a procedural type after `procedure` / `function`
@@ -2669,7 +2683,20 @@ impl Parser {
     /// Parse one parameter group inside a procedural type, `[var] a, b: T`,
     /// returning `T` once per name.
     fn parse_proc_param_types(&mut self) -> Result<Vec<PascalType>, ParseError> {
-        if *self.peek() == Tok::Var {
+        // `var`, `out` and `constref` pass by reference, as does an untyped
+        // `const`.
+        let keyword = match self.peek() {
+            Tok::Var => Some("var"),
+            Tok::Const => Some("const"),
+            Tok::Ident(w)
+                if (w.eq_ignore_ascii_case("out") || w.eq_ignore_ascii_case("constref"))
+                    && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _))) =>
+            {
+                Some("var")
+            }
+            _ => None,
+        };
+        if keyword.is_some() {
             self.advance();
         }
         let mut count = 1;
@@ -2679,8 +2706,19 @@ impl Parser {
             let _ = self.expect_ident()?;
             count += 1;
         }
+        if *self.peek() != Tok::Colon && keyword.is_some() {
+            return Ok(vec![
+                PascalType::VarParam(Box::new(PascalType::Untyped));
+                count
+            ]);
+        }
         self.expect(&Tok::Colon)?;
         let ty = self.parse_type()?;
+        let ty = if keyword == Some("var") {
+            PascalType::VarParam(Box::new(ty))
+        } else {
+            ty
+        };
         Ok(vec![ty; count])
     }
 
@@ -3030,6 +3068,92 @@ impl Parser {
         }
     }
 
+    /// The rest of a statement whose start, `value`, is a call's result:
+    /// `.Field`, `.Method(args)`, `[index]` and `^` steps, then a method
+    /// call or an assignment.
+    fn parse_chained_call_statement(
+        &mut self,
+        mut value: Expr,
+        span: Span,
+    ) -> Result<Statement, ParseError> {
+        loop {
+            match self.peek() {
+                Tok::Dot => {
+                    self.advance();
+                    let (field, _) = self.expect_member_name()?;
+                    value = if *self.peek() == Tok::LParen {
+                        let args = self.parse_call_args()?;
+                        Expr::MethodCall {
+                            object: Box::new(value),
+                            method: field,
+                            args,
+                            span,
+                        }
+                    } else {
+                        Expr::FieldAccess {
+                            record: Box::new(value),
+                            field,
+                            span,
+                        }
+                    };
+                }
+                Tok::LBracket => {
+                    self.advance();
+                    loop {
+                        let index = self.parse_expr()?;
+                        value = Expr::Index {
+                            array: Box::new(value),
+                            index: Box::new(index),
+                            span,
+                        };
+                        if *self.peek() != Tok::Comma {
+                            break;
+                        }
+                        self.advance();
+                    }
+                    self.expect(&Tok::RBracket)?;
+                }
+                Tok::Caret => {
+                    self.advance();
+                    value = Expr::Deref(Box::new(value), span);
+                }
+                _ => break,
+            }
+        }
+        if *self.peek() == Tok::Assign {
+            self.advance();
+            let expr = self.parse_expr()?;
+            return Ok(Statement::PlaceAssignment {
+                target: value,
+                expr,
+                span,
+            });
+        }
+        match value {
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } => Ok(Statement::MethodCall {
+                object: *object,
+                method,
+                args,
+                span,
+            }),
+            Expr::FieldAccess { record, field, .. } => Ok(Statement::MethodCall {
+                object: *record,
+                method: field,
+                args: Vec::new(),
+                span,
+            }),
+            _ => Err(ParseError {
+                message: "expected a method call or an assignment".into(),
+                span,
+            }),
+        }
+    }
+
     fn parse_ident_statement(&mut self) -> Result<Statement, ParseError> {
         let span = self.span();
         let (name, _) = self.expect_ident()?;
@@ -3059,6 +3183,16 @@ impl Parser {
                     if *self.peek() == Tok::LParen {
                         let object = Self::chain_to_expr(&name, chain, span);
                         let args = self.parse_call_args()?;
+                        // `TFoo.Create(...).Free`: the chain goes on.
+                        if matches!(self.peek(), Tok::Dot | Tok::LBracket | Tok::Caret) {
+                            let call = Expr::MethodCall {
+                                object: Box::new(object),
+                                method: field,
+                                args,
+                                span,
+                            };
+                            return self.parse_chained_call_statement(call, span);
+                        }
                         return Ok(Statement::MethodCall {
                             object,
                             method: field,

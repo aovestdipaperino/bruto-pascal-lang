@@ -39,7 +39,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// The address of an untyped `var` argument: the place itself, or a
     /// temporary holding the value.
-    fn address_of_arg(
+    pub(super) fn address_of_arg(
         &mut self,
         arg: &Expr,
         span: Span,

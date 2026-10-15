@@ -187,6 +187,8 @@ pub struct CodeGen<'ctx> {
     has_classes: bool,
     // Classes whose instance cleanup routines still need bodies.
     class_cleanups: Vec<String>,
+    // Each routine's parameter defaults, one per parameter (by symbol).
+    proc_param_defaults: HashMap<String, Vec<Option<Expr>>>,
     // Runtime error functions whose bodies are still to be written:
     // name, code, description.
     runtime_error_stubs: std::cell::RefCell<Vec<(String, u32, String)>>,
@@ -295,6 +297,7 @@ impl<'ctx> CodeGen<'ctx> {
             has_classes: false,
             class_cleanups: Vec::new(),
             runtime_error_stubs: std::cell::RefCell::new(Vec::new()),
+            proc_param_defaults: HashMap::new(),
             with_objects: Vec::new(),
             with_classes: Vec::new(),
             bypass_user: false,
@@ -1102,6 +1105,7 @@ impl<'ctx> CodeGen<'ctx> {
                 PascalType::SizedInt { .. }
                 | PascalType::Object(_)
                 | PascalType::ClassOf(_)
+                | PascalType::VarParam(_)
                 | PascalType::ShortString { .. } => {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
@@ -1682,6 +1686,16 @@ impl<'ctx> CodeGen<'ctx> {
             .return_type
             .clone()
             .or_else(|| method.as_ref().and_then(|(_, m)| m.return_type.clone()));
+        if method.is_none() {
+            let defaults = Self::param_defaults(&params);
+            if defaults.iter().any(Option::is_some) {
+                self.proc_param_defaults
+                    .insert(proc.name.clone(), defaults.clone());
+                if let Some(c_symbol) = &proc.external {
+                    self.proc_param_defaults.insert(c_symbol.clone(), defaults);
+                }
+            }
+        }
         let is_constructor = matches!(&method, Some((_, m)) if m.kind == RoutineKind::Constructor);
         let frees_instance = matches!(&method, Some((_, m)) if m.frees_instance);
         let is_class_method = matches!(&method, Some((_, m)) if m.is_class_method);
@@ -3613,7 +3627,7 @@ impl<'ctx> CodeGen<'ctx> {
         match ty {
             // Object declarations are lowered to records when registered.
             PascalType::Object(_) => 0,
-            PascalType::ClassOf(_) => 8,
+            PascalType::ClassOf(_) | PascalType::VarParam(_) => 8,
             PascalType::ShortString { max } => *max as u64 + 1,
             PascalType::Integer
             | PascalType::Enum { .. }
@@ -4869,12 +4883,38 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// One default per parameter in `groups` (`None` where there is none).
+    pub(super) fn param_defaults(groups: &[ParamGroup]) -> Vec<Option<Expr>> {
+        groups
+            .iter()
+            .flat_map(|g| {
+                g.names
+                    .iter()
+                    .map(|_| g.default.as_ref().map(|d| d.0.clone()))
+            })
+            .collect()
+    }
+
+    /// `args` for a call to `name`, with the defaults of the parameters it
+    /// leaves out.
+    pub(super) fn with_defaults(&self, name: &str, args: &[Expr]) -> Vec<Expr> {
+        let mut all = args.to_vec();
+        if let Some(defaults) = self.proc_param_defaults.get(name)
+            && args.len() < defaults.len()
+            && defaults[args.len()..].iter().all(Option::is_some)
+        {
+            all.extend(defaults[args.len()..].iter().flatten().cloned());
+        }
+        all
+    }
+
     fn compile_call_args(
         &mut self,
         name: &str,
         args: &[Expr],
         span: Span,
     ) -> Result<Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>, CodeGenError> {
+        let args = &self.with_defaults(name, args);
         let param_modes = self.proc_param_modes.get(name).cloned();
         let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
 
@@ -7537,7 +7577,7 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Untyped | PascalType::Object(_) => {
                 self.context.i8_type().as_basic_type_enum()
             }
-            PascalType::ClassOf(_) => self
+            PascalType::ClassOf(_) | PascalType::VarParam(_) => self
                 .context
                 .ptr_type(AddressSpace::default())
                 .as_basic_type_enum(),
@@ -8991,9 +9031,15 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::RecordInit { .. } | Expr::ArrayInit { .. } => PascalType::Integer,
-            Expr::MethodCall { object, method, .. } if self.class_receiver(object).is_some() => {
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } if self.class_receiver(object).is_some() => {
                 let class = self.class_receiver(object).unwrap();
-                self.method_result_type(&class, method)
+                let method = self.method_overload(&class, method, args);
+                self.method_result_type(&class, &method)
                     .unwrap_or(PascalType::Integer)
             }
             Expr::MethodCall { object, method, .. }
@@ -9001,10 +9047,18 @@ impl<'ctx> CodeGen<'ctx> {
             {
                 PascalType::Boolean
             }
-            Expr::MethodCall { object, method, .. } => {
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } => {
                 let ty = self.infer_declared_type(object);
                 self.object_name_of(&ty)
-                    .and_then(|o| self.method_result_type(&o, method))
+                    .and_then(|o| {
+                        let method = self.method_overload(&o, method, args);
+                        self.method_result_type(&o, &method)
+                    })
                     .unwrap_or(PascalType::Integer)
             }
             Expr::Inherited { method, .. } if self.inherited_is_constructor(method) => {
@@ -9288,6 +9342,42 @@ impl<'ctx> CodeGen<'ctx> {
     /// The routine a call to `name` with `args` means: `name` itself, or
     /// for an overloaded name, the overload whose parameters best fit the
     /// argument types.
+    /// How well `args` fit the parameters of routine `symbol` (higher is
+    /// better), or `None` if they can't be passed to it.
+    pub(super) fn overload_score(&self, symbol: &str, args: &[Expr]) -> Option<i32> {
+        let params = self.proc_param_modes.get(symbol)?;
+        let args = &self.with_defaults(symbol, args);
+        if params.len() != args.len() {
+            return None;
+        }
+        let mut total = 0;
+        for ((_, mode, param), arg) in params.iter().zip(args) {
+            let param = self.resolve_type(param);
+            let arg_ty = self.resolve_type(&self.infer_declared_type(arg));
+            total += if param == arg_ty {
+                3
+            } else if *mode == ParamMode::Var && param == PascalType::Untyped {
+                1
+            } else {
+                match (&param, &arg_ty) {
+                    (
+                        PascalType::Integer | PascalType::SizedInt { .. },
+                        PascalType::Integer | PascalType::SizedInt { .. },
+                    )
+                    | (PascalType::Real, PascalType::Integer | PascalType::SizedInt { .. })
+                    | (
+                        PascalType::String | PascalType::ShortString { .. },
+                        PascalType::String | PascalType::ShortString { .. },
+                    ) => 2,
+                    (PascalType::Pointer(_) | PascalType::Proc { .. }, PascalType::Pointer(_)) => 1,
+                    (PascalType::Char, PascalType::String) => 1,
+                    _ => return None,
+                }
+            };
+        }
+        Some(total)
+    }
+
     fn resolve_overload(&self, name: &str, args: &[Expr]) -> String {
         if let Some(c_symbol) = self.external_symbols.get(name) {
             return c_symbol.clone();
@@ -9295,41 +9385,7 @@ impl<'ctx> CodeGen<'ctx> {
         let Some(candidates) = self.overloads.get(name) else {
             return name.to_string();
         };
-        let score = |symbol: &String| -> Option<i32> {
-            let params = self.proc_param_modes.get(symbol)?;
-            if params.len() != args.len() {
-                return None;
-            }
-            let mut total = 0;
-            for ((_, mode, param), arg) in params.iter().zip(args) {
-                let param = self.resolve_type(param);
-                let arg_ty = self.resolve_type(&self.infer_declared_type(arg));
-                total += if param == arg_ty {
-                    3
-                } else if *mode == ParamMode::Var && param == PascalType::Untyped {
-                    1
-                } else {
-                    match (&param, &arg_ty) {
-                        (
-                            PascalType::Integer | PascalType::SizedInt { .. },
-                            PascalType::Integer | PascalType::SizedInt { .. },
-                        )
-                        | (PascalType::Real, PascalType::Integer | PascalType::SizedInt { .. })
-                        | (
-                            PascalType::String | PascalType::ShortString { .. },
-                            PascalType::String | PascalType::ShortString { .. },
-                        ) => 2,
-                        (
-                            PascalType::Pointer(_) | PascalType::Proc { .. },
-                            PascalType::Pointer(_),
-                        ) => 1,
-                        (PascalType::Char, PascalType::String) => 1,
-                        _ => return None,
-                    }
-                };
-            }
-            Some(total)
-        };
+        let score = |symbol: &String| self.overload_score(symbol, args);
         candidates
             .iter()
             .filter_map(|s| score(s).map(|n| (n, s)))

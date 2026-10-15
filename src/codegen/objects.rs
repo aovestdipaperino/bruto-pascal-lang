@@ -284,6 +284,10 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             self.proc_param_modes.insert(symbol.clone(), param_info);
+            let defaults = Self::param_defaults(&method.params);
+            if defaults.iter().any(Option::is_some) {
+                self.proc_param_defaults.insert(symbol.clone(), defaults);
+            }
             let ret = match method.kind {
                 RoutineKind::Function => method.return_type.clone(),
                 _ => None,
@@ -526,7 +530,9 @@ impl<'ctx> CodeGen<'ctx> {
     /// A method function calling itself with arguments: its name is also
     /// its result variable, which hides it from `implicit_method`.
     pub(super) fn recursive_method(&self, name: &str) -> Option<(String, PointerValue<'ctx>)> {
-        if self.bypass_user || self.current_function.as_deref() != Some(name) {
+        // (An overload, `get$2`, is called by its plain name too.)
+        let current = self.current_function.as_deref()?;
+        if self.bypass_user || current.split('$').next() != Some(name) {
             return None;
         }
         let object = self.current_object.clone()?;
@@ -564,6 +570,33 @@ impl<'ctx> CodeGen<'ctx> {
         self.implicit_method(name).map(|(object, _)| object)
     }
 
+    /// The method `method(args)` means on `object`: `method` itself, or
+    /// for an overloaded method (`method$2`...), the overload whose
+    /// parameters fit `args` best.
+    pub(super) fn method_overload(&self, object: &str, method: &str, args: &[Expr]) -> String {
+        let Some(info) = self.objects.get(object) else {
+            return method.to_string();
+        };
+        let prefix = format!("{method}$");
+        let candidates: Vec<&String> = info
+            .methods
+            .keys()
+            .filter(|k| *k == method || k.starts_with(&prefix))
+            .collect();
+        if candidates.len() < 2 {
+            return method.to_string();
+        }
+        candidates
+            .into_iter()
+            .filter_map(|k| {
+                self.overload_score(&info.methods[k].symbol, args)
+                    .map(|n| (n, k))
+            })
+            .max_by_key(|(n, k)| (*n, std::cmp::Reverse(k.len())))
+            .map(|(_, k)| k.clone())
+            .unwrap_or_else(|| method.to_string())
+    }
+
     /// Call `method` on `receiver`.
     pub(super) fn call_method(
         &mut self,
@@ -583,6 +616,8 @@ impl<'ctx> CodeGen<'ctx> {
         let info = self.objects.get(object).cloned().ok_or_else(|| {
             CodeGenError::new(format!("'{object}' is not an object type"), Some(span))
         })?;
+        let chosen = self.method_overload(object, method, args);
+        let method = chosen.as_str();
         let m = info.methods.get(method).cloned().ok_or_else(|| {
             CodeGenError::new(
                 format!("'{}' has no method '{method}'", self.display(object)),
