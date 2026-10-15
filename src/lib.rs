@@ -3572,6 +3572,125 @@ end.
         assert_eq!(out, "person50000 nick 50000 C person7\ntrue\n");
     }
 
+    // Bruto's network units are for Unix (BSD sockets).
+    #[cfg(unix)]
+    #[test]
+    fn sockets_talk_over_loopback() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses Sockets, NetDB;
+var
+  Server, Client, Conn: LongInt;
+  Addr, Peer: TInetSockAddr;
+  Len: TSockLen;
+  Buf: array[0..63] of Char;
+  N: LongInt;
+  Msg: AnsiString;
+  H: THostEntry;
+begin
+  writeln(SizeOf(TInetSockAddr), ' ', SizeOf(in_addr), ' ',
+    NetAddrToStr(StrToNetAddr('192.168.1.20')), ' ', HostAddrToStr(StrToHostAddr('10.0.0.1')),
+    ' ', htons($1234) = $3412, ' ', StrToNetAddr('300.1.1.1').s_addr);
+  Server := fpSocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_addr := StrToNetAddr('127.0.0.1');
+  writeln(fpBind(Server, @Addr, SizeOf(Addr)), ' ', fpListen(Server, 1));
+  Len := SizeOf(Addr);
+  fpGetSockName(Server, @Addr, @Len);
+  Client := fpSocket(AF_INET, SOCK_STREAM, 0);
+  writeln(fpConnect(Client, @Addr, SizeOf(Addr)));
+  Len := SizeOf(Peer);
+  Conn := fpAccept(Server, @Peer, @Len);
+  writeln(NetAddrToStr(Peer.sin_addr));
+  Msg := 'hello';
+  fpSend(Client, @Msg[1], Length(Msg), 0);
+  N := fpRecv(Conn, @Buf, SizeOf(Buf), 0);
+  Buf[N] := #0;
+  writeln(N, ' ', PChar(@Buf));
+  CloseSocket(Conn);
+  writeln(fpRecv(Client, @Buf, SizeOf(Buf), 0));
+  CloseSocket(Client);
+  CloseSocket(Server);
+  writeln(ResolveHostByName('localhost', H), ' ', HostAddrToStr(H.Addr));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "16 4 192.168.1.20 10.0.0.1 true 0\n0 0\n0\n127.0.0.1\n5 hello\n0\ntrue 127.0.0.1\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_objects() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses NetObjects;
+function c_fork: LongInt; cdecl; external 'c' name 'fork';
+procedure c_exit(Code: LongInt); cdecl; external 'c' name '_exit';
+function c_waitpid(Pid: LongInt; Status: Pointer; Options: LongInt): LongInt;
+  cdecl; external 'c' name 'waitpid';
+var
+  Server: TTcpServer;
+  Peer: PTcpClient;
+  Client: TTcpClient;
+  Http: THttpClient;
+  Udp1, Udp2: TUdpSocket;
+  Line, Data, From: AnsiString;
+  FromPort, Port: Word;
+  Pid, Status: LongInt;
+begin
+  if not Server.Listen(0, 4) then Halt(1);
+  Port := Server.LocalPort;
+  Pid := c_fork;
+  if Pid = 0 then
+  begin
+    Peer := Server.Accept;
+    while Peer^.ReadLine(Line) and (Line <> 'quit') do
+      Peer^.SendString('echo: ' + Line + #10);
+    Dispose(Peer, Done);
+    Peer := Server.Accept;
+    while Peer^.ReadLine(Line) and (Line <> '') do ;
+    Peer^.SendString('HTTP/1.1 200 OK'#13#10'Content-Type: text/plain'#13#10 +
+      'Transfer-Encoding: chunked'#13#10#13#10'5'#13#10'Hello'#13#10 +
+      '7'#13#10', world'#13#10'0'#13#10#13#10);
+    Dispose(Peer, Done);
+    c_exit(0);
+  end;
+  Server.Done;
+  if not Client.Connect('127.0.0.1', Port) then writeln('connect failed');
+  Client.SendString('first'#10'second'#10);
+  Client.ReadLine(Line); writeln(Line);
+  Client.ReadLine(Line); writeln(Line);
+  Client.SendString('quit'#10);
+  Client.Done;
+  Http.Init;
+  Str(Port, Line);
+  writeln(Http.Get('http://localhost:' + Line + '/x'), ' [', Http.Body, '] ',
+    Http.Header('content-type'));
+  Http.Done;
+  c_waitpid(Pid, @Status, 0);
+  writeln(Client.Connect('127.0.0.1', 1));
+  Udp1.Init(0);
+  Udp2.Init(0);
+  Udp1.SendTo('127.0.0.1', Udp2.LocalPort, 'datagram');
+  if Udp2.ReceiveFrom(Data, From, FromPort) then
+    writeln(Data, ' ', From, ' ', FromPort = Udp1.LocalPort);
+  Udp1.Done;
+  Udp2.Done;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "echo: first\necho: second\n200 [Hello, world] text/plain\nfalse\ndatagram 127.0.0.1 true\n"
+        );
+    }
+
     #[test]
     fn conditional_compilation() {
         let (ok, out) = build_and_run_source(

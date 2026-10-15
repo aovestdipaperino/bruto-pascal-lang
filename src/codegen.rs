@@ -25,6 +25,7 @@ use std::path::Path;
 mod arc;
 mod closures;
 mod forin;
+mod layout;
 mod objects;
 mod strings;
 mod system;
@@ -1714,6 +1715,10 @@ impl<'ctx> CodeGen<'ctx> {
                 .insert(proc.name.clone(), c_symbol.clone());
             self.proc_return_types
                 .insert(c_symbol.clone(), return_type.clone());
+            // A parameterless external function can be called by its
+            // Pascal name alone (`Pid := c_fork;`).
+            self.proc_return_types
+                .insert(proc.name.clone(), return_type.clone());
             self.proc_param_modes.insert(c_symbol.clone(), param_info);
             return Ok(());
         }
@@ -2724,7 +2729,7 @@ impl<'ctx> CodeGen<'ctx> {
                                     .build_struct_gep(
                                         self.llvm_type_for(&resolved),
                                         alloca,
-                                        fields.len() as u32,
+                                        Self::variant_slots(fields.len(), v).tag.unwrap_or(0),
                                         "tag_gep",
                                     )
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
@@ -2744,7 +2749,7 @@ impl<'ctx> CodeGen<'ctx> {
                                     .build_struct_gep(
                                         self.llvm_type_for(&resolved),
                                         alloca,
-                                        (fields.len() + 1) as u32,
+                                        Self::variant_slots(fields.len(), v).area,
                                         "union_gep",
                                     )
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
@@ -3425,23 +3430,7 @@ impl<'ctx> CodeGen<'ctx> {
             }
             PascalType::Record {
                 fields, variant, ..
-            } => {
-                let fixed: u64 = fields.iter().map(|(_, t)| self.sizeof_type(t)).sum();
-                let var_size = variant
-                    .as_ref()
-                    .map(|v| {
-                        let tag_size = self.sizeof_type(&v.tag_type);
-                        let max_body = v
-                            .variants
-                            .iter()
-                            .map(|(_, vf)| vf.iter().map(|(_, t)| self.sizeof_type(t)).sum::<u64>())
-                            .max()
-                            .unwrap_or(0);
-                        tag_size + max_body
-                    })
-                    .unwrap_or(0);
-                fixed + var_size
-            }
+            } => self.record_size(fields, variant),
             PascalType::Named(_) => {
                 let resolved = self.resolve_type(ty);
                 self.sizeof_type(&resolved)
@@ -3455,28 +3444,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// Each variant's fields are laid out at byte offset 0 within the union (they overlap).
     /// Within a single variant, fields are sequential.
     fn find_variant_field(&self, v: &RecordVariant, field: &str) -> Option<(u64, PascalType)> {
-        for (_values, vfields) in &v.variants {
-            let mut offset = 0u64;
-            for (name, ty) in vfields {
-                if name == field {
-                    return Some((offset, ty.clone()));
-                }
-                // A nested variant part: an unnamed record laid out as its
-                // tag followed by its own union.
-                if name.is_empty()
-                    && let PascalType::Record {
-                        variant: Some(nested),
-                        ..
-                    } = ty
-                    && let Some((inner, inner_ty)) = self.find_variant_field(nested, field)
-                {
-                    let tag = self.sizeof_type(&nested.tag_type);
-                    return Some((offset + tag + inner, inner_ty));
-                }
-                offset += self.sizeof_type(ty);
-            }
-        }
-        None
+        self.variant_field_offset(v, field)
     }
 
     /// The names of all fields in a variant part, nested ones included.
@@ -4859,7 +4827,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         for arg in &args[start_idx..] {
             let val = self.compile_expr(&arg.expr)?;
-            let mut arg_type = self.infer_expr_type(&arg.expr);
+            let mut arg_type = self.resolve_type(&self.infer_expr_type(&arg.expr));
             // UnicodeStrings and WideChars are written in UTF-8.
             let val = if self.is_ustr(val) || Self::is_wide_char(val) {
                 arg_type = PascalType::String;
@@ -5370,14 +5338,24 @@ impl<'ctx> CodeGen<'ctx> {
         if field == v.tag_name {
             let addr = self
                 .builder
-                .build_struct_gep(record_ty, rec_ptr, fields.len() as u32, "tag_gep")
+                .build_struct_gep(
+                    record_ty,
+                    rec_ptr,
+                    Self::variant_slots(fields.len(), v).tag.unwrap_or(0),
+                    "tag_gep",
+                )
                 .map_err(err)?;
             return Ok((addr, v.tag_type.clone()));
         }
         let (offset, field_ty) = self.find_variant_field(v, field).ok_or_else(missing)?;
         let union = self
             .builder
-            .build_struct_gep(record_ty, rec_ptr, (fields.len() + 1) as u32, "union_gep")
+            .build_struct_gep(
+                record_ty,
+                rec_ptr,
+                Self::variant_slots(fields.len(), v).area,
+                "union_gep",
+            )
             .map_err(err)?;
         let addr = unsafe {
             self.builder
@@ -5459,8 +5437,12 @@ impl<'ctx> CodeGen<'ctx> {
                             Some(*span),
                         )
                     })?;
-                // `if not TAncestor.Init(...) then Fail`.
-                if self.ancestor_constructor(object, method) {
+                // `if not TAncestor.Init(...) then Fail`, `if not
+                // Conn.Connect(...) then`: a constructor used as a value
+                // says whether it succeeded.
+                if self.ancestor_constructor(object, method)
+                    || self.is_constructor_call(object, method)
+                {
                     return Ok(self
                         .builder
                         .build_is_not_null(value.into_pointer_value(), "constructed")
@@ -5734,7 +5716,7 @@ impl<'ctx> CodeGen<'ctx> {
                                     .build_struct_gep(
                                         self.llvm_type_for(&resolved),
                                         alloca,
-                                        fields.len() as u32,
+                                        Self::variant_slots(fields.len(), v).tag.unwrap_or(0),
                                         "tag_gep",
                                     )
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
@@ -5757,7 +5739,7 @@ impl<'ctx> CodeGen<'ctx> {
                                     .build_struct_gep(
                                         self.llvm_type_for(&resolved),
                                         alloca,
-                                        (fields.len() + 1) as u32,
+                                        Self::variant_slots(fields.len(), v).area,
                                         "union_gep",
                                     )
                                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
@@ -7167,12 +7149,11 @@ impl<'ctx> CodeGen<'ctx> {
         let scope = self.compile_unit.as_debug_info_scope();
         let file = self.compile_unit.get_file();
         let mut members: Vec<DIType<'ctx>> = Vec::new();
-        let mut offset: u64 = 0;
-
-        for (name, ty) in fields {
+        let boxed = variant.map(|v| Box::new(v.clone()));
+        let (offsets, tag_offset, area_offset) = self.record_offsets(fields, &boxed);
+        let mut member = |name: &str, ty: &PascalType, offset: u64| -> Option<()> {
             let resolved = self.resolve_type(ty);
             let mty = self.create_debug_type(&resolved)?;
-            let size = self.sizeof_type(&resolved) * 8;
             members.push(
                 self.di_builder
                     .create_member_type(
@@ -7180,116 +7161,54 @@ impl<'ctx> CodeGen<'ctx> {
                         &self.display(name),
                         file,
                         0,
-                        size,
-                        64,
-                        offset,
+                        self.sizeof_type(&resolved) * 8,
+                        self.align_of(&resolved) as u32 * 8,
+                        offset * 8,
                         DIFlags::ZERO,
                         mty,
                     )
                     .as_type(),
             );
-            offset += self.sizeof_type(&resolved) * 8;
+            Some(())
+        };
+        for ((name, ty), offset) in fields.iter().zip(&offsets) {
+            member(name, ty, *offset)?;
         }
-
         if let Some(v) = variant {
-            // Tag field (named member, sequential).
-            let tag_resolved = self.resolve_type(&v.tag_type);
-            let tag_dt = self.create_debug_type(&tag_resolved)?;
-            let tag_size = self.sizeof_type(&tag_resolved) * 8;
-            members.push(
-                self.di_builder
-                    .create_member_type(
-                        scope,
-                        &self.display(&v.tag_name),
-                        file,
-                        0,
-                        tag_size,
-                        64,
-                        offset,
-                        DIFlags::ZERO,
-                        tag_dt,
-                    )
-                    .as_type(),
-            );
-            offset += tag_size;
-
-            // Variant fields: all variants share the same starting offset
-            // (the union region). Sequential within a single variant.
-            for (_vals, vfields) in &v.variants {
-                let mut voffset = offset;
+            if let Some(tag) = tag_offset {
+                member(&v.tag_name, &v.tag_type, tag)?;
+            }
+            // The variants overlap, each starting at the area.
+            for (_, vfields) in &v.variants {
                 for (vname, vty) in vfields {
-                    let vresolved = self.resolve_type(vty);
-                    let vdt = self.create_debug_type(&vresolved)?;
-                    let vsize = self.sizeof_type(&vresolved) * 8;
-                    members.push(
-                        self.di_builder
-                            .create_member_type(
-                                scope,
-                                &self.display(vname),
-                                file,
-                                0,
-                                vsize,
-                                64,
-                                voffset,
-                                DIFlags::ZERO,
-                                vdt,
-                            )
-                            .as_type(),
-                    );
-                    voffset += vsize;
+                    if vname.is_empty() {
+                        continue;
+                    }
+                    if let Some((offset, _)) = self.variant_field_offset(v, vname) {
+                        member(vname, vty, area_offset + offset)?;
+                    }
                 }
             }
-
-            // Total record size = fixed + tag + max variant size.
-            let max_variant_bits: u64 = v
-                .variants
-                .iter()
-                .map(|(_, vf)| {
-                    vf.iter()
-                        .map(|(_, t)| self.sizeof_type(&self.resolve_type(t)) * 8)
-                        .sum::<u64>()
-                })
-                .max()
-                .unwrap_or(0);
-            let total = offset + max_variant_bits;
-            Some(
-                self.di_builder
-                    .create_struct_type(
-                        scope,
-                        "record",
-                        file,
-                        0,
-                        total,
-                        64,
-                        DIFlags::ZERO,
-                        None,
-                        &members,
-                        0,
-                        None,
-                        "",
-                    )
-                    .as_type(),
-            )
-        } else {
-            Some(
-                self.di_builder
-                    .create_struct_type(
-                        scope,
-                        "record",
-                        file,
-                        0,
-                        offset,
-                        64,
-                        DIFlags::ZERO,
-                        None,
-                        &members,
-                        0,
-                        None,
-                        "",
-                    )
-                    .as_type(),
-            )
         }
+        let size = self.record_size(fields, &boxed) * 8;
+        Some(
+            self.di_builder
+                .create_struct_type(
+                    scope,
+                    "record",
+                    file,
+                    0,
+                    size,
+                    64,
+                    DIFlags::ZERO,
+                    None,
+                    &members,
+                    0,
+                    None,
+                    "",
+                )
+                .as_type(),
+        )
     }
 
     fn llvm_type_for(&self, ty: &PascalType) -> inkwell::types::BasicTypeEnum<'ctx> {
@@ -7348,21 +7267,17 @@ impl<'ctx> CodeGen<'ctx> {
                 let mut field_types: Vec<inkwell::types::BasicTypeEnum> =
                     fields.iter().map(|(_, t)| self.llvm_type_for(t)).collect();
                 if let Some(v) = variant {
-                    field_types.push(self.llvm_type_for(&v.tag_type));
-                    let max_size = v
-                        .variants
-                        .iter()
-                        .map(|(_, vf)| vf.iter().map(|(_, t)| self.sizeof_type(t)).sum::<u64>())
-                        .max()
-                        .unwrap_or(0);
-                    if max_size > 0 {
-                        field_types.push(
-                            self.context
-                                .i8_type()
-                                .array_type(max_size as u32)
-                                .as_basic_type_enum(),
-                        );
+                    // The tag only when it has a name; then the union area,
+                    // as integers of its alignment (see `codegen/layout.rs`).
+                    if !v.tag_name.is_empty() {
+                        field_types.push(self.llvm_type_for(&v.tag_type));
                     }
+                    let (size, align) = self.variant_area(v);
+                    let unit = self.context.custom_width_int_type((align * 8) as u32);
+                    field_types.push(
+                        unit.array_type(size.div_ceil(align) as u32)
+                            .as_basic_type_enum(),
+                    );
                 }
                 self.context
                     .struct_type(&field_types, false)
@@ -8976,11 +8891,19 @@ impl<'ctx> CodeGen<'ctx> {
     fn method_result_type(&self, object: &str, method: &str) -> Option<PascalType> {
         let m = self.objects.get(object)?.methods.get(method)?;
         match m.kind {
-            RoutineKind::Constructor => Some(PascalType::Pointer(Box::new(PascalType::Named(
-                object.to_string(),
-            )))),
+            // Used as a value, a constructor says whether it succeeded.
+            RoutineKind::Constructor => Some(PascalType::Boolean),
             _ => m.return_type.clone(),
         }
+    }
+
+    /// Whether `object.method` calls a constructor of `object`'s type.
+    fn is_constructor_call(&self, object: &Expr, method: &str) -> bool {
+        let ty = self.infer_declared_type(object);
+        self.object_name_of(&ty)
+            .and_then(|o| self.objects.get(&o))
+            .and_then(|info| info.methods.get(method))
+            .is_some_and(|m| m.kind == RoutineKind::Constructor)
     }
 
     /// Whether `record.field` names a method of an object rather than a

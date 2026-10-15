@@ -15,6 +15,14 @@ type
   csize_t = QWord;
   cssize_t = Int64;
   time_t = Int64;
+  cint8 = ShortInt;
+  cuint8 = Byte;
+  cint16 = SmallInt;
+  cuint16 = Word;
+  cint32 = LongInt;
+  cuint32 = LongWord;
+  cint64 = Int64;
+  cuint64 = QWord;
   pcint = ^cint;
 {$ifdef DARWIN}
   suseconds_t = LongInt;
