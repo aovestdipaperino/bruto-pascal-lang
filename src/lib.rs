@@ -470,7 +470,7 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
     program.procedures.splice(0..0, procs);
     program.body.statements.splice(0..0, init_stmts);
 
-    Ok(())
+    rtl::add_system_prelude(program)
 }
 
 fn load_unit_recursive(
@@ -3088,6 +3088,35 @@ end.
         );
         assert!(ok, "program failed: {out}");
         assert_eq!(out, "visited 3\n2\ntrue\none\ntwo\nabc 3 2\nx\n");
+    }
+
+    #[test]
+    fn short_string_constants_and_char_arrays() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}
+const
+  LineBreak: string[2] = #13#10;
+  Frame: array[0..1] of array[0..2] of Char = (#218#196#191, 'ab');
+  Chars: array[0..3] of Char = 'xyz';
+var
+  Hs: string[7];
+  P: PChar;
+begin
+  P := @LineBreak[1];
+  writeln(Ord(P^), ' ', Ord(LineBreak[2]));
+  writeln(Ord(Frame[0][1]), ' ', Frame[1][1], ' ', Ord(Frame[1][2]));
+  Str(7, Hs);
+  while Length(Hs) < 2 do Hs := '0' + Hs;
+  writeln(Hs);
+  P := Chars;
+  writeln(P[1]);
+  writeln(HexStr(255, 4), ' ', HexStr($12345, 2));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "13 10\n196 b 0\n07\ny\n00FF 45\n");
     }
 
     #[test]

@@ -617,6 +617,89 @@ impl<'ctx> CodeGen<'ctx> {
                     .basic()
                     .unwrap()
             }
+            // HexStr(Value, Digits): the low `Digits` hex digits of Value.
+            ("hexstr", 2) => {
+                let value = self.compile_expr(&args[0])?;
+                let value = if value.is_pointer_value() {
+                    self.builder
+                        .build_ptr_to_int(value.into_pointer_value(), i64_ty, "addr")
+                        .map_err(err)?
+                } else {
+                    self.to_i64(value, span)?
+                };
+                let digits = self.int_arg(&args[1], span)?;
+                // Keep the low 4 * Digits bits (all of them from 16 up).
+                let bits = self
+                    .builder
+                    .build_int_mul(digits, i64_ty.const_int(4, false), "bits")
+                    .map_err(err)?;
+                let wide = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::SGE,
+                        bits,
+                        i64_ty.const_int(64, false),
+                        "wide",
+                    )
+                    .map_err(err)?;
+                let one = i64_ty.const_int(1, false);
+                let shift = self
+                    .builder
+                    .build_select(wide, i64_ty.const_zero(), bits, "shift")
+                    .map_err(err)?
+                    .into_int_value();
+                let limit = self
+                    .builder
+                    .build_left_shift(one, shift, "limit")
+                    .map_err(err)?;
+                let mask = self
+                    .builder
+                    .build_int_sub(limit, one, "mask")
+                    .map_err(err)?;
+                let mask = self
+                    .builder
+                    .build_select(wide, i64_ty.const_all_ones(), mask, "mask")
+                    .map_err(err)?
+                    .into_int_value();
+                let value = self.builder.build_and(value, mask, "value").map_err(err)?;
+                let malloc = self.libc("malloc", ptr.fn_type(&[i64_ty.into()], false));
+                let buf = self
+                    .builder
+                    .build_call(malloc, &[i64_ty.const_int(32, false).into()], "hex")
+                    .map_err(err)?
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap();
+                let snprintf = self.libc(
+                    "snprintf",
+                    self.context
+                        .i32_type()
+                        .fn_type(&[ptr.into(), i64_ty.into(), ptr.into()], true),
+                );
+                let format = self
+                    .builder
+                    .build_global_string_ptr("%0*llX", "hex_fmt")
+                    .map_err(err)?
+                    .as_pointer_value();
+                let width = self
+                    .builder
+                    .build_int_truncate(digits, self.context.i32_type(), "width")
+                    .map_err(err)?;
+                self.builder
+                    .build_call(
+                        snprintf,
+                        &[
+                            buf.into(),
+                            i64_ty.const_int(32, false).into(),
+                            format.into(),
+                            width.into(),
+                            value.into(),
+                        ],
+                        "",
+                    )
+                    .map_err(err)?;
+                buf
+            }
             // Swap(W): exchange the two bytes of a 16-bit value.
             ("swap", 1) => {
                 let v = self.int_arg(&args[0], span)?;
@@ -736,7 +819,7 @@ impl<'ctx> CodeGen<'ctx> {
             ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) | ("unicodetoutf8", 4) => {
                 PascalType::Integer
             }
-            ("paramstr", 1) => PascalType::String,
+            ("paramstr", 1) | ("hexstr", 2) => PascalType::String,
             ("get_frame" | "get_pc_addr", 0) | ("get_caller_frame", 1 | 2) => {
                 PascalType::Pointer(Box::new(PascalType::Untyped))
             }

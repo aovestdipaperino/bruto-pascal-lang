@@ -1356,6 +1356,42 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(())
             }
+            // `array[0..2] of Char = #218#196#191`: the characters, then
+            // zeros.
+            (Expr::StrLit(text, span), PascalType::Array { lo, hi, elem })
+                if self.resolve_type(elem) == PascalType::Char =>
+            {
+                let bytes: Vec<u8> = text.chars().map(|c| c as u32 as u8).collect();
+                let len = (hi - lo + 1) as usize;
+                if bytes.len() > len {
+                    return Err(CodeGenError::new(
+                        format!(
+                            "the string has {} characters but the array holds {len}",
+                            bytes.len()
+                        ),
+                        Some(*span),
+                    ));
+                }
+                let i8_ty = self.context.i8_type();
+                let i64_ty = self.context.i64_type();
+                for i in 0..len {
+                    let addr = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(
+                                i8_ty,
+                                slot,
+                                &[i64_ty.const_int(i as u64, false)],
+                                "init_char",
+                            )
+                            .map_err(err)?
+                    };
+                    let byte = bytes.get(i).copied().unwrap_or(0);
+                    self.builder
+                        .build_store(addr, i8_ty.const_int(byte as u64, false))
+                        .map_err(err)?;
+                }
+                Ok(())
+            }
             (Expr::RecordInit { span, .. } | Expr::ArrayInit { span, .. }, _) => Err(
                 CodeGenError::new("this value doesn't match the constant's type", Some(*span)),
             ),
@@ -1383,7 +1419,9 @@ impl<'ctx> CodeGen<'ctx> {
     /// `declare_global` created for it.
     fn compile_const_decl(&mut self, c: &ConstDecl) -> Result<(), CodeGenError> {
         self.set_debug_loc(c.span);
-        if matches!(c.value, Expr::RecordInit { .. } | Expr::ArrayInit { .. }) {
+        if matches!(c.value, Expr::RecordInit { .. } | Expr::ArrayInit { .. })
+            || matches!(self.const_decl_type(c), PascalType::Array { .. })
+        {
             let ty = self.const_decl_type(c);
             let slot = *self.global_vars.get(&c.name).ok_or_else(|| {
                 CodeGenError::new(
@@ -1401,23 +1439,9 @@ impl<'ctx> CodeGen<'ctx> {
                 Some(c.span),
             )
         })?;
-        // If declared real but initializer is integer literal, promote.
-        let store_val = if matches!(ty, PascalType::Real) && val.is_int_value() {
-            self.builder
-                .build_signed_int_to_float(
-                    val.into_int_value(),
-                    self.context.f64_type(),
-                    "const_itof",
-                )
-                .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?
-                .into()
-        } else {
-            val
-        };
-        self.builder
-            .build_store(alloca, store_val)
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?;
-        Ok(())
+        // Converted as any store: an integer into a real, a string into
+        // a short string's buffer.
+        self.store_value(alloca, val, &ty, c.span)
     }
 
     fn compile_proc_decl(&mut self, proc: &ProcDecl) -> Result<(), CodeGenError> {
@@ -2014,6 +2038,26 @@ impl<'ctx> CodeGen<'ctx> {
         })
     }
 
+    /// Compile `expr` as a value of type `target`. An array assigned to a
+    /// pointer (`P := CharArray`, as FPC allows for `PChar`) is its
+    /// address.
+    fn compile_expr_for(
+        &mut self,
+        expr: &Expr,
+        target: &PascalType,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        if matches!(self.resolve_type(target), PascalType::Pointer(_))
+            && self.is_addressable(expr)
+            && matches!(
+                self.resolve_type(&self.infer_declared_type(expr)),
+                PascalType::Array { .. }
+            )
+        {
+            return Ok(self.resolve_array_base(expr, expr.span())?.0.into());
+        }
+        self.compile_expr(expr)
+    }
+
     /// `val` as a string: a char becomes a one-character string, anything
     /// else is returned unchanged.
     fn as_string_value(
@@ -2219,14 +2263,14 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Statement::Assignment { target, expr, span } => {
                 self.set_debug_loc(*span);
-                let val = self.compile_expr(expr)?;
-                let alloca = *self.lookup_var(target.as_str()).ok_or_else(|| {
-                    CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
-                })?;
                 let ty = self
                     .lookup_var_type(target.as_str())
                     .cloned()
                     .unwrap_or(PascalType::Integer);
+                let val = self.compile_expr_for(expr, &ty)?;
+                let alloca = *self.lookup_var(target.as_str()).ok_or_else(|| {
+                    CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
+                })?;
                 self.store_value(alloca, val, &ty, *span)
             }
             Statement::DerefAssignment { target, expr, span } => {
@@ -3709,18 +3753,12 @@ impl<'ctx> CodeGen<'ctx> {
     fn compile_str_proc(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
         let val = self.compile_expr(&args[0])?;
-        let s_name = match &args[1] {
-            Expr::Var(name, _) => name.clone(),
-            _ => {
-                return Err(CodeGenError::new(
-                    "str requires a string variable as 2nd arg",
-                    Some(span),
-                ));
-            }
+        let val = if val.is_float_value() {
+            val
+        } else {
+            self.to_i64(val, span)?.into()
         };
-        let alloca = *self.lookup_var(s_name.as_str()).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span))
-        })?;
+        let (alloca, target_ty) = self.resolve_array_base(&args[1], span)?;
         let fn_name = if val.is_float_value() {
             "bruto_real_to_str"
         } else {
@@ -3734,10 +3772,7 @@ impl<'ctx> CodeGen<'ctx> {
             .try_as_basic_value()
             .basic()
             .unwrap();
-        self.builder
-            .build_store(alloca, result)
-            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-        Ok(())
+        self.store_value(alloca, result, &target_ty, span)
     }
 
     /// Call the procedural value `callee` computes (`TFunc(p)(args)`),
@@ -3775,7 +3810,7 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<(), CodeGenError> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         self.set_debug_loc(span);
-        let (slot, _) = self.resolve_array_base(target, span)?;
+        let (slot, target_ty) = self.resolve_array_base(target, span)?;
         let val = self.compile_expr(&value.expr)?;
         let ptr = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
@@ -3865,8 +3900,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(err)?;
             text = out;
         }
-        self.builder.build_store(slot, text).map_err(err)?;
-        Ok(())
+        self.store_value(slot, text.into(), &target_ty, span)
     }
 
     fn compile_val(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
@@ -4439,7 +4473,10 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 call_args.push(address.into());
             } else {
-                let val = self.compile_expr(arg)?;
+                let val = match pinfo {
+                    Some((_, _, param_ty)) => self.compile_expr_for(arg, param_ty)?,
+                    None => self.compile_expr(arg)?,
+                };
                 let val = match pinfo {
                     Some((_, _, param_ty)) => self.convert_for_store(val, param_ty, span)?,
                     None => val,
