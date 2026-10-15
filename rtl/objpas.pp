@@ -34,7 +34,100 @@ type
     function ToString: AnsiString; virtual;
   end;
 
+  { Called with a runtime error's code before the program stops; SysUtils
+    raises the matching exception from it. }
+  TBrutoRunErrorHook = procedure(Code: LongInt);
+
+var
+  { The innermost exception frame (one per `try` being run). }
+  BrutoExcTop: Pointer;
+  { The exception being raised or handled. }
+  BrutoExcObject: TObject;
+  { The newest record of a running routine's string locals, which an
+    exception leaving it releases. }
+  BrutoCleanupTop: Pointer;
+  BrutoRunErrorHook: TBrutoRunErrorHook;
+
+{ Raise Obj: go back to the innermost `try`, or report it and stop. }
+procedure BrutoRaise(Obj: TObject; Address: Pointer);
+{ Free a handled exception. }
+procedure BrutoFreeException(Obj: TObject);
+
 implementation
+
+type
+  PBrutoExcFrame = ^TBrutoExcFrame;
+  TBrutoExcFrame = record
+    Buf: array[0..63] of Int64;
+    Prev: PBrutoExcFrame;
+    Cleanup: Pointer;
+  end;
+  { A routine's string locals: Count slot addresses follow. }
+  PBrutoCleanup = ^TBrutoCleanup;
+  TBrutoCleanup = record
+    Prev: PBrutoCleanup;
+    Count: PtrInt;
+  end;
+
+{$ifdef WINDOWS}
+procedure bruto_longjmp(Buf: Pointer; Value: LongInt); cdecl; external 'c' name 'longjmp';
+{$else}
+procedure bruto_longjmp(Buf: Pointer; Value: LongInt); cdecl; external 'c' name '_longjmp';
+{$endif}
+{$ifdef WINDOWS}
+function bruto_exc_write(Fd: LongInt; Buf: PChar; Count: LongWord): LongInt; cdecl;
+  external 'c' name '_write';
+{$else}
+function bruto_exc_write(Fd: LongInt; Buf: PChar; Count: PtrUInt): PtrInt; cdecl;
+  external 'c' name 'write';
+{$endif}
+function bruto_exc_fflush(Stream: Pointer): LongInt; cdecl; external 'c' name 'fflush';
+
+procedure BrutoUnhandled(Obj: TObject; Address: Pointer);
+var
+  Where, Report: AnsiString;
+begin
+  Where := '$' + HexStr(PtrUInt(Address), 16);
+  Report := 'An unhandled exception occurred at ' + Where + ':'#10 + Obj.ToString + #10 +
+    '  ' + Where + #10#10;
+  bruto_exc_fflush(nil);
+  bruto_exc_write(2, PChar(Report), Length(Report));
+  Halt(217);
+end;
+
+procedure BrutoRaise(Obj: TObject; Address: Pointer);
+var
+  Frame: PBrutoExcFrame;
+  Rec: PBrutoCleanup;
+  Slot: Pointer;
+  I: PtrInt;
+begin
+  Frame := BrutoExcTop;
+  BrutoExcObject := Obj;
+  if Frame = nil then
+    BrutoUnhandled(Obj, Address);
+  BrutoExcTop := Frame^.Prev;
+  { Release the strings of the routines being left. }
+  while BrutoCleanupTop <> Frame^.Cleanup do
+  begin
+    Rec := BrutoCleanupTop;
+    for I := 0 to Rec^.Count - 1 do
+    begin
+      Slot := PPointer(PtrUInt(Rec) + SizeOf(TBrutoCleanup) + PtrUInt(I) * SizeOf(Pointer))^;
+      bruto_astr_release(PPointer(Slot)^);
+      PPointer(Slot)^ := nil;
+    end;
+    BrutoCleanupTop := Rec^.Prev;
+  end;
+  bruto_longjmp(@Frame^.Buf, 1);
+end;
+
+procedure BrutoFreeException(Obj: TObject);
+begin
+  if BrutoExcObject = Obj then
+    BrutoExcObject := nil;
+  Obj.Free;
+end;
 
 type
   PBrutoClassHeader = ^TBrutoClassHeader;

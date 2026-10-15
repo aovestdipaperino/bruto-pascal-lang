@@ -449,6 +449,7 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
     let mut procs = Vec::new();
     let mut init_stmts = Vec::new();
     for unit in loaded {
+        program.uses_exceptions |= unit.uses_exceptions;
         consts.extend(unit.interface_consts);
         consts.extend(unit.impl_consts);
         types.extend(unit.interface_types);
@@ -669,6 +670,29 @@ fn collect_stmt_lines(stmt: &ast::Statement, lines: &mut HashSet<usize>) {
         }
         ast::Statement::Block(block) => {
             collect_block_lines(block, lines);
+        }
+        ast::Statement::Raise { span, .. } => insert_line(lines, *span),
+        ast::Statement::Try {
+            body,
+            handler,
+            span,
+        } => {
+            insert_line(lines, *span);
+            collect_block_lines(body, lines);
+            match handler {
+                ast::TryHandler::Except {
+                    handlers,
+                    otherwise,
+                } => {
+                    for h in handlers {
+                        collect_block_lines(&h.body, lines);
+                    }
+                    if let Some(b) = otherwise {
+                        collect_block_lines(b, lines);
+                    }
+                }
+                ast::TryHandler::Finally(b) => collect_block_lines(b, lines),
+            }
         }
     }
 }
@@ -3675,6 +3699,236 @@ end.
         let _ = std::fs::remove_file(&path);
         assert!(ok, "program failed: {out}");
         assert_eq!(out, "TRUE FALSE [  TRUE] [  FALSE]\nTRUE FALSE\n");
+    }
+
+    #[test]
+    fn exceptions_unwind_to_the_nearest_handler() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+type
+  EBoom = class
+    Code: Integer;
+    constructor Create(C: Integer);
+  end;
+constructor EBoom.Create(C: Integer); begin Code := C; end;
+
+procedure Deep(N: Integer);
+var S: String;
+begin
+  S := 'level';
+  if N = 0 then raise EBoom.Create(42);
+  Deep(N - 1);
+end;
+
+function Guarded(N: Integer): Integer;
+begin
+  Result := -1;
+  try
+    if N > 5 then Exit(N * 2);
+    Deep(N);
+    Result := 0;
+  finally
+    writeln('finally ', N);
+  end;
+end;
+
+var I, Total, Changed: Integer;
+begin
+  Changed := 0;
+  try
+    Changed := 1;
+    Deep(3);
+    writeln('not reached');
+  except
+    on E: EBoom do writeln('caught ', E.Code, ' ', Changed);
+  end;
+  writeln(Guarded(10));
+  try
+    writeln(Guarded(2));
+  except
+    writeln('outer caught');
+  end;
+  Total := 0;
+  for I := 1 to 5 do
+    try
+      if I = 2 then Continue;
+      if I = 4 then Break;
+      Total := Total + I;
+    finally
+      write('[', I, ']');
+    end;
+  writeln(' total ', Total);
+  try
+    try
+      raise EBoom.Create(7);
+    except
+      on E: EBoom do
+      begin
+        writeln('inner ', E.Code);
+        raise;
+      end;
+    end;
+  except
+    on E: TObject do writeln('again ', E.ClassName);
+  end;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "caught 42 1\nfinally 10\n20\nfinally 2\nouter caught\n[1][2][3][4] total 4\n\
+             inner 7\nagain EBoom\n"
+        );
+    }
+
+    #[test]
+    fn sysutils_exceptions() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses SysUtils;
+type
+  TA = class end;
+  TB = class(TA) end;
+  EApp = class(Exception)
+    Detail: String;
+  end;
+  TRes = class
+    Name: String;
+    constructor Create(const AName: String; ShouldFail: Boolean);
+    destructor Destroy; override;
+  end;
+
+constructor TRes.Create(const AName: String; ShouldFail: Boolean);
+begin
+  Name := AName;
+  if ShouldFail then raise Exception.Create('cannot create ' + AName);
+end;
+
+destructor TRes.Destroy;
+begin
+  writeln('destroying ', Name);
+  inherited Destroy;
+end;
+
+function Risky(I: Integer): String;
+var S: String; E: EApp;
+begin
+  S := 'value ' + IntToStr(I);
+  if I mod 3 = 0 then
+  begin
+    E := EApp.Create('bad ' + S);
+    E.Detail := S + S;
+    raise E;
+  end;
+  Result := S;
+end;
+
+function Count(N: Integer): Integer;
+var I: Integer; S: String;
+begin
+  Result := 0;
+  for I := 1 to N do
+    try
+      S := Risky(I);
+    except
+      on E: EApp do Inc(Result);
+    end;
+end;
+
+var
+  A: TA;
+  R: TRes;
+  H: TFPCHeapStatus;
+  Before: PtrUInt;
+begin
+  try
+    StrToInt('12x');
+  except
+    on E: EConvertError do writeln(E.ToString);
+  end;
+  A := TA.Create;
+  try
+    writeln((A as TB).ClassName);
+  except
+    on E: EInvalidCast do writeln(E.ClassName, ': ', E.Message);
+  end;
+  A.Free;
+  try
+    try
+      Abort;
+    finally
+      try
+        raise EApp.Create('inside finally');
+      except
+        on E: Exception do writeln('handled ', E.Message);
+      end;
+    end;
+  except
+    on E: EAbort do writeln('abort: ', E.Message);
+  end;
+  try
+    raise EApp.CreateFmt('%d items, %s', [3, 'ok']);
+  except
+    on E: Exception do writeln(E.Message);
+  end;
+  R := nil;
+  try
+    R := TRes.Create('a', True);
+  except
+    on E: Exception do writeln(E.Message, ' ', R = nil);
+  end;
+  H := GetFPCHeapStatus;
+  Before := H.CurrHeapUsed;
+  writeln(Count(30000));
+  H := GetFPCHeapStatus;
+  {$ifdef DARWIN}
+  writeln(H.CurrHeapUsed - Before < 50000);
+  {$else}
+  writeln(TRUE);
+  {$endif}
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "EConvertError: \"12x\" is an invalid integer\nEInvalidCast: Invalid type cast\n\
+             handled inside finally\nabort: Operation aborted\n3 items, ok\n\
+             destroying a\ncannot create a TRUE\n10000\nTRUE\n"
+        );
+    }
+
+    #[test]
+    fn an_unhandled_exception_stops_the_program() {
+        let result = MiniPascal
+            .build(
+                "program T;
+uses SysUtils;
+begin
+  writeln('before');
+  raise EConvertError.Create('boom');
+  writeln('after');
+end.
+",
+            )
+            .expect("build failed");
+        let run = std::process::Command::new(&result.exe_path)
+            .output()
+            .expect("run failed");
+        let _ = std::fs::remove_file(&result.exe_path);
+        let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
+        let _ = std::fs::remove_file(&result.source_path);
+        let _ = std::fs::remove_file(&result.console_capture_path);
+        let stdout = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&run.stderr).replace("\r\n", "\n");
+        assert_eq!(run.status.code(), Some(217), "{stdout}{stderr}");
+        assert_eq!(stdout, "before\n");
+        assert!(
+            stderr.starts_with("An unhandled exception occurred at $"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(":\nEConvertError: boom\n  $"), "{stderr}");
     }
 
     #[test]

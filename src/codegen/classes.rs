@@ -269,7 +269,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// `bruto_class_is(Obj, VMT)`: whether the instance `Obj` (or nil) is
     /// of the class with that VMT or a descendant. Walks the parent links.
-    fn class_is_fn(&self) -> FunctionValue<'ctx> {
+    pub(super) fn class_is_fn(&self) -> FunctionValue<'ctx> {
         if let Some(f) = self.module.get_function("bruto_class_is") {
             return f;
         }
@@ -671,6 +671,13 @@ impl<'ctx> CodeGen<'ctx> {
                 call: d(call)?,
                 span: *span,
             },
+            Statement::Raise {
+                exception: Some(e),
+                span,
+            } => Statement::Raise {
+                exception: Some(d(e)?),
+                span: *span,
+            },
             _ => return Ok(None),
         }))
     }
@@ -811,6 +818,30 @@ impl<'ctx> CodeGen<'ctx> {
                 Expr::Index {
                     array: b(array)?,
                     index: b(index)?,
+                    span: *span,
+                }
+            }
+            // `EFoo.CreateFmt(Fmt, [Args])`: `Create(Format(Fmt, [Args]))`
+            // (Format is built in, so it needs its values written out).
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                span,
+            } if method == "createfmt"
+                && args.len() == 2
+                && self
+                    .class_receiver(object)
+                    .is_some_and(|c| !self.objects[&c].methods.contains_key("createfmt")) =>
+            {
+                Expr::MethodCall {
+                    object: Box::new(self.dx_receiver(object)?),
+                    method: "create".into(),
+                    args: vec![Expr::Call {
+                        name: "format".into(),
+                        args: args.iter().map(d).collect::<Result<_, _>>()?,
+                        span: *span,
+                    }],
                     span: *span,
                 }
             }

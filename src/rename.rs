@@ -285,6 +285,32 @@ fn rewrite_stmts<R: Rename>(stmts: &mut [Statement], n: &R) {
 fn rewrite_stmt<R: Rename>(s: &mut Statement, n: &R) {
     n.rewrite_stmt_node(s);
     match s {
+        Statement::Try { body, handler, .. } => {
+            rewrite_block(body, n);
+            match handler {
+                TryHandler::Except {
+                    handlers,
+                    otherwise,
+                } => {
+                    for h in handlers {
+                        if let Some(var) = &mut h.var {
+                            *var = n.rename(var);
+                        }
+                        h.class = n.rename(&h.class);
+                        rewrite_block(&mut h.body, n);
+                    }
+                    if let Some(b) = otherwise {
+                        rewrite_block(b, n);
+                    }
+                }
+                TryHandler::Finally(b) => rewrite_block(b, n),
+            }
+        }
+        Statement::Raise { exception, .. } => {
+            if let Some(e) = exception {
+                rewrite_expr(e, n);
+            }
+        }
         Statement::IndirectCall { call, .. } => rewrite_expr(call, n),
         Statement::Str { value, target, .. } => {
             rewrite_expr(&mut value.expr, n);

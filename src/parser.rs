@@ -1216,6 +1216,13 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// Whether the source has `try` or `raise`.
+    fn uses_exceptions(&self) -> bool {
+        self.tokens.iter().any(|(t, _)| {
+            matches!(t, Tok::Ident(w) if w.eq_ignore_ascii_case("try") || w.eq_ignore_ascii_case("raise"))
+        })
+    }
+
     pub fn new(source: &str) -> Self {
         Self::with_options(source, &ParseOptions::default())
     }
@@ -1371,6 +1378,7 @@ impl Parser {
             procedures: decls.procedures,
             body,
             span,
+            uses_exceptions: self.uses_exceptions(),
         })
     }
 
@@ -1539,6 +1547,7 @@ impl Parser {
             procedures,
             init,
             span,
+            uses_exceptions: self.uses_exceptions(),
         })
     }
 
@@ -2711,6 +2720,174 @@ impl Parser {
 
     // ── statement ────────────────────────────────────────
 
+    /// Whether the next token is `word` (`try`, `raise`) starting a
+    /// statement, rather than a variable of that name being assigned.
+    fn at_word_statement(&self, current: &str, word: &str) -> bool {
+        current.eq_ignore_ascii_case(word)
+            && !matches!(
+                self.tokens.get(self.pos + 1),
+                Some((Tok::Assign | Tok::Dot | Tok::LBracket | Tok::Caret, _))
+            )
+    }
+
+    /// Whether the next token ends a section of a `try` statement:
+    /// `except` or `finally`.
+    fn at_try_section_end(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(w)
+            if w.eq_ignore_ascii_case("except") || w.eq_ignore_ascii_case("finally"))
+    }
+
+    /// Statements separated by semicolons, up to (not including) a token
+    /// for which `stop` holds.
+    fn parse_statements_until(
+        &mut self,
+        stop: impl Fn(&Self) -> bool,
+    ) -> Result<Vec<Statement>, ParseError> {
+        let mut statements = Vec::new();
+        loop {
+            if stop(self) {
+                break;
+            }
+            let stmt = self.parse_statement()?;
+            let is_label = matches!(&stmt, Statement::Label { .. });
+            statements.push(stmt);
+            if is_label && !stop(self) && *self.peek() != Tok::Semi {
+                continue;
+            }
+            if *self.peek() == Tok::Semi {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(statements)
+    }
+
+    /// `try S... except [on [E:] T do S; ...] [else S...] end`, or
+    /// `try S... finally S... end`.
+    fn parse_try(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        self.advance();
+        let body_statements = self.parse_statements_until(|p| p.at_try_section_end())?;
+        let body = Block {
+            statements: body_statements,
+            span,
+            end_span: self.span(),
+        };
+        let is_finally = matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("finally"));
+        if !self.at_try_section_end() {
+            return Err(ParseError {
+                message: format!("expected 'except' or 'finally', found {}", self.peek()),
+                span: self.span(),
+            });
+        }
+        let section_span = self.span();
+        self.advance();
+        let at_end = |p: &Self| *p.peek() == Tok::End;
+        let handler = if is_finally {
+            let statements = self.parse_statements_until(at_end)?;
+            TryHandler::Finally(Block {
+                statements,
+                span: section_span,
+                end_span: self.span(),
+            })
+        } else if self.at_on_handler() {
+            let mut handlers = Vec::new();
+            let mut otherwise = None;
+            while self.at_on_handler() {
+                let hspan = self.span();
+                self.advance();
+                let (first, _) = self.expect_ident()?;
+                let (var, class) = if *self.peek() == Tok::Colon {
+                    self.advance();
+                    let (class, _) = self.expect_ident()?;
+                    (Some(first), class)
+                } else {
+                    (None, first)
+                };
+                self.expect(&Tok::Do)?;
+                let stmt = self.parse_statement()?;
+                handlers.push(ExceptHandler {
+                    var,
+                    class,
+                    body: Block {
+                        statements: vec![stmt],
+                        span: hspan,
+                        end_span: self.span(),
+                    },
+                    span: hspan,
+                });
+                if *self.peek() == Tok::Semi {
+                    self.advance();
+                }
+            }
+            if *self.peek() == Tok::Else {
+                let espan = self.span();
+                self.advance();
+                let statements = self.parse_statements_until(at_end)?;
+                otherwise = Some(Block {
+                    statements,
+                    span: espan,
+                    end_span: self.span(),
+                });
+            }
+            TryHandler::Except {
+                handlers,
+                otherwise,
+            }
+        } else {
+            let statements = self.parse_statements_until(at_end)?;
+            TryHandler::Except {
+                handlers: Vec::new(),
+                otherwise: Some(Block {
+                    statements,
+                    span: section_span,
+                    end_span: self.span(),
+                }),
+            }
+        };
+        self.expect(&Tok::End)?;
+        Ok(Statement::Try {
+            body,
+            handler,
+            span,
+        })
+    }
+
+    /// `on Name: Class do` / `on Class do` in an `except` section.
+    fn at_on_handler(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("on"))
+            && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
+            && matches!(
+                self.tokens.get(self.pos + 2),
+                Some((Tok::Colon | Tok::Do, _))
+            )
+    }
+
+    /// `raise [Expr [at Address]]`.
+    fn parse_raise(&mut self) -> Result<Statement, ParseError> {
+        let span = self.span();
+        self.advance();
+        if matches!(self.peek(), Tok::Semi | Tok::End | Tok::Else | Tok::Until)
+            || self.at_try_section_end()
+        {
+            return Ok(Statement::Raise {
+                exception: None,
+                span,
+            });
+        }
+        let exception = self.parse_expr()?;
+        // `at Address`: where the exception is reported; ignored.
+        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("at")) {
+            self.advance();
+            self.parse_expr()?;
+        }
+        Ok(Statement::Raise {
+            exception: Some(exception),
+            span,
+        })
+    }
+
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         // Check for label: N: statement
         if let Tok::IntLit(n) = self.peek().clone()
@@ -2735,7 +2912,9 @@ impl Parser {
         }
 
         // An empty statement: `while Busy do;`, `begin ; end`.
-        if matches!(self.peek(), Tok::Semi | Tok::End | Tok::Else | Tok::Until) {
+        if matches!(self.peek(), Tok::Semi | Tok::End | Tok::Else | Tok::Until)
+            || self.at_try_section_end()
+        {
             let span = self.span();
             return Ok(Statement::Block(Block {
                 statements: Vec::new(),
@@ -2785,6 +2964,8 @@ impl Parser {
                 }
             }
             Tok::Ident(_) if self.at_flow_statement() => self.parse_flow_statement(),
+            Tok::Ident(w) if self.at_word_statement(w, "try") => self.parse_try(),
+            Tok::Ident(w) if self.at_word_statement(w, "raise") => self.parse_raise(),
             Tok::KwInherited => {
                 let span = self.span();
                 self.advance();

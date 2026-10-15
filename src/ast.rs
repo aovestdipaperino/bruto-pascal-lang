@@ -49,6 +49,9 @@ pub struct Program {
     pub procedures: Vec<ProcDecl>,
     pub body: Block,
     pub span: Span,
+    /// Whether the program (or a unit it uses) raises or handles
+    /// exceptions, so it needs the exception runtime in `rtl/objpas.pp`.
+    pub uses_exceptions: bool,
 }
 
 /// A unit module: `unit Name; interface ... implementation ... end.`
@@ -74,6 +77,8 @@ pub struct Unit {
     pub procedures: Vec<ProcDecl>,
     pub init: Option<Block>,
     pub span: Span,
+    /// Whether the unit raises or handles exceptions.
+    pub uses_exceptions: bool,
 }
 
 /// Type alias declaration: `type Name = T;`
@@ -672,6 +677,42 @@ pub enum Statement {
         expr: Expr,
         span: Span,
     },
+    /// `try ... except ... end` or `try ... finally ... end`.
+    Try {
+        body: Block,
+        handler: TryHandler,
+        span: Span,
+    },
+    /// `raise Obj [at Address]`, or a bare `raise` (in an exception
+    /// handler: raise the exception being handled again).
+    Raise {
+        exception: Option<Expr>,
+        span: Span,
+    },
+}
+
+/// What follows a `try` block.
+#[derive(Debug, Clone)]
+pub enum TryHandler {
+    /// `except`: `on [Name:] Class do Statement` handlers, tried in
+    /// order, then `else` statements. With no handlers, the statements
+    /// after `except` (in `otherwise`) handle every exception.
+    Except {
+        handlers: Vec<ExceptHandler>,
+        otherwise: Option<Block>,
+    },
+    /// `finally`: statements run however the `try` block is left.
+    Finally(Block),
+}
+
+/// `on [Name:] Class do Statement` in an `except` section.
+#[derive(Debug, Clone)]
+pub struct ExceptHandler {
+    /// The name the exception object is given in `body`.
+    pub var: Option<String>,
+    pub class: String,
+    pub body: Block,
+    pub span: Span,
 }
 
 /// A single write/writeln argument with optional formatting: `expr[:width[:precision]]`.
@@ -721,7 +762,9 @@ impl Statement {
             | Self::Inherited { span, .. }
             | Self::Break { span }
             | Self::Continue { span }
-            | Self::ChainedAssignment { span, .. } => *span,
+            | Self::ChainedAssignment { span, .. }
+            | Self::Try { span, .. }
+            | Self::Raise { span, .. } => *span,
             Self::Block(b) => b.span,
         }
     }

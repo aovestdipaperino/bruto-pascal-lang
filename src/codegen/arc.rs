@@ -237,6 +237,19 @@ pub(super) fn contains_label(stmt: &Statement) -> bool {
         | Statement::ForIn { body, .. }
         | Statement::With { body, .. } => block_has_label(body),
         Statement::RepeatUntil { body, .. } => body.iter().any(contains_label),
+        Statement::Try { body, handler, .. } => {
+            block_has_label(body)
+                || match handler {
+                    TryHandler::Except {
+                        handlers,
+                        otherwise,
+                    } => {
+                        handlers.iter().any(|h| block_has_label(&h.body))
+                            || otherwise.as_ref().is_some_and(block_has_label)
+                    }
+                    TryHandler::Finally(b) => block_has_label(b),
+                }
+        }
         Statement::Case {
             branches,
             else_branch,

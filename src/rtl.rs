@@ -82,10 +82,11 @@ pub(crate) fn add_system_prelude(program: &mut Program) -> Result<(), String> {
 /// Add the string routines (`rtl/brutostrings.pp`), and for a program
 /// that declares classes, `TObject` (`rtl/objpas.pp`).
 pub(crate) fn add_string_runtime(program: &mut Program) -> Result<(), String> {
-    let has_classes = program
-        .type_decls
-        .iter()
-        .any(|t| matches!(&t.ty, PascalType::Object(o) if o.is_class));
+    let has_classes = program.uses_exceptions
+        || program
+            .type_decls
+            .iter()
+            .any(|t| matches!(&t.ty, PascalType::Object(o) if o.is_class));
     if has_classes {
         // A program with a TObject of its own (Free Vision's object type)
         // gets the root class as BrutoTObject.

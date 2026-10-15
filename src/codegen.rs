@@ -25,6 +25,7 @@ use std::path::Path;
 mod arc;
 mod classes;
 mod closures;
+mod exceptions;
 mod forin;
 mod layout;
 mod objects;
@@ -141,6 +142,12 @@ pub struct CodeGen<'ctx> {
     // Reset on entry to each routine: a nested procedure can't break out
     // of its parent's loop.
     loop_targets: Vec<(BasicBlock<'ctx>, BasicBlock<'ctx>)>,
+    // The `try` blocks being compiled in the current routine, innermost
+    // last.
+    try_stack: Vec<exceptions::TryContext<'ctx>>,
+    // Slots holding the exceptions being handled, innermost last (for a
+    // bare `raise`).
+    handled_exceptions: Vec<PointerValue<'ctx>>,
     /// Hidden locals made so far (for `for-in` loops), for unique names.
     hidden_count: u32,
     /// The hidden locals of the `for-in` loop being compiled, released
@@ -180,6 +187,9 @@ pub struct CodeGen<'ctx> {
     has_classes: bool,
     // Classes whose instance cleanup routines still need bodies.
     class_cleanups: Vec<String>,
+    // Runtime error functions whose bodies are still to be written:
+    // name, code, description.
+    runtime_error_stubs: std::cell::RefCell<Vec<(String, u32, String)>>,
     current_object: Option<String>,
     method_context: Option<objects::MethodContext<'ctx>>,
     // Each routine's dummy slot for `end`-line breakpoint markers.
@@ -270,6 +280,8 @@ impl<'ctx> CodeGen<'ctx> {
             current_scope: None,
             label_blocks: HashMap::new(),
             loop_targets: Vec::new(),
+            try_stack: Vec::new(),
+            handled_exceptions: Vec::new(),
             hidden_count: 0,
             for_in_locals: Vec::new(),
             prof_skip: false,
@@ -282,6 +294,7 @@ impl<'ctx> CodeGen<'ctx> {
             objects: HashMap::new(),
             has_classes: false,
             class_cleanups: Vec::new(),
+            runtime_error_stubs: std::cell::RefCell::new(Vec::new()),
             with_objects: Vec::new(),
             with_classes: Vec::new(),
             bypass_user: false,
@@ -705,6 +718,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.in_runtime = false;
         self.emit_class_cleanups()?;
+        self.emit_runtime_error_stubs()?;
         self.di_builder.finalize();
 
         // A debugging aid: `BRUTO_DUMP_IR=file` writes the module's IR.
@@ -2096,12 +2110,59 @@ impl<'ctx> CodeGen<'ctx> {
         // only now, after the nested procedures, which install their own.
         let saved_exit = self.begin_exit_block(func);
         let saved_loops = std::mem::take(&mut self.loop_targets);
+        let saved_tries = std::mem::take(&mut self.try_stack);
+        let saved_handled = std::mem::take(&mut self.handled_exceptions);
         let saved_function = std::mem::replace(
             &mut self.current_function,
             return_type.as_ref().map(|_| proc.name.clone()),
         );
+        // The string locals an exception would skip releasing.
+        let mut string_slots = Vec::new();
+        if self.arc && !self.in_runtime {
+            let mut names: Vec<String> = proc
+                .vars
+                .iter()
+                .flat_map(|v| v.names.iter().cloned())
+                .collect();
+            names.extend(
+                param_info
+                    .iter()
+                    .filter(|(_, mode, _)| *mode == ParamMode::Value)
+                    .map(|(name, _, _)| name.clone()),
+            );
+            if return_type.is_some() {
+                names.push(proc.name.clone());
+            }
+            for name in names {
+                if let (Some(&slot), Some(ty)) =
+                    (self.variables.get(&name), self.var_types.get(&name))
+                    && matches!(
+                        self.resolve_type(ty),
+                        PascalType::String | PascalType::UnicodeString
+                    )
+                    && !string_slots.contains(&slot)
+                {
+                    string_slots.push(slot);
+                }
+            }
+        }
+        // A class's constructor that raises destroys the instance it made.
+        let constructor_frame = match &method {
+            Some((owner, _)) if is_constructor && self.objects[owner].is_class => {
+                let self_param = func.get_nth_param(0).unwrap().into_pointer_value();
+                self.guard_constructor(owner, self_param, proc.span)?
+            }
+            _ => None,
+        };
+        let cleanup_record = self.push_cleanup_record(&string_slots, proc.span)?;
         self.compile_block(&proc.body)?;
         self.enter_exit_block(proc.body.end_span)?;
+        if let Some(rec) = cleanup_record {
+            self.pop_cleanup_record(rec, proc.body.end_span)?;
+        }
+        if let Some(frame) = constructor_frame {
+            self.pop_frame(frame, proc.body.end_span)?;
+        }
 
         // Release the strings held by locals and value parameters.
         if self.arc && !self.in_runtime {
@@ -2185,6 +2246,8 @@ impl<'ctx> CodeGen<'ctx> {
         }
         self.exit_block = saved_exit;
         self.loop_targets = saved_loops;
+        self.try_stack = saved_tries;
+        self.handled_exceptions = saved_handled;
         self.current_function = saved_function;
         self.current_object = saved_object;
         self.method_context = saved_method_context;
@@ -3129,6 +3192,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let (_, after) = *self.loop_targets.last().ok_or_else(|| {
                     CodeGenError::new("'break' is only allowed inside a loop", Some(*span))
                 })?;
+                self.leave_try_blocks(Some(self.loop_targets.len()), *span)?;
                 self.jump_to(after, "after_break", *span)
             }
             Statement::Continue { span } => {
@@ -3136,6 +3200,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let (next, _) = *self.loop_targets.last().ok_or_else(|| {
                     CodeGenError::new("'continue' is only allowed inside a loop", Some(*span))
                 })?;
+                self.leave_try_blocks(Some(self.loop_targets.len()), *span)?;
                 self.jump_to(next, "after_continue", *span)
             }
             Statement::Exit { value, span } => {
@@ -3156,6 +3221,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let exit = self
                     .exit_block
                     .ok_or_else(|| CodeGenError::new("'exit' outside a routine", Some(*span)))?;
+                self.leave_try_blocks(None, *span)?;
                 self.jump_to(exit, "after_exit", *span)
             }
             Statement::Goto { label, span } => {
@@ -3172,6 +3238,12 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(())
             }
             Statement::With { target, body, span } => self.compile_with(target, body, *span),
+            Statement::Try {
+                body,
+                handler,
+                span,
+            } => self.compile_try(body, handler, *span),
+            Statement::Raise { exception, span } => self.compile_raise(exception.as_ref(), *span),
             Statement::ChainedAssignment {
                 target,
                 chain,
@@ -9249,6 +9321,28 @@ fn collect_captures_stmt(
         }
     };
     match stmt {
+        Statement::Try { body, handler, .. } => {
+            collect_captures(body, locals, parent_types, out, seen);
+            match handler {
+                TryHandler::Except {
+                    handlers,
+                    otherwise,
+                } => {
+                    for h in handlers {
+                        collect_captures(&h.body, locals, parent_types, out, seen);
+                    }
+                    if let Some(b) = otherwise {
+                        collect_captures(b, locals, parent_types, out, seen);
+                    }
+                }
+                TryHandler::Finally(b) => collect_captures(b, locals, parent_types, out, seen),
+            }
+        }
+        Statement::Raise { exception, .. } => {
+            if let Some(e) = exception {
+                collect_captures_expr(e, locals, parent_types, out, seen);
+            }
+        }
         Statement::Assignment { target, expr, .. }
         | Statement::DerefAssignment { target, expr, .. } => {
             record(target, out, seen);

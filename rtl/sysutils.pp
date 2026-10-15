@@ -6,6 +6,60 @@ interface
 
 uses UnixType;
 
+type
+  { The root of FPC's exception classes. }
+  Exception = class(TObject)
+  private
+    FMessage: string;
+    FHelpContext: LongInt;
+  public
+    constructor Create(const Msg: string);
+    constructor CreateHelp(const Msg: string; AHelpContext: LongInt);
+    { The class name and the message: `EConvertError: ...`. }
+    function ToString: string; override;
+    property Message: string read FMessage write FMessage;
+    property HelpContext: LongInt read FHelpContext write FHelpContext;
+  end;
+  ExceptClass = class of Exception;
+
+  EAbort = class(Exception);
+  EExternal = class(Exception);
+  EIntError = class(EExternal);
+  EDivByZero = class(EIntError);
+  ERangeError = class(EIntError);
+  EIntOverflow = class(EIntError);
+  EMathError = class(EExternal);
+  EInvalidOp = class(EMathError);
+  EZeroDivide = class(EMathError);
+  EOverflow = class(EMathError);
+  EUnderflow = class(EMathError);
+  EAccessViolation = class(EExternal);
+  EInOutError = class(Exception)
+  public
+    ErrorCode: LongInt;
+  end;
+  EHeapMemoryError = class(Exception);
+  EOutOfMemory = class(EHeapMemoryError);
+  EInvalidPointer = class(EHeapMemoryError);
+  EInvalidCast = class(Exception);
+  EConvertError = class(Exception);
+  EAbstractError = class(Exception);
+  EAssertionFailed = class(Exception);
+  EOSError = class(Exception)
+  public
+    ErrorCode: LongInt;
+  end;
+  EArgumentException = class(Exception);
+  EArgumentOutOfRangeException = class(EArgumentException);
+  EArgumentNilException = class(EArgumentException);
+  ENotImplemented = class(Exception);
+  ENotSupportedException = class(Exception);
+
+{ Raise EAbort, the exception that is handled without a message. }
+procedure Abort;
+{ The exception being handled, in an exception handler. }
+function ExceptObject: TObject;
+
 function IntToStr(Value: Int64): string;
 function IntToHex(Value: Int64; Digits: Integer): string;
 function StrToInt(const S: string): Int64;
@@ -62,8 +116,14 @@ begin
 end;
 
 function StrToInt(const S: string): Int64;
+var
+  V: Int64;
+  Code: Integer;
 begin
-  StrToInt := StrToIntDef(S, 0);
+  Val(Trim(S), V, Code);
+  if Code <> 0 then
+    raise EConvertError.Create('"' + S + '" is an invalid integer');
+  StrToInt := V;
 end;
 
 function UpperCase(const S: string): string;
@@ -212,4 +272,52 @@ begin
   end;
 end;
 
+constructor Exception.Create(const Msg: string);
+begin
+  inherited Create;
+  FMessage := Msg;
+end;
+
+constructor Exception.CreateHelp(const Msg: string; AHelpContext: LongInt);
+begin
+  inherited Create;
+  FMessage := Msg;
+  FHelpContext := AHelpContext;
+end;
+
+function Exception.ToString: string;
+begin
+  Result := ClassName + ': ' + FMessage;
+end;
+
+procedure Abort;
+begin
+  raise EAbort.Create('Operation aborted');
+end;
+
+function ExceptObject: TObject;
+begin
+  ExceptObject := BrutoExcObject;
+end;
+
+{ Runtime errors become exceptions, as with FPC's SysUtils. }
+procedure BrutoRunErrorToException(Code: LongInt);
+begin
+  case Code of
+    200: raise EDivByZero.Create('Division by zero');
+    201: raise ERangeError.Create('Range check error');
+    203: raise EOutOfMemory.Create('Out of memory');
+    204: raise EInvalidPointer.Create('Invalid pointer operation');
+    205: raise EOverflow.Create('Floating point overflow');
+    207: raise EInvalidOp.Create('Invalid floating point operation');
+    210: raise EAbstractError.Create('Abstract method called');
+    211: raise EAbstractError.Create('Abstract method called');
+    215: raise EIntOverflow.Create('Arithmetic overflow');
+    216: raise EAccessViolation.Create('Access violation');
+    219: raise EInvalidCast.Create('Invalid type cast');
+  end;
+end;
+
+initialization
+  BrutoRunErrorHook := @BrutoRunErrorToException;
 end.

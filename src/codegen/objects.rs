@@ -124,6 +124,16 @@ impl<'ctx> CodeGen<'ctx> {
             .find(|r| self.objects.get(*r).is_some_and(|o| o.is_class));
         let parent_name = match (&decl.parent, root) {
             (None, Some(root)) if decl.is_class => Some(root.to_string()),
+            // `class(TObject)` where TObject is the program's own object
+            // type (Free Vision's): in FPC the unit declaring the class
+            // sees System's TObject.
+            (Some(p), Some(root))
+                if decl.is_class
+                    && p == "tobject"
+                    && self.objects.get(p).is_some_and(|o| !o.is_class) =>
+            {
+                Some(root.to_string())
+            }
             (other, _) => other.clone(),
         };
         let parent = match &parent_name {
@@ -409,7 +419,9 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// A function that reports runtime error `code` and stops the
-    /// program, as FPC does.
+    /// program, as FPC does (or, with SysUtils, raises the matching
+    /// exception). Its body is written at the end of compilation, once
+    /// the program's globals exist (see `emit_runtime_error_stubs`).
     pub(super) fn runtime_error_fn(&self, code: u32, what: &str) -> FunctionValue<'ctx> {
         let name = if code == 211 {
             "bruto_abstract_error".to_string()
@@ -424,44 +436,66 @@ impl<'ctx> CodeGen<'ctx> {
             .module
             .add_function(&name, void_ty.fn_type(&[], false), None);
         f.set_linkage(Linkage::Internal);
-        let builder = self.context.create_builder();
-        let entry = self.context.append_basic_block(f, "entry");
-        builder.position_at_end(entry);
-        let i32_ty = self.context.i32_type();
-        let i64_ty = self.context.i64_type();
-        let ptr = self.context.ptr_type(AddressSpace::default());
-        let message = format!("Runtime error {code}: {what}\n");
-        let text = builder
-            .build_global_string_ptr(&message, "runtime_error_msg")
-            .unwrap()
-            .as_pointer_value();
-        let write = self.module.get_function("write").unwrap_or_else(|| {
-            self.module.add_function(
-                "write",
-                i64_ty.fn_type(&[i32_ty.into(), ptr.into(), i64_ty.into()], false),
-                None,
-            )
-        });
-        builder
-            .build_call(
-                write,
-                &[
-                    i32_ty.const_int(2, false).into(),
-                    text.into(),
-                    i64_ty.const_int(message.len() as u64, false).into(),
-                ],
-                "",
-            )
-            .unwrap();
-        let exit = self.module.get_function("exit").unwrap_or_else(|| {
-            self.module
-                .add_function("exit", void_ty.fn_type(&[i32_ty.into()], false), None)
-        });
-        builder
-            .build_call(exit, &[i32_ty.const_int(code as u64, false).into()], "")
-            .unwrap();
-        builder.build_unreachable().unwrap();
+        self.runtime_error_stubs
+            .borrow_mut()
+            .push((name, code, what.to_string()));
         f
+    }
+
+    /// Write the bodies of the functions `runtime_error_fn` made.
+    pub(super) fn emit_runtime_error_stubs(&mut self) -> Result<(), CodeGenError> {
+        let saved_block = self.builder.get_insert_block();
+        let saved_fn = self.current_fn;
+        let stubs = std::mem::take(&mut *self.runtime_error_stubs.borrow_mut());
+        for (name, code, what) in stubs {
+            let f = self.module.get_function(&name).unwrap();
+            let entry = self.context.append_basic_block(f, "entry");
+            self.builder.position_at_end(entry);
+            self.builder.unset_current_debug_location();
+            self.current_fn = Some(f);
+            let i32_ty = self.context.i32_type();
+            let i64_ty = self.context.i64_type();
+            let ptr = self.context.ptr_type(AddressSpace::default());
+            let void_ty = self.context.void_type();
+            self.call_run_error_hook(i32_ty.const_int(code as u64, false), Span::default())?;
+            let message = format!("Runtime error {code}: {what}\n");
+            let text = self
+                .builder
+                .build_global_string_ptr(&message, "runtime_error_msg")
+                .unwrap()
+                .as_pointer_value();
+            let write = self.module.get_function("write").unwrap_or_else(|| {
+                self.module.add_function(
+                    "write",
+                    i64_ty.fn_type(&[i32_ty.into(), ptr.into(), i64_ty.into()], false),
+                    None,
+                )
+            });
+            self.builder
+                .build_call(
+                    write,
+                    &[
+                        i32_ty.const_int(2, false).into(),
+                        text.into(),
+                        i64_ty.const_int(message.len() as u64, false).into(),
+                    ],
+                    "",
+                )
+                .unwrap();
+            let exit = self.module.get_function("exit").unwrap_or_else(|| {
+                self.module
+                    .add_function("exit", void_ty.fn_type(&[i32_ty.into()], false), None)
+            });
+            self.builder
+                .build_call(exit, &[i32_ty.const_int(code as u64, false).into()], "")
+                .unwrap();
+            self.builder.build_unreachable().unwrap();
+        }
+        self.current_fn = saved_fn;
+        if let Some(block) = saved_block {
+            self.builder.position_at_end(block);
+        }
+        Ok(())
     }
 
     /// The object type a record type was lowered from, if any.
