@@ -15,6 +15,7 @@ use crate::ast::*;
 use inkwell::AddressSpace;
 use inkwell::module::Linkage;
 use inkwell::types::{BasicMetadataTypeEnum, BasicType};
+use inkwell::values::BasicValue;
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
 
 impl<'ctx> CodeGen<'ctx> {
@@ -32,6 +33,7 @@ impl<'ctx> CodeGen<'ctx> {
             params,
             return_type,
             nested,
+            of_object,
         } = self.resolve_type(proc_ty)
         else {
             return Err(CodeGenError::new(
@@ -48,13 +50,40 @@ impl<'ctx> CodeGen<'ctx> {
         let ptr = self.context.ptr_type(AddressSpace::default());
         let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::new();
         let mut call_args: Vec<BasicMetadataValueEnum> = Vec::new();
+        // A method pointer (`target` is its slot): `Code(Data, args...)`.
+        let mut method_code = None;
+        if of_object {
+            let pair = self.method_pointer_type();
+            let code_addr = self
+                .builder
+                .build_struct_gep(pair, target, 0, "code_addr")
+                .map_err(err)?;
+            let data_addr = self
+                .builder
+                .build_struct_gep(pair, target, 1, "data_addr")
+                .map_err(err)?;
+            let code = self
+                .builder
+                .build_load(ptr, code_addr, "code")
+                .map_err(err)?
+                .into_pointer_value();
+            let data = self
+                .builder
+                .build_load(ptr, data_addr, "data")
+                .map_err(err)?;
+            param_types.push(ptr.into());
+            call_args.push(data.into());
+            method_code = Some(code);
+        }
         for (param, arg) in params.iter().zip(args) {
             let param = self.resolve_type(param);
             param_types.push(self.abi_type_for(&param).into());
             let val = self.compile_expr(arg)?;
             call_args.push(self.convert_for_store(val, &param, span)?.into());
         }
-        let code = if nested {
+        let code = if let Some(code) = method_code {
+            code
+        } else if nested {
             // Unpack the closure: the trampoline, and its environment last.
             let code = self
                 .builder
@@ -241,5 +270,168 @@ impl<'ctx> CodeGen<'ctx> {
             None => b.build_return(None).unwrap(),
         };
         tramp
+    }
+
+    /// FPC's `TMethod`: `{ Code, Data }`.
+    pub(super) fn method_pointer_type(&self) -> inkwell::types::StructType<'ctx> {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        self.context.struct_type(&[ptr.into(), ptr.into()], false)
+    }
+
+    /// Whether `ty` (resolved) is a method pointer type (`... of object`).
+    pub(super) fn is_method_pointer(ty: &PascalType) -> bool {
+        matches!(
+            ty,
+            PascalType::Proc {
+                of_object: true,
+                ..
+            }
+        )
+    }
+
+    /// The code pointer of `val`: itself, or a method pointer's `Code`.
+    pub(super) fn code_part(
+        &self,
+        val: BasicValueEnum<'ctx>,
+        span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        match val {
+            BasicValueEnum::StructValue(s) if s.get_type() == self.method_pointer_type() => self
+                .builder
+                .build_extract_value(s, 0, "code")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span))),
+            other => Ok(other),
+        }
+    }
+
+    /// The address of the method pointer `expr` gives (held in a
+    /// temporary if it isn't a variable or field).
+    pub(super) fn method_pointer_slot(
+        &mut self,
+        expr: &Expr,
+        span: Span,
+    ) -> Result<PointerValue<'ctx>, CodeGenError> {
+        if self.is_addressable(expr) {
+            return Ok(self.resolve_array_base(expr, span)?.0);
+        }
+        let value = self.compile_expr(expr)?;
+        let slot = self
+            .entry_alloca(self.method_pointer_type(), "method_tmp")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        self.builder
+            .build_store(slot, value)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(slot)
+    }
+
+    /// `expr` as a method pointer value: `nil`, another method pointer,
+    /// or a method of an instance (`@Obj.Method`, `Obj.Method`, or a
+    /// method of `Self` by name). A virtual method is looked up in the
+    /// instance's VMT now, as FPC does.
+    pub(super) fn compile_method_pointer(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let span = expr.span();
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let pair = self.method_pointer_type();
+        let inner = match expr {
+            Expr::Nil(_) => return Ok(pair.const_zero().into()),
+            Expr::AddrOf(inner, _) => inner.as_ref(),
+            other => other,
+        };
+        // The instance and the method's type and name.
+        let (object, instance, method) = match inner {
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } if args.is_empty() => {
+                if let Some(class) = self.class_instance_of(&self.infer_declared_type(object)) {
+                    let instance = self.compile_expr(object)?.into_pointer_value();
+                    (class, instance, method.clone())
+                } else {
+                    let (instance, ty) = self.resolve_array_base(object, span)?;
+                    let name = self.object_name_of(&ty).ok_or_else(|| {
+                        CodeGenError::new("this isn't a method of an instance", Some(span))
+                    })?;
+                    (name, instance, method.clone())
+                }
+            }
+            Expr::FieldAccess { record, field, .. }
+                if self.is_parameterless_method(record, field) =>
+            {
+                let (instance, ty) = self.resolve_array_base(record, span)?;
+                let name = self.object_name_of(&ty).unwrap();
+                (name, instance, field.clone())
+            }
+            Expr::Var(name, _) if self.implicit_method(name).is_some() => {
+                let (object, instance) = self.implicit_method(name).unwrap();
+                (object, instance, name.clone())
+            }
+            _ => {
+                // Already a method pointer.
+                let value = self.compile_expr(expr)?;
+                if value.get_type() == pair.as_basic_type_enum() {
+                    return Ok(value);
+                }
+                return Err(CodeGenError::new(
+                    "expected a method of an instance (`@Obj.Method`) or nil",
+                    Some(span),
+                ));
+            }
+        };
+        let info = self.objects[&object].clone();
+        let m = info.methods.get(&method).cloned().ok_or_else(|| {
+            CodeGenError::new(
+                format!(
+                    "'{}' has no method '{}'",
+                    self.display(&object),
+                    self.display(&method)
+                ),
+                Some(span),
+            )
+        })?;
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let code: PointerValue = match (m.slot, info.vmt_field) {
+            (Some(slot), Some(_)) => {
+                let vmt = self.load_vmt(&object, instance, span)?;
+                let header = self.vmt_header_words(&object);
+                let addr = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(
+                            ptr,
+                            vmt,
+                            &[self
+                                .context
+                                .i64_type()
+                                .const_int(header + slot as u64, false)],
+                            "slot_addr",
+                        )
+                        .map_err(err)?
+                };
+                self.builder
+                    .build_load(ptr, addr, "method")
+                    .map_err(err)?
+                    .into_pointer_value()
+            }
+            _ => self
+                .module
+                .get_function(&m.symbol)
+                .map(|f| f.as_global_value().as_pointer_value())
+                .ok_or_else(|| {
+                    CodeGenError::new(format!("method '{}' has no body", m.symbol), Some(span))
+                })?,
+        };
+        let value = self
+            .builder
+            .build_insert_value(pair.get_undef(), code, 0, "code")
+            .map_err(err)?;
+        let value = self
+            .builder
+            .build_insert_value(value, instance, 1, "data")
+            .map_err(err)?;
+        Ok(value.as_basic_value_enum())
     }
 }

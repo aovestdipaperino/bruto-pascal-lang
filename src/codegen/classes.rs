@@ -540,6 +540,17 @@ impl<'ctx> CodeGen<'ctx> {
                 method,
                 args,
                 span,
+            } if self.event_call(object, method, args, *span)?.is_some() => {
+                Statement::IndirectCall {
+                    call: self.event_call(object, method, args, *span)?.unwrap(),
+                    span: *span,
+                }
+            }
+            Statement::MethodCall {
+                object,
+                method,
+                args,
+                span,
             } => Statement::MethodCall {
                 object: self.dx_receiver(object)?,
                 method: method.clone(),
@@ -821,6 +832,16 @@ impl<'ctx> CodeGen<'ctx> {
                     span: *span,
                 }
             }
+            // `Obj.OnClick(Self)`: a call through a method pointer field or
+            // property.
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                span,
+            } if self.event_call(object, method, args, *span)?.is_some() => {
+                self.event_call(object, method, args, *span)?.unwrap()
+            }
             // `EFoo.CreateFmt(Fmt, [Args])`: `Create(Format(Fmt, [Args]))`
             // (Format is built in, so it needs its values written out).
             Expr::MethodCall {
@@ -985,6 +1006,45 @@ impl<'ctx> CodeGen<'ctx> {
             prop,
             args,
             rest,
+        }))
+    }
+
+    /// `Obj.Name(args)` where `Name` is a field or property of `Obj`'s
+    /// class holding a method pointer: a call through it.
+    fn event_call(
+        &self,
+        object: &Expr,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Option<Expr>, CodeGenError> {
+        if matches!(object, Expr::Var(n, _) if self.is_class_name(n)) {
+            return Ok(None);
+        }
+        let Some(class) = self.class_instance_of(&self.infer_declared_type(object)) else {
+            return Ok(None);
+        };
+        let info = &self.objects[&class];
+        if info.methods.contains_key(name) {
+            return Ok(None);
+        }
+        let ty = match &info.record {
+            PascalType::Record { fields, .. } => fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.clone()),
+            _ => None,
+        }
+        .or_else(|| info.properties.get(name).map(|p| p.ty.clone()));
+        if !ty.is_some_and(|t| Self::is_method_pointer(&self.resolve_type(&t))) {
+            return Ok(None);
+        }
+        let rec = self.dx(object)?;
+        let callee = self.member_read(rec, &class, name, span)?;
+        Ok(Some(Expr::IndirectCall {
+            callee: Box::new(callee),
+            args: args.iter().map(|a| self.dx(a)).collect::<Result<_, _>>()?,
+            span,
         }))
     }
 

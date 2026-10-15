@@ -1145,6 +1145,13 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_store(alloca, empty)
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
+                PascalType::Proc {
+                    of_object: true, ..
+                } => {
+                    self.builder
+                        .build_store(alloca, self.method_pointer_type().const_zero())
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
+                }
                 PascalType::Pointer(_) | PascalType::File { .. } | PascalType::Proc { .. } => {
                     let ptr_type = self.context.ptr_type(AddressSpace::default());
                     self.builder
@@ -2398,6 +2405,15 @@ impl<'ctx> CodeGen<'ctx> {
         expr: &Expr,
         target: &PascalType,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        if matches!(
+            self.resolve_type(target),
+            PascalType::Proc {
+                of_object: true,
+                ..
+            }
+        ) {
+            return self.compile_method_pointer(expr);
+        }
         if matches!(self.resolve_type(target), PascalType::Pointer(_))
             && self.is_addressable(expr)
             && matches!(
@@ -3167,7 +3183,8 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Statement::PlaceAssignment { target, expr, span } => {
                 self.set_debug_loc(*span);
-                let val = self.compile_expr(expr)?;
+                let target_ty = self.infer_declared_type(target);
+                let val = self.compile_expr_for(expr, &target_ty)?;
                 // A dynamic string's character is replaced through the
                 // runtime; a short string's is stored in its buffer below.
                 if let Expr::Index { array, index, .. } = target
@@ -3610,6 +3627,9 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::WideChar => 2,
             PascalType::String | PascalType::UnicodeString | PascalType::Pointer(_) => 8,
             PascalType::File { .. } => 8, // pointer to opaque struct
+            PascalType::Proc {
+                of_object: true, ..
+            } => 16, // { Code, Data }
             PascalType::Proc { .. } => 8, // function pointer
             PascalType::ConformantArray { .. } => 8, // base pointer
             PascalType::Set { .. } => 32, // 4 x i64 = 256 bits
@@ -4040,11 +4060,15 @@ impl<'ctx> CodeGen<'ctx> {
         // A call through a procedural variable or parameter.
         if let Some(proc_ty) = self.procedural_var_type(name) {
             let slot = *self.lookup_var(name).unwrap();
-            let target = self
-                .builder
-                .build_load(self.context.ptr_type(AddressSpace::default()), slot, "proc")
-                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
-                .into_pointer_value();
+            // A method pointer is called through its slot.
+            let target = if Self::is_method_pointer(&proc_ty) {
+                slot
+            } else {
+                self.builder
+                    .build_load(self.context.ptr_type(AddressSpace::default()), slot, "proc")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                    .into_pointer_value()
+            };
             self.call_procedural(target, &proc_ty, args, span)?;
             return Ok(());
         }
@@ -4272,6 +4296,10 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
         let proc_ty = self.infer_declared_type(callee);
+        if Self::is_method_pointer(&self.resolve_type(&proc_ty)) {
+            let slot = self.method_pointer_slot(callee, span)?;
+            return self.call_procedural(slot, &proc_ty, args, span);
+        }
         let target = self.compile_expr(callee)?;
         if !target.is_pointer_value() {
             return Err(CodeGenError::new(
@@ -4920,6 +4948,12 @@ impl<'ctx> CodeGen<'ctx> {
                 // `is nested` parameter a closure over its environment; any
                 // other expression is already a procedural value.
                 let param_ty = pinfo.map(|(_, _, t)| self.resolve_type(t)).unwrap();
+                if Self::is_method_pointer(&param_ty) {
+                    let value = self.compile_method_pointer(arg)?;
+                    call_args.push(value.into());
+                    pi += 1;
+                    continue;
+                }
                 let routine = match arg {
                     Expr::Var(n, _) => Some(n),
                     Expr::AddrOf(inner, _) => match inner.as_ref() {
@@ -6224,6 +6258,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 if name == "assigned" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
+                    let val = self.code_part(val, *span)?;
                     if !val.is_pointer_value() {
                         return Err(CodeGenError::new(
                             "assigned() needs a pointer or procedural value",
@@ -6863,11 +6898,18 @@ impl<'ctx> CodeGen<'ctx> {
                 // A call through a procedural variable or parameter.
                 if let Some(proc_ty) = self.procedural_var_type(name) {
                     let slot = *self.lookup_var(name.as_str()).unwrap();
-                    let target = self
-                        .builder
-                        .build_load(self.context.ptr_type(AddressSpace::default()), slot, "proc")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .into_pointer_value();
+                    let target = if Self::is_method_pointer(&proc_ty) {
+                        slot
+                    } else {
+                        self.builder
+                            .build_load(
+                                self.context.ptr_type(AddressSpace::default()),
+                                slot,
+                                "proc",
+                            )
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                            .into_pointer_value()
+                    };
                     return self
                         .call_procedural(target, &proc_ty, args, *span)?
                         .ok_or_else(|| {
@@ -7223,6 +7265,7 @@ impl<'ctx> CodeGen<'ctx> {
                 params,
                 return_type,
                 nested,
+                of_object,
             } => PascalType::Proc {
                 params: params
                     .iter()
@@ -7232,6 +7275,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .as_ref()
                     .map(|t| Box::new(self.resolve_type_at(t, behind_pointer))),
                 nested: *nested,
+                of_object: *of_object,
             },
             PascalType::ConformantArray {
                 lo_name,
@@ -7513,6 +7557,9 @@ impl<'ctx> CodeGen<'ctx> {
                 .context
                 .ptr_type(AddressSpace::default())
                 .as_basic_type_enum(),
+            PascalType::Proc {
+                of_object: true, ..
+            } => self.method_pointer_type().as_basic_type_enum(),
             PascalType::Proc { .. } => self
                 .context
                 .ptr_type(AddressSpace::default())
@@ -7680,6 +7727,38 @@ impl<'ctx> CodeGen<'ctx> {
         right: &Expr,
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        // `Ev = nil`, `Ev <> Other`: method pointers compare by their code.
+        if matches!(op, BinOp::Eq | BinOp::Neq)
+            && [left, right]
+                .iter()
+                .any(|e| Self::is_method_pointer(&self.resolve_type(&self.infer_declared_type(e))))
+        {
+            let l = self.compile_expr(left)?;
+            let l = self.code_part(l, span)?;
+            let r = self.compile_expr(right)?;
+            let r = self.code_part(r, span)?;
+            let pred = if op == BinOp::Eq {
+                inkwell::IntPredicate::EQ
+            } else {
+                inkwell::IntPredicate::NE
+            };
+            let i64_ty = self.context.i64_type();
+            let err =
+                |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+            let li = self
+                .builder
+                .build_ptr_to_int(l.into_pointer_value(), i64_ty, "l")
+                .map_err(err)?;
+            let ri = self
+                .builder
+                .build_ptr_to_int(r.into_pointer_value(), i64_ty, "r")
+                .map_err(err)?;
+            return Ok(self
+                .builder
+                .build_int_compare(pred, li, ri, "same_method")
+                .map_err(err)?
+                .into());
+        }
         let lhs = self.compile_expr(left)?;
         // Boolean `and` / `or` short-circuit, as in Turbo Pascal and FPC's
         // default `{$B-}`: `(p <> nil) and (p^.x > 0)` must not touch `p^`.

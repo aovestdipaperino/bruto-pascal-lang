@@ -15,6 +15,11 @@ interface
 type
   TClass = class of TObject;
 
+  { A method pointer's parts: `TMethod(OnClick).Data` is the instance. }
+  TMethod = record
+    Code, Data: Pointer;
+  end;
+
   TObject = class
   public
     constructor Create;

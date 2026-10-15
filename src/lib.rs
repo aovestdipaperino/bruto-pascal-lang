@@ -3932,6 +3932,128 @@ end.
     }
 
     #[test]
+    fn method_pointers_carry_their_instance() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+type
+  TNotifyEvent = procedure(Sender: TObject) of object;
+  TValueEvent = function(Sender: TObject; V: Integer): Integer of object;
+
+  TButton = class
+  private
+    FOnClick: TNotifyEvent;
+    FCaption: string;
+  public
+    OnValue: TValueEvent;
+    constructor Create(const ACaption: string);
+    procedure Click;
+    property OnClick: TNotifyEvent read FOnClick write FOnClick;
+    property Caption: string read FCaption;
+  end;
+
+  TForm = class
+  private
+    FClicks: Integer;
+  public
+    Name: string;
+    procedure ButtonClick(Sender: TObject);
+    function Twice(Sender: TObject; V: Integer): Integer; virtual;
+    procedure Wire(B: TButton);
+  end;
+
+  TBigForm = class(TForm)
+    function Twice(Sender: TObject; V: Integer): Integer; override;
+  end;
+
+  PCounter = ^TCounter;
+  TCounter = object
+    N: Integer;
+    procedure Bump(Sender: TObject);
+  end;
+
+constructor TButton.Create(const ACaption: string);
+begin
+  FCaption := ACaption;
+end;
+
+procedure TButton.Click;
+begin
+  if Assigned(FOnClick) then
+    FOnClick(Self)
+  else
+    WriteLn(FCaption, ': nobody listens');
+end;
+
+procedure TForm.ButtonClick(Sender: TObject);
+begin
+  Inc(FClicks);
+  WriteLn(Name, ' got click ', FClicks, ' from ', TButton(Sender).Caption);
+end;
+
+function TForm.Twice(Sender: TObject; V: Integer): Integer;
+begin
+  Result := V * 2;
+end;
+
+function TBigForm.Twice(Sender: TObject; V: Integer): Integer;
+begin
+  Result := V * 20;
+end;
+
+procedure TForm.Wire(B: TButton);
+begin
+  B.OnClick := @ButtonClick;
+end;
+
+procedure TCounter.Bump(Sender: TObject);
+begin
+  Inc(N);
+end;
+
+var
+  B: TButton;
+  F: TForm;
+  G: TForm;
+  Ev, Ev2: TNotifyEvent;
+  C: TCounter;
+begin
+  B := TButton.Create('OK');
+  F := TForm.Create;
+  F.Name := 'main';
+  B.Click;
+  B.OnClick := @F.ButtonClick;
+  B.Click;
+  B.Click;
+  G := TBigForm.Create;
+  G.Name := 'big';
+  G.Wire(B);
+  B.Click;
+  B.OnValue := @G.Twice;
+  WriteLn(B.OnValue(nil, 3));
+  Ev := B.OnClick;
+  Ev2 := nil;
+  WriteLn(Assigned(Ev), ' ', Assigned(Ev2), ' ', Ev2 = nil, ' ', Ev <> nil);
+  Ev(B);
+  C.N := 0;
+  B.OnClick := @C.Bump;
+  B.Click;
+  B.Click;
+  WriteLn('counter ', C.N);
+  B.OnClick := nil;
+  B.Click;
+  B.Free; F.Free; G.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "OK: nobody listens\nmain got click 1 from OK\nmain got click 2 from OK\nbig got click 1 from OK\n60\nTRUE FALSE TRUE TRUE\nbig got click 2 from OK\ncounter 2\nOK: nobody listens\n"
+        );
+    }
+
+    #[test]
     fn class_instances_and_their_strings_are_freed() {
         let (ok, out) = build_and_run_source(
             "program T;

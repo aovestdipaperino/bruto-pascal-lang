@@ -269,6 +269,9 @@ pub enum PascalType {
         params: Vec<PascalType>,
         return_type: Option<Box<PascalType>>,
         nested: bool,
+        /// `... of object`: a method pointer, FPC's `TMethod` (`{ Code,
+        /// Data }`), called with `Data` as the method's `Self`.
+        of_object: bool,
     },
     /// Conformant array parameter (ISO 7185):
     ///   `array[lo..hi: integer] of T`

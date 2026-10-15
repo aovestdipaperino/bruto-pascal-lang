@@ -2644,6 +2644,7 @@ impl Parser {
         // `is nested`: a closure over a local routine; `of object`: a
         // method pointer (parsed, treated like a plain procedural value).
         let mut nested = false;
+        let mut of_object = false;
         if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("is"))
             && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(w), _)) if w.eq_ignore_ascii_case("nested"))
         {
@@ -2655,11 +2656,13 @@ impl Parser {
         {
             self.advance();
             self.advance();
+            of_object = true;
         }
         Ok(PascalType::Proc {
             params,
             return_type,
             nested,
+            of_object,
         })
     }
 
