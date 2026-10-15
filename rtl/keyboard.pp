@@ -113,6 +113,9 @@ implementation
 var
   Pending: TKeyEvent;
   HasPending: Boolean;
+  { The modifiers of the last key read: a terminal reports them only
+    along with a key, so this is the best answer to GetShiftState. }
+  LastShift: Byte;
 
 procedure InitKeyboard;
 begin
@@ -168,10 +171,12 @@ begin
   if HasPending then
   begin
     HasPending := False;
+    LastShift := (Pending shr 16) and $FF;
     GetKeyEvent := Pending;
     Exit;
   end;
   ConsoleGetKey(K);
+  LastShift := LegacyShift(K.Shift);
   GetKeyEvent := ToKeyEvent(K);
 end;
 
@@ -195,8 +200,7 @@ end;
 
 function PollShiftStateEvent: TKeyEvent;
 begin
-  { A terminal reports modifiers only along with a key. }
-  PollShiftStateEvent := 0;
+  PollShiftStateEvent := LongWord(LastShift) shl 16;
 end;
 
 function TranslateKeyEvent(KeyEvent: TKeyEvent): TKeyEvent;
@@ -239,6 +243,7 @@ var
   K: TConsoleKey;
 begin
   ConsoleGetKey(K);
+  LastShift := LegacyShift(K.Shift);
   GetEnhancedKeyEvent := ToEnhanced(K);
 end;
 
