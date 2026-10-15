@@ -381,6 +381,11 @@ begin
         OldEnhancedVideoBuf^[I] := EnhancedVideoBuf^[I];
         NextX := X + W;
         NextY := Y;
+        { Terminals disagree on how far a cluster of several code units
+          (a letter with combining marks, an emoji sequence) moves the
+          cursor, so the next cell is placed explicitly. }
+        if Length(EnhancedVideoBuf^[I].ExtendedGraphemeCluster) > 1 then
+          NextX := -1;
         Redraw := (OldW = 2) and (W = 1);
       end
       else
