@@ -444,9 +444,10 @@ impl<'ctx> CodeGen<'ctx> {
                 &[old.into(), idx.into(), code.into()],
                 span,
             )?
-            .unwrap();
-        self.builder.build_store(slot, new).map_err(err)?;
-        Ok(())
+            .unwrap()
+            .into_pointer_value();
+        let new = self.wrap_ustr(new, span)?;
+        self.store_value(slot, new, &PascalType::UnicodeString, span)
     }
 
     /// Whether `expr` is a UnicodeString or a WideChar.

@@ -3418,6 +3418,92 @@ end.
     }
 
     #[test]
+    fn strings_are_reference_counted() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses SysUtils;
+type
+  TRec = record
+    Name: String;
+    Wide: UnicodeString;
+    N: Integer;
+  end;
+var
+  G: String;
+  A: array[1..3] of String;
+  R, R2: TRec;
+  P: ^TRec;
+  I: Integer;
+  H: TFPCHeapStatus;
+  Before: PtrUInt;
+
+function Twice(S: String): String;
+begin
+  S := S + S;
+  Twice := S;
+end;
+
+function Join(const A, B: String): String;
+begin
+  Result := A + '-' + B;
+end;
+
+procedure SetIt(var S: String; const V: String);
+begin
+  S := V + '!';
+end;
+
+function Upper(S: UnicodeString): UnicodeString;
+var I: Integer;
+begin
+  for I := 1 to Length(S) do
+    S[I] := UpCase(S[I]);
+  Upper := S;
+end;
+
+begin
+  G := Twice('ab');
+  writeln(Join(G, Twice('c')));
+  SetIt(G, 'set');
+  writeln(G);
+  A[1] := 'one'; A[2] := A[1] + 'two'; A[3] := A[2];
+  A[1] := 'changed';
+  writeln(A[1], ' ', A[2], ' ', A[3]);
+  R.Name := 'rec' + IntToStr(1); R.Wide := 'w'; R.N := 5;
+  R2 := R;
+  R.Name := 'other'; R.Wide := 'x';
+  writeln(R.Name, R.Wide, ' ', R2.Name, R2.Wide);
+  New(P);
+  P^.Name := Join('heap', 'rec');
+  writeln(P^.Name, ' ', Upper('mixed Case'));
+  H := GetFPCHeapStatus;
+  Before := H.CurrHeapUsed;
+  for I := 1 to 100000 do
+  begin
+    G := Twice(IntToStr(I)) + Join('a', 'b');
+    R.Name := G;
+    R.Wide := Upper(G);
+    A[2] := Copy(G, 1, 3);
+  end;
+  H := GetFPCHeapStatus;
+  writeln(G, ' ', R.Wide, ' ', A[2]);
+  {$ifdef DARWIN}
+  writeln(H.CurrHeapUsed - Before < 200000);
+  {$else}
+  writeln(true);
+  {$endif}
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "abab-cc\nset!\nchanged onetwo onetwo\notherx rec1w\nheap-rec MIXED CASE\n\
+             100000100000a-b 100000100000A-B 100\ntrue\n"
+        );
+    }
+
+    #[test]
     fn conditional_compilation() {
         let (ok, out) = build_and_run_source(
             "program T;

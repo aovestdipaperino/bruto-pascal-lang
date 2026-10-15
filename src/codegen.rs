@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
+mod arc;
 mod closures;
 mod forin;
 mod objects;
@@ -140,9 +141,18 @@ pub struct CodeGen<'ctx> {
     loop_targets: Vec<(BasicBlock<'ctx>, BasicBlock<'ctx>)>,
     /// Hidden locals made so far (for `for-in` loops), for unique names.
     hidden_count: u32,
-    /// Whether the routine being compiled is Bruto's runtime, which the
-    /// profiler leaves out.
+    /// The hidden locals of the `for-in` loop being compiled, released
+    /// when it ends.
+    for_in_locals: Vec<(String, PascalType)>,
+    /// Whether the routine being compiled comes from one of Bruto's own
+    /// RTL files, which the profiler leaves out.
     prof_skip: bool,
+    /// Whether it is the string runtime itself, which isn't reference
+    /// counted (it is what counts).
+    in_runtime: bool,
+    /// Whether AnsiStrings are reference counted and freed (see
+    /// `codegen/arc.rs`); `BRUTO_NO_ARC` turns it off.
+    arc: bool,
     /// The Unicode text of each string literal's global (by address),
     /// so a literal stored as a UnicodeString becomes UTF-16 at compile
     /// time, in its source's code page.
@@ -251,7 +261,10 @@ impl<'ctx> CodeGen<'ctx> {
             label_blocks: HashMap::new(),
             loop_targets: Vec::new(),
             hidden_count: 0,
+            for_in_locals: Vec::new(),
             prof_skip: false,
+            in_runtime: false,
+            arc: std::env::var_os("BRUTO_NO_ARC").is_none(),
             literal_texts: HashMap::new(),
             exit_block: None,
             end_bp_slots: HashMap::new(),
@@ -636,6 +649,10 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Predefined `input` and `output` text files (Wirth's spec).
         self.emit_predefined_files(program.span)?;
+
+        if self.arc {
+            self.call_ustr_runtime("bruto_arc_enable", &[], program.span)?;
+        }
 
         // Store each constant's value into its global before the body runs.
         for c in &program.consts {
@@ -1072,7 +1089,7 @@ impl<'ctx> CodeGen<'ctx> {
                 // UnicodeStrings inside start out empty (nil), as FPC
                 // initializes managed fields.
                 PascalType::Array { .. } | PascalType::Record { .. }
-                    if self.holds_unicode_string(&resolved_ty) =>
+                    if self.holds_unicode_string(&resolved_ty) || self.needs_arc(&resolved_ty) =>
                 {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
@@ -1518,9 +1535,16 @@ impl<'ctx> CodeGen<'ctx> {
     fn compile_local_const(&mut self, c: &ConstDecl) -> Result<(), CodeGenError> {
         self.set_debug_loc(c.span);
         let ty = self.const_decl_type(c);
+        let llvm_ty = self.llvm_type_for(&ty);
         let slot = self
-            .entry_alloca(self.llvm_type_for(&ty), &c.name)
+            .entry_alloca(llvm_ty, &c.name)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?;
+        // Strings start out nil, so storing the value releases nothing.
+        if self.needs_arc(&ty) {
+            self.builder
+                .build_store(slot, llvm_ty.const_zero())
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(c.span)))?;
+        }
         self.store_initializer(slot, &c.value, &ty)?;
         self.variables.insert(c.name.clone(), slot);
         self.var_types.insert(c.name.clone(), ty);
@@ -1557,12 +1581,14 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_proc_decl(&mut self, proc: &ProcDecl) -> Result<(), CodeGenError> {
-        // Bruto's own runtime routines aren't profiled.
-        let saved = self.prof_skip;
-        self.prof_skip = crate::source_map::path_of(proc.span.file)
-            .is_some_and(|p| crate::rtl::is_runtime_file(&p));
+        // Bruto's own RTL routines aren't profiled; the string runtime
+        // isn't counted either.
+        let path = crate::source_map::path_of(proc.span.file);
+        let saved = (self.prof_skip, self.in_runtime);
+        self.prof_skip = path.as_deref().is_some_and(crate::rtl::is_runtime_file);
+        self.in_runtime = path.as_deref().is_some_and(crate::rtl::is_string_runtime);
         let result = self.compile_routine(proc);
-        self.prof_skip = saved;
+        (self.prof_skip, self.in_runtime) = saved;
         result
     }
 
@@ -1779,7 +1805,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .entry_alloca(llvm_ty, name)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
                 // (A short string arrives as a C string and is copied in.)
-                self.store_value(alloca, param_val, &resolved_ty, proc.span)?;
+                self.store_value_init(alloca, param_val, &resolved_ty, proc.span)?;
                 self.variables.insert(name.clone(), alloca);
                 self.var_types.insert(name.clone(), resolved_ty);
             }
@@ -1997,6 +2023,23 @@ impl<'ctx> CodeGen<'ctx> {
         self.compile_block(&proc.body)?;
         self.enter_exit_block(proc.body.end_span)?;
 
+        // Release the strings held by locals and value parameters.
+        if self.arc && !self.in_runtime {
+            let mut locals: Vec<(String, PascalType)> = proc
+                .vars
+                .iter()
+                .flat_map(|v| v.names.iter().map(|n| (n.clone(), v.ty.clone())))
+                .collect();
+            locals.extend(
+                param_info
+                    .iter()
+                    .filter(|(_, mode, _)| *mode == ParamMode::Value)
+                    .map(|(name, _, ty)| (name.clone(), ty.clone())),
+            );
+            locals.retain(|(_, ty)| self.needs_arc(ty));
+            self.arc_release_locals(&locals, proc.body.end_span)?;
+        }
+
         // Return (profiler exit first so the routine's time closes)
         self.emit_prof_exit()?;
         if is_constructor {
@@ -2015,6 +2058,19 @@ impl<'ctx> CodeGen<'ctx> {
                     .build_load(llvm_ty, alloca, "retval")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?
             };
+            // The result's reference passes to the caller's statement.
+            if self.arc && !self.in_runtime {
+                match self.resolve_type(ret_ty) {
+                    PascalType::String => {
+                        self.call_ustr_runtime("bruto_astr_return", &[ret_val.into()], proc.span)?;
+                    }
+                    PascalType::UnicodeString => {
+                        let p = self.ustr_ptr(ret_val, proc.span)?;
+                        self.call_ustr_runtime("bruto_astr_return", &[p.into()], proc.span)?;
+                    }
+                    _ => {}
+                }
+            }
             self.builder
                 .build_return(Some(&ret_val))
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
@@ -2217,7 +2273,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// Store an expression value into a slot of type `ty`, converting it
     /// first (see [`Self::convert_for_store`]).
     fn store_value(
-        &self,
+        &mut self,
         ptr: PointerValue<'ctx>,
         val: BasicValueEnum<'ctx>,
         ty: &PascalType,
@@ -2229,6 +2285,35 @@ impl<'ctx> CodeGen<'ctx> {
             return self.store_short_string(ptr, val, max, span);
         }
         let val = self.convert_for_store(val, ty, span)?;
+        // Count the new strings before releasing the old ones: they may
+        // be the same.
+        if self.needs_arc(ty) {
+            self.arc_addref_value(val, ty, span)?;
+            self.arc_release_slot(ptr, ty, span)?;
+        }
+        self.builder
+            .build_store(ptr, val)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(())
+    }
+
+    /// Store `val` into a slot holding nothing yet (a parameter's copy):
+    /// as [`Self::store_value`], but nothing there is released.
+    fn store_value_init(
+        &mut self,
+        ptr: PointerValue<'ctx>,
+        val: BasicValueEnum<'ctx>,
+        ty: &PascalType,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        if let PascalType::ShortString { max } = self.resolve_type(ty) {
+            let val = self.ustr_to_ansi(val, span)?;
+            return self.store_short_string(ptr, val, max, span);
+        }
+        let val = self.convert_for_store(val, ty, span)?;
+        if self.needs_arc(ty) {
+            self.arc_addref_value(val, ty, span)?;
+        }
         self.builder
             .build_store(ptr, val)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
@@ -2362,6 +2447,27 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_statement(&mut self, stmt: &Statement) -> Result<(), CodeGenError> {
+        // Free the strings the statement made and didn't store. A block's
+        // statements do this one by one; a statement holding a label is
+        // left to the enclosing one (a jump to the label would skip the
+        // pool mark).
+        let drained = self.arc
+            && !self.in_runtime
+            && self.block_is_open()
+            && !matches!(stmt, Statement::Block(_) | Statement::Label { .. })
+            && !arc::contains_label(stmt);
+        if !drained {
+            return self.compile_statement_inner(stmt);
+        }
+        let mark = self.pool_mark(stmt.span())?;
+        self.compile_statement_inner(stmt)?;
+        if self.block_is_open() {
+            self.pool_drain(mark, stmt.span())?;
+        }
+        Ok(())
+    }
+
+    fn compile_statement_inner(&mut self, stmt: &Statement) -> Result<(), CodeGenError> {
         if self.instrument && !matches!(stmt, Statement::Label { .. }) {
             // The hook carries the statement's own debug location so the
             // call is attributed to the line it measures.
@@ -2990,6 +3096,15 @@ impl<'ctx> CodeGen<'ctx> {
             .try_as_basic_value()
             .basic()
             .unwrap();
+        // Zeroed, as FPC initializes a new record's strings (to nil).
+        self.builder
+            .build_memset(
+                ptr.into_pointer_value(),
+                1,
+                self.context.i8_type().const_zero(),
+                size,
+            )
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         self.builder
             .build_store(slot, ptr)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
@@ -3428,9 +3543,14 @@ impl<'ctx> CodeGen<'ctx> {
             .build_unconditional_branch(cond_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
 
-        // Condition
+        // Condition, whose strings are freed on each test
         self.builder.position_at_end(cond_bb);
         self.set_debug_loc(span);
+        let cond_mark = if self.arc && !self.in_runtime {
+            Some(self.pool_mark(span)?)
+        } else {
+            None
+        };
         let cond_val = self.compile_expr(condition)?;
 
         let cond_bool = if cond_val.is_int_value() {
@@ -3454,6 +3574,9 @@ impl<'ctx> CodeGen<'ctx> {
             ));
         };
 
+        if let Some(mark) = cond_mark {
+            self.pool_drain(mark, span)?;
+        }
         self.builder
             .build_conditional_branch(cond_bool, body_bb, after_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
@@ -3635,6 +3758,11 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Check condition — repeat exits when condition is true
         self.set_debug_loc(span);
+        let cond_mark = if self.arc && !self.in_runtime {
+            Some(self.pool_mark(span)?)
+        } else {
+            None
+        };
         let cond_val = self.compile_expr(condition)?;
         let cond_bool = if cond_val.is_int_value() {
             let iv = cond_val.into_int_value();
@@ -3656,6 +3784,9 @@ impl<'ctx> CodeGen<'ctx> {
                 Some(span),
             ));
         };
+        if let Some(mark) = cond_mark {
+            self.pool_drain(mark, span)?;
+        }
         // If condition true, exit; if false, loop back
         self.builder
             .build_conditional_branch(cond_bool, after_bb, body_bb)
@@ -3937,6 +4068,9 @@ impl<'ctx> CodeGen<'ctx> {
             .try_as_basic_value()
             .basic()
             .unwrap();
+        let result = self
+            .call_ustr_runtime("bruto_astr_adopt", &[result.into()], span)?
+            .unwrap();
         self.store_value(alloca, result, &target_ty, span)
     }
 
@@ -4063,9 +4197,24 @@ impl<'ctx> CodeGen<'ctx> {
                     "",
                 )
                 .map_err(err)?;
+            // The unpadded text (a fresh C string) is no longer needed.
+            let free = self.module.get_function("free").unwrap_or_else(|| {
+                self.module.add_function(
+                    "free",
+                    self.context.void_type().fn_type(&[ptr.into()], false),
+                    None,
+                )
+            });
+            self.builder
+                .build_call(free, &[text.into()], "")
+                .map_err(err)?;
             text = out;
         }
-        self.store_value(slot, text.into(), &target_ty, span)
+        // The formatted C string becomes an AnsiString (its buffer freed).
+        let text = self
+            .call_ustr_runtime("bruto_astr_adopt", &[text.into()], span)?
+            .unwrap();
+        self.store_value(slot, text, &target_ty, span)
     }
 
     /// `Val(S, X, Code)`: X is an integer or a real, `Code` the position
@@ -4959,6 +5108,13 @@ impl<'ctx> CodeGen<'ctx> {
                     .basic()
                     .unwrap()
             };
+            // A line read is a fresh C string: adopted as an AnsiString.
+            let val = if resolved == PascalType::String {
+                self.call_ustr_runtime("bruto_astr_adopt", &[val.into()], span)?
+                    .unwrap()
+            } else {
+                val
+            };
             self.store_value(alloca, val, &var_type, span)?;
         }
 
@@ -5118,8 +5274,7 @@ impl<'ctx> CodeGen<'ctx> {
                 span,
             )?
             .unwrap();
-        self.builder.build_store(slot, copy).map_err(err)?;
-        Ok(())
+        self.store_value(slot, copy, &PascalType::String, span)
     }
 
     /// Whether `expr` is a `string` value (so `[i]` picks a character).

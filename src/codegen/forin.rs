@@ -19,6 +19,8 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
+        // This loop's hidden locals are the ones added from here on.
+        let first_local = self.for_in_locals.len();
         let var_expr = |name: &str| Expr::Var(name.to_string(), span);
         let mut statements = Vec::new();
         let condition;
@@ -114,7 +116,21 @@ impl<'ctx> CodeGen<'ctx> {
                 statements,
             },
             span,
-        })
+        })?;
+        // The hidden locals let go of their strings.
+        for (name, ty) in self.for_in_locals.split_off(first_local) {
+            if self.block_is_open()
+                && self.needs_arc(&ty)
+                && let Some(&slot) = self.variables.get(&name)
+            {
+                self.arc_release_slot(slot, &ty, span)?;
+                let llvm_ty = self.llvm_type_for(&self.resolve_type(&ty));
+                self.builder
+                    .build_store(slot, llvm_ty.const_zero())
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            }
+        }
+        Ok(())
     }
 
     /// For `T.Create(args)` (or `T.Create`) with `T` an object type: the
@@ -161,6 +177,7 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         self.variables.insert(name.clone(), slot);
         self.var_types.insert(name.clone(), ty.clone());
+        self.for_in_locals.push((name.clone(), ty.clone()));
         Ok(name)
     }
 }

@@ -13,7 +13,8 @@
   the first 16 bytes of a page.
 
   A UnicodeString is a pointer to UTF-16 code units, followed by a zero
-  unit and preceded by the length (an Int64), as in FPC.
+  unit and preceded by the same header (the length counts units), as in
+  FPC; both kinds are reference counted the same way.
 
   Nil is the empty string of either kind. A string is never changed in
   place: every operation that changes one builds a copy. String
@@ -30,14 +31,32 @@ type
   PBrutoLength = ^Int64;
   PBrutoMarker = ^LongWord;
 
+  BrutoPointers = array[0..$FFFFFFF] of Pointer;
+  PBrutoPointers = ^BrutoPointers;
+  PBrutoCount = ^LongInt;
+
 const
-  { The header marker of the AnsiStrings Bruto makes. }
+  { The header marker of the AnsiStrings Bruto makes, with two flags:
+    the string waits in the pool of temporaries, and its block starts 16
+    bytes before the header. }
   BrutoAStrMarker = $B57A57A1;
+  BrutoAStrPooled = 2;
+  BrutoAStrShifted = 4;
+  BrutoAStrFlags = 6;
+
+var
+  { Strings made by the statement being run and not yet stored anywhere
+    (reference count 0): freed when it ends, unless stored by then. }
+  BrutoPool: PBrutoPointers;
+  BrutoPoolCount, BrutoPoolCap: Int64;
+  BrutoArc: Boolean;
 
 function bruto_astr_len(S: Pointer): Int64;
 function bruto_astr_alloc(Len: Int64): Pointer;
 function bruto_astr_from_buf(P: Pointer; Len: Int64): Pointer;
 function bruto_astr_from_char(C: Int64): Pointer;
+{ A string holding the C string P, whose memory (from malloc) is freed. }
+function bruto_astr_adopt(P: Pointer): Pointer;
 function bruto_astr_concat(A, B: Pointer): Pointer;
 function bruto_astr_compare(A, B: Pointer): Int64;
 function bruto_astr_copy(S: Pointer; Index, Count: Int64): Pointer;
@@ -46,6 +65,17 @@ function bruto_astr_delete(S: Pointer; Index, Count: Int64): Pointer;
 function bruto_astr_insert(Src, S: Pointer; Index: Int64): Pointer;
 function bruto_astr_setlength(S: Pointer; Len: Int64): Pointer;
 function bruto_astr_setchar(S: Pointer; Index, C: Int64): Pointer;
+{ Reference counting (see the unit's header): a Bruto string's count goes
+  up when it is stored and down when it is replaced or goes out of scope;
+  at 0 it is freed. C strings and literals are left alone. }
+procedure bruto_arc_enable;
+procedure bruto_astr_addref(S: Pointer);
+procedure bruto_astr_release(S: Pointer);
+{ A function's result, released by the function: back to the pool, so
+  the caller's statement frees it unless it is stored. }
+procedure bruto_astr_return(S: Pointer);
+function bruto_pool_mark: Int64;
+procedure bruto_pool_drain(Mark: Int64);
 { Write S to the console (and the IDE's capture), #0 characters included. }
 procedure bruto_astr_write(S: Pointer);
 
@@ -98,34 +128,149 @@ function bruto_strlen(S: Pointer): Int64; cdecl; external 'c' name 'strlen';
 
 { ── AnsiString ────────────────────────────────────────────── }
 
+{ Whether S is a string Bruto made (it has a header). }
+function bruto_astr_is_managed(S: Pointer): Boolean;
+begin
+  bruto_astr_is_managed := (S <> nil) and ((PtrUInt(S) and 4095) >= 16)
+    and ((PBrutoMarker(S - 16)^ and not LongWord(BrutoAStrFlags)) = BrutoAStrMarker);
+end;
+
 function bruto_astr_len(S: Pointer): Int64;
 begin
   if S = nil then
     bruto_astr_len := 0
-  else if (PtrUInt(S) and 4095) < 16 then
-    bruto_astr_len := bruto_strlen(S)
-  else if PBrutoMarker(S - 16)^ = BrutoAStrMarker then
+  else if bruto_astr_is_managed(S) then
     bruto_astr_len := PBrutoLength(S - 8)^
   else
     bruto_astr_len := bruto_strlen(S);
 end;
 
-{ A string of Len bytes, all zero (the reference count 0). Its
-  characters are moved 16 bytes further when they would start a page. }
-function bruto_astr_alloc(Len: Int64): Pointer;
+procedure bruto_arc_enable;
+begin
+  BrutoArc := True;
+end;
+
+procedure bruto_pool_add(S: Pointer);
+var
+  Bigger: PBrutoPointers;
+begin
+  if BrutoPoolCount = BrutoPoolCap then
+  begin
+    if BrutoPoolCap = 0 then
+      BrutoPoolCap := 256
+    else
+      BrutoPoolCap := BrutoPoolCap * 2;
+    GetMem(Bigger, BrutoPoolCap * SizeOf(Pointer));
+    if BrutoPoolCount > 0 then
+      Move(BrutoPool^, Bigger^, BrutoPoolCount * SizeOf(Pointer));
+    if BrutoPool <> nil then
+      FreeMem(BrutoPool);
+    BrutoPool := Bigger;
+  end;
+  BrutoPool^[BrutoPoolCount] := S;
+  BrutoPoolCount := BrutoPoolCount + 1;
+  PBrutoMarker(S - 16)^ := PBrutoMarker(S - 16)^ or BrutoAStrPooled;
+end;
+
+procedure bruto_astr_free(S: Pointer);
+begin
+  if (PBrutoMarker(S - 16)^ and BrutoAStrShifted) <> 0 then
+    FreeMem(S - 32)
+  else
+    FreeMem(S - 16);
+end;
+
+procedure bruto_astr_addref(S: Pointer);
+var
+  Count: PBrutoCount;
+begin
+  if not bruto_astr_is_managed(S) then
+    Exit;
+  Count := PBrutoCount(S - 12);
+  if Count^ >= 0 then
+    Count^ := Count^ + 1;
+end;
+
+procedure bruto_astr_release(S: Pointer);
+var
+  Count: PBrutoCount;
+begin
+  if not bruto_astr_is_managed(S) then
+    Exit;
+  Count := PBrutoCount(S - 12);
+  if Count^ <= 0 then
+    Exit;
+  Count^ := Count^ - 1;
+  if (Count^ = 0) and ((PBrutoMarker(S - 16)^ and BrutoAStrPooled) = 0) then
+    bruto_astr_free(S);
+end;
+
+procedure bruto_astr_return(S: Pointer);
+var
+  Count: PBrutoCount;
+begin
+  if not bruto_astr_is_managed(S) then
+    Exit;
+  Count := PBrutoCount(S - 12);
+  if Count^ <= 0 then
+    Exit;
+  Count^ := Count^ - 1;
+  if (Count^ = 0) and ((PBrutoMarker(S - 16)^ and BrutoAStrPooled) = 0) then
+    bruto_pool_add(S);
+end;
+
+function bruto_pool_mark: Int64;
+begin
+  bruto_pool_mark := BrutoPoolCount;
+end;
+
+procedure bruto_pool_drain(Mark: Int64);
+var
+  I: Int64;
+  S: Pointer;
+begin
+  I := Mark;
+  while I < BrutoPoolCount do
+  begin
+    S := BrutoPool^[I];
+    if PBrutoCount(S - 12)^ = 0 then
+      bruto_astr_free(S)
+    else
+      PBrutoMarker(S - 16)^ := PBrutoMarker(S - 16)^ and not LongWord(BrutoAStrPooled);
+    I := I + 1;
+  end;
+  if Mark < BrutoPoolCount then
+    BrutoPoolCount := Mark;
+end;
+
+{ A string block: a header (count 0, length Len) and Size zero bytes
+  after it, of which a pointer to the first is returned. The data is
+  moved 16 bytes further when it would start a page. }
+function bruto_string_block(Len, Size: Int64): Pointer;
 var
   Block, Header: Pointer;
 begin
+  GetMem(Block, 32 + Size);
+  FillChar(Block^, 32 + Size, 0);
+  Header := Block;
+  PBrutoMarker(Header)^ := BrutoAStrMarker;
+  if ((PtrUInt(Block) + 16) and 4095) < 16 then
+  begin
+    Header := Block + 16;
+    PBrutoMarker(Header)^ := BrutoAStrMarker or BrutoAStrShifted;
+  end;
+  PBrutoLength(Header + 8)^ := Len;
+  if BrutoArc then
+    bruto_pool_add(Header + 16);
+  bruto_string_block := Header + 16;
+end;
+
+{ A string of Len bytes, all zero (the reference count 0). }
+function bruto_astr_alloc(Len: Int64): Pointer;
+begin
   if Len < 0 then
     Len := 0;
-  GetMem(Block, 32 + Len + 1);
-  FillChar(Block^, 32 + Len + 1, 0);
-  Header := Block;
-  if ((PtrUInt(Block) + 16) and 4095) < 16 then
-    Header := Block + 16;
-  PBrutoMarker(Header)^ := BrutoAStrMarker;
-  PBrutoLength(Header + 8)^ := Len;
-  bruto_astr_alloc := Header + 16;
+  bruto_astr_alloc := bruto_string_block(Len, Len + 1);
 end;
 
 function bruto_astr_from_buf(P: Pointer; Len: Int64): Pointer;
@@ -145,6 +290,17 @@ begin
   R := PBrutoBytes(bruto_astr_alloc(1));
   R^[0] := C;
   bruto_astr_from_char := R;
+end;
+
+function bruto_astr_adopt(P: Pointer): Pointer;
+begin
+  if P = nil then
+  begin
+    bruto_astr_adopt := bruto_astr_alloc(0);
+    Exit;
+  end;
+  bruto_astr_adopt := bruto_astr_from_buf(P, bruto_strlen(P));
+  FreeMem(P);
 end;
 
 function bruto_astr_concat(A, B: Pointer): Pointer;
@@ -333,18 +489,11 @@ end;
 
 { A string of Len units, all zero, or nil when Len is 0. }
 function bruto_ustr_alloc(Len: Int64): Pointer;
-var
-  Block: PBrutoBytes;
 begin
   if Len <= 0 then
-  begin
-    bruto_ustr_alloc := nil;
-    Exit;
-  end;
-  GetMem(Block, 8 + (Len + 1) * 2);
-  FillChar(Block^, 8 + (Len + 1) * 2, 0);
-  PBrutoLength(Block)^ := Len;
-  bruto_ustr_alloc := Pointer(Block) + 8;
+    bruto_ustr_alloc := nil
+  else
+    bruto_ustr_alloc := bruto_string_block(Len, (Len + 1) * 2);
 end;
 
 { The length of the UTF-8 sequence starting with byte B, or 0 when B

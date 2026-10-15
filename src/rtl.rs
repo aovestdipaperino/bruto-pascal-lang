@@ -45,6 +45,11 @@ pub(crate) fn is_runtime_file(path: &std::path::Path) -> bool {
     path.parent().and_then(|p| p.file_name()) == Some(name)
 }
 
+/// Whether `path` is the string runtime (`rtl/brutostrings.pp`).
+pub(crate) fn is_string_runtime(path: &std::path::Path) -> bool {
+    is_runtime_file(path) && path.file_name().is_some_and(|n| n == "brutostrings.pp")
+}
+
 /// The file of built-in unit `name`, if there is one.
 pub(crate) fn unit_file(name: &str) -> Option<PathBuf> {
     let file = format!("{}.pp", name.to_ascii_lowercase());
@@ -124,6 +129,12 @@ fn add_prelude(program: &mut Program, file: &str, source: &str) -> Result<(), St
         .chain(unit.impl_consts)
         .filter(|c| fresh(&c.name));
     program.consts.splice(0..0, consts);
+    let vars = unit
+        .interface_vars
+        .into_iter()
+        .chain(unit.impl_vars)
+        .filter(|v| v.names.iter().all(|n| fresh(n)));
+    program.vars.splice(0..0, vars);
     let procs = unit.procedures.into_iter().filter(|p| fresh(&p.name));
     program.procedures.splice(0..0, procs);
     Ok(())

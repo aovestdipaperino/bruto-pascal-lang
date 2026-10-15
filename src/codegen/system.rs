@@ -170,7 +170,10 @@ impl<'ctx> CodeGen<'ctx> {
                         "cwd",
                     )
                     .map_err(err)?;
-                self.store_value(slot, buf, &ty, span)?;
+                let dir = self
+                    .call_ustr_runtime("bruto_astr_adopt", &[buf.into()], span)?
+                    .unwrap();
+                self.store_value(slot, dir, &ty, span)?;
             }
             // ChDir / MkDir / RmDir(Path), reporting failure in InOutRes.
             ("chdir" | "mkdir" | "rmdir", 1) => {
@@ -275,7 +278,7 @@ impl<'ctx> CodeGen<'ctx> {
                                 span,
                             )?
                             .unwrap();
-                        self.builder.build_store(slot, new).map_err(err)?;
+                        self.store_value(slot, new, &PascalType::String, span)?;
                     }
                     PascalType::UnicodeString => {
                         let old = self.builder.build_load(ptr, slot, "old").map_err(err)?;
@@ -285,8 +288,10 @@ impl<'ctx> CodeGen<'ctx> {
                                 &[old.into(), n.into()],
                                 span,
                             )?
-                            .unwrap();
-                        self.builder.build_store(slot, new).map_err(err)?;
+                            .unwrap()
+                            .into_pointer_value();
+                        let new = self.wrap_ustr(new, span)?;
+                        self.store_value(slot, new, &PascalType::UnicodeString, span)?;
                     }
                     _ => {
                         return Err(CodeGenError::new("SetLength needs a string", Some(span)));
@@ -568,7 +573,8 @@ impl<'ctx> CodeGen<'ctx> {
                 self.builder
                     .build_call(snprintf, &call_args, "")
                     .map_err(err)?;
-                buf
+                self.call_ustr_runtime("bruto_astr_adopt", &[buf.into()], span)?
+                    .unwrap()
             }
             // HexStr(Value, Digits): the low `Digits` hex digits of Value.
             ("hexstr", 2) => {
@@ -651,7 +657,8 @@ impl<'ctx> CodeGen<'ctx> {
                         "",
                     )
                     .map_err(err)?;
-                buf
+                self.call_ustr_runtime("bruto_astr_adopt", &[buf.into()], span)?
+                    .unwrap()
             }
             // Swap(W): exchange the two bytes of a 16-bit value.
             ("swap", 1) => {
