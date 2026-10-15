@@ -3370,6 +3370,54 @@ end.
     }
 
     #[test]
+    fn code_page_437_literals() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$codepage cp437}
+var
+  U: UnicodeString;
+  A: AnsiString;
+  S: ShortString;
+begin
+  U := #222'v'#221;
+  A := #222'v'#221;
+  writeln(U, ' ', Ord(A[1]), ' ', Length(A));
+  U := '*.*';
+  S := ShortString(U);
+  writeln(S, ' ', Pos('*', S));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "\u{2590}v\u{258c} 222 3\n*.* 1\n");
+    }
+
+    #[test]
+    fn calling_a_method_with_wrong_arguments_is_an_error() {
+        let result = MiniPascal.build(
+            "program T;
+type
+  TW = object
+    procedure Close;
+    procedure Run;
+  end;
+procedure TW.Close; begin end;
+procedure TW.Run;
+var F: Text;
+begin
+  Close(F);
+end;
+begin
+end.
+",
+        );
+        let Err(e) = result else {
+            panic!("the call should not compile");
+        };
+        assert!(format!("{e:?}").contains("takes 0 argument(s), found 1"), "{e:?}");
+    }
+
+    #[test]
     fn conditional_compilation() {
         let (ok, out) = build_and_run_source(
             "program T;

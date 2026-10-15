@@ -25,6 +25,7 @@ function bruto_ustr_to_utf8(S: Pointer): Pointer;
 function bruto_wchar_to_ustr(C: Int64): Pointer;
 function bruto_wchar_to_utf8(C: Int64): Pointer;
 function bruto_utf8_first_wchar(S: Pointer): Int64;
+function bruto_ustr_from_units(P: Pointer; Len: Int64): Pointer;
 function bruto_ustr_concat(A, B: Pointer): Pointer;
 function bruto_ustr_compare(A, B: Pointer): Int64;
 function bruto_ustr_copy(S: Pointer; Index, Count: Int64): Pointer;
@@ -311,6 +312,17 @@ begin
   if Code > $FFFF then
     Code := $D800 + ((Code - $10000) shr 10);
   bruto_utf8_first_wchar := Code;
+end;
+
+{ A string of the Len units at P (a literal's UTF-16 data). }
+function bruto_ustr_from_units(P: Pointer; Len: Int64): Pointer;
+var
+  R: PBrutoUnits;
+begin
+  R := PBrutoUnits(bruto_ustr_alloc(Len));
+  if Len > 0 then
+    Move(P^, R^[0], Len * 2);
+  bruto_ustr_from_units := R;
 end;
 
 function bruto_ustr_concat(A, B: Pointer): Pointer;

@@ -17,7 +17,7 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::BasicType;
-use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::values::{AsValueRef, BasicValue, BasicValueEnum, FunctionValue, PointerValue};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -136,6 +136,10 @@ pub struct CodeGen<'ctx> {
     loop_targets: Vec<(BasicBlock<'ctx>, BasicBlock<'ctx>)>,
     /// Hidden locals made so far (for `for-in` loops), for unique names.
     hidden_count: u32,
+    /// The Unicode text of each string literal's global (by address),
+    /// so a literal stored as a UnicodeString becomes UTF-16 at compile
+    /// time, in its source's code page.
+    literal_texts: HashMap<usize, String>,
     // How many pointers `create_debug_type` is currently inside.
     debug_pointer_depth: std::cell::Cell<u32>,
     // Overloaded routines: base name -> one symbol per signature.
@@ -240,6 +244,7 @@ impl<'ctx> CodeGen<'ctx> {
             label_blocks: HashMap::new(),
             loop_targets: Vec::new(),
             hidden_count: 0,
+            literal_texts: HashMap::new(),
             exit_block: None,
             end_bp_slots: HashMap::new(),
             debug_pointer_depth: std::cell::Cell::new(0),
@@ -1384,10 +1389,10 @@ impl<'ctx> CodeGen<'ctx> {
             // zeros; for `array of WideChar`, their UTF-16 units.
             (_, PascalType::Array { lo, hi, elem })
                 if self.resolve_type(elem) == PascalType::WideChar
-                    && literal_text(value).is_some() =>
+                    && literal_text(value, true).is_some() =>
             {
                 let span = &value.span();
-                let units: Vec<u16> = literal_text(value).unwrap().encode_utf16().collect();
+                let units: Vec<u16> = literal_text(value, true).unwrap().encode_utf16().collect();
                 let len = (hi - lo + 1) as usize;
                 if units.len() > len {
                     return Err(CodeGenError::new(
@@ -1419,10 +1424,10 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(())
             }
             (_, PascalType::Array { lo, hi, elem })
-                if self.resolve_type(elem) == PascalType::Char && literal_text(value).is_some() =>
+                if self.resolve_type(elem) == PascalType::Char && literal_text(value, false).is_some() =>
             {
                 let span = &value.span();
-                let bytes: Vec<u8> = literal_text(value)
+                let bytes: Vec<u8> = literal_text(value, false)
                     .unwrap()
                     .chars()
                     .map(|c| c as u32 as u8)
@@ -5290,7 +5295,16 @@ impl<'ctx> CodeGen<'ctx> {
                 .i16_type()
                 .const_int(u64::from(*c), false)
                 .into()),
-            Expr::StrLit(s, _) => Ok(self.string_literal(s).into()),
+            Expr::StrLit(s, _) => {
+                let p = self.string_literal(s);
+                self.literal_texts.insert(p.as_value_ref() as usize, s.clone());
+                Ok(p.into())
+            }
+            Expr::CodePageStrLit(bytes, text, _) => {
+                let p = self.string_literal(bytes);
+                self.literal_texts.insert(p.as_value_ref() as usize, text.clone());
+                Ok(p.into())
+            }
             Expr::BoolLit(b, _) => Ok(self
                 .context
                 .bool_type()
@@ -5617,7 +5631,11 @@ impl<'ctx> CodeGen<'ctx> {
                         && self.is_addressable(&args[0])
                         && !matches!(
                             self.resolve_type(&self.infer_declared_type(&args[0])),
-                            PascalType::String | PascalType::ShortString { .. }
+                            PascalType::String
+                                | PascalType::ShortString { .. }
+                                | PascalType::UnicodeString
+                                | PascalType::WideChar
+                                | PascalType::Char
                         )
                     {
                         let (address, _) = self.resolve_array_base(&args[0], *span)?;
@@ -8538,7 +8556,7 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::RealLit(..) => PascalType::Real,
             Expr::CharLit(..) => PascalType::Char,
             Expr::WideCharLit(..) => PascalType::WideChar,
-            Expr::StrLit(..) => PascalType::String,
+            Expr::StrLit(..) | Expr::CodePageStrLit(..) => PascalType::String,
             Expr::BoolLit(..) => PascalType::Boolean,
             Expr::Var(name, _) => self
                 .lookup_var_type(name.as_str())
@@ -9208,9 +9226,13 @@ fn collect_captures_expr(
 
 /// The text of a constant string: a literal, a character, or literals
 /// joined with `+` (`#$250C#$2500 + #$2510`).
-fn literal_text(expr: &Expr) -> Option<String> {
+///
+/// A `{$codepage}` string gives its Unicode text when `wide`, else its
+/// bytes.
+fn literal_text(expr: &Expr, wide: bool) -> Option<String> {
     match expr {
         Expr::StrLit(text, _) => Some(text.clone()),
+        Expr::CodePageStrLit(bytes, text, _) => Some(if wide { text } else { bytes }.clone()),
         Expr::CharLit(c, _) => Some(char::from(*c).to_string()),
         Expr::WideCharLit(c, _) => char::from_u32(u32::from(*c)).map(|c| c.to_string()),
         Expr::BinOp {
@@ -9218,7 +9240,7 @@ fn literal_text(expr: &Expr) -> Option<String> {
             left,
             right,
             ..
-        } => Some(literal_text(left)? + &literal_text(right)?),
+        } => Some(literal_text(left, wide)? + &literal_text(right, wide)?),
         _ => None,
     }
 }

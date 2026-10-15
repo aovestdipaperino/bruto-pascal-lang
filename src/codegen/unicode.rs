@@ -12,7 +12,7 @@ use super::{CodeGen, CodeGenError};
 use crate::ast::*;
 use inkwell::AddressSpace;
 use inkwell::types::StructType;
-use inkwell::values::BasicValue;
+use inkwell::values::{AsValueRef, BasicValue};
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, IntValue, PointerValue};
 
 impl<'ctx> CodeGen<'ctx> {
@@ -130,11 +130,43 @@ impl<'ctx> CodeGen<'ctx> {
                 let code = self.char_code(ch, span)?;
                 self.ustr_runtime("bruto_wchar_to_ustr", &[code.into()], span)
             }
-            BasicValueEnum::PointerValue(p) => {
-                self.ustr_runtime("bruto_utf8_to_ustr", &[p.into()], span)
-            }
+            BasicValueEnum::PointerValue(p) => match self.literal_text_of(p) {
+                Some(text) => self.ustr_constant(&text, span),
+                None => self.ustr_runtime("bruto_utf8_to_ustr", &[p.into()], span),
+            },
             _ => Ok(val),
         }
+    }
+
+    /// The Unicode text of `p`, if it is a string literal's global.
+    pub(super) fn literal_text_of(&self, p: PointerValue<'ctx>) -> Option<String> {
+        self.literal_texts.get(&(p.as_value_ref() as usize)).cloned()
+    }
+
+    /// A fresh UnicodeString holding `text`, built from UTF-16 data fixed
+    /// at compile time.
+    fn ustr_constant(&self, text: &str, span: Span) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        if units.is_empty() {
+            return Ok(self.empty_ustr());
+        }
+        let i16_ty = self.context.i16_type();
+        let values: Vec<_> = units
+            .iter()
+            .map(|&u| i16_ty.const_int(u64::from(u), false))
+            .collect();
+        let data = i16_ty.const_array(&values);
+        let global = self.module.add_global(data.get_type(), None, "ustr_lit");
+        global.set_linkage(inkwell::module::Linkage::Private);
+        global.set_constant(true);
+        global.set_unnamed_addr(true);
+        global.set_initializer(&data);
+        let len = self.context.i64_type().const_int(units.len() as u64, false);
+        self.ustr_runtime(
+            "bruto_ustr_from_units",
+            &[global.as_pointer_value().into(), len.into()],
+            span,
+        )
     }
 
     /// `val` as a `String` when it is a UnicodeString or a WideChar
@@ -169,6 +201,12 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let i16_ty = self.context.i16_type();
+        if let BasicValueEnum::PointerValue(p) = val
+            && let Some(text) = self.literal_text_of(p)
+        {
+            let unit = text.encode_utf16().next().unwrap_or(0);
+            return Ok(i16_ty.const_int(u64::from(unit), false).into());
+        }
         let code = match val {
             BasicValueEnum::PointerValue(p) => self
                 .call_ustr_runtime("bruto_utf8_first_wchar", &[p.into()], span)?

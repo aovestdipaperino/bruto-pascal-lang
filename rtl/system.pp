@@ -12,7 +12,8 @@ type
 
   TSystemCodePage = Word;
 
-{ Bruto doesn't track heap use: the figures are all zero. }
+{ The C library's heap, which Bruto allocates from: on macOS the default
+  malloc zone's statistics; elsewhere the figures are zero. }
 function GetFPCHeapStatus: TFPCHeapStatus;
 { Bruto's AnsiStrings carry no code page: they are all UTF-8 (65001), and
   setting one changes nothing. }
@@ -26,11 +27,34 @@ function IndexByte(const Buf; Len: SizeInt; B: Byte): SizeInt;
 
 implementation
 
+{$ifdef DARWIN}
+type
+  TBrutoMallocStatistics = record
+    BlocksInUse, Padding: LongWord;
+    SizeInUse, MaxSizeInUse, SizeAllocated: PtrUInt;
+  end;
+
+procedure bruto_malloc_zone_statistics(Zone: Pointer; var Stats: TBrutoMallocStatistics);
+  cdecl; external 'c' name 'malloc_zone_statistics';
+{$endif}
+
 function GetFPCHeapStatus: TFPCHeapStatus;
 var
   Status: TFPCHeapStatus;
+{$ifdef DARWIN}
+  Stats: TBrutoMallocStatistics;
+{$endif}
 begin
   FillChar(Status, SizeOf(Status), 0);
+{$ifdef DARWIN}
+  FillChar(Stats, SizeOf(Stats), 0);
+  bruto_malloc_zone_statistics(nil, Stats);
+  Status.CurrHeapUsed := Stats.SizeInUse;
+  Status.CurrHeapSize := Stats.SizeAllocated;
+  Status.CurrHeapFree := Stats.SizeAllocated - Stats.SizeInUse;
+  Status.MaxHeapUsed := Stats.MaxSizeInUse;
+  Status.MaxHeapSize := Stats.SizeAllocated;
+{$endif}
   GetFPCHeapStatus := Status;
 end;
 

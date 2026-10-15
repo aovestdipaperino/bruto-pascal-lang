@@ -443,8 +443,23 @@ impl<'ctx> CodeGen<'ctx> {
         if m.kind == RoutineKind::Constructor {
             call_args.push(vmt.unwrap_or_else(|| ptr.const_null()).into());
         }
+        let hidden = call_args.len();
         call_args.extend(self.compile_call_args(&m.symbol, args, span)?);
         let fn_type = self.method_fn_type(&m);
+        // As in FPC, a method hides the routine of the same name: `Close(F)`
+        // inside a window's method means its `Close`, and is an error.
+        if call_args.len() != fn_type.count_param_types() as usize {
+            return Err(CodeGenError::new(
+                format!(
+                    "'{}.{}' takes {} argument(s), found {}",
+                    self.display(object),
+                    self.display(method),
+                    fn_type.count_param_types() as usize - hidden,
+                    args.len()
+                ),
+                Some(span),
+            ));
+        }
 
         let result = match (dispatch, m.slot, info.vmt_field) {
             (Dispatch::Virtual, Some(slot), Some(vmt_index)) => {

@@ -719,6 +719,10 @@ pub enum Expr {
     /// A character code above 255, `#$2502`: a `WideChar`.
     WideCharLit(u16, Span),
     StrLit(String, Span),
+    /// A string from a `{$codepage cp437}` source with characters above
+    /// 127: the bytes (as an AnsiString holds them) and the Unicode text
+    /// they mean (as a UnicodeString gets it).
+    CodePageStrLit(String, String, Span),
     BoolLit(bool, Span),
     Var(String, Span),
     BinOp {
@@ -806,6 +810,7 @@ impl Expr {
             | Self::CharLit(_, s)
             | Self::WideCharLit(_, s)
             | Self::StrLit(_, s)
+            | Self::CodePageStrLit(_, _, s)
             | Self::BoolLit(_, s)
             | Self::Var(_, s) => *s,
             Self::BinOp { span, .. }

@@ -557,6 +557,7 @@ fn rewrite_expr<R: Rename>(e: &mut Expr, n: &R) {
         | Expr::CharLit(..)
         | Expr::WideCharLit(..)
         | Expr::StrLit(..)
+        | Expr::CodePageStrLit(..)
         | Expr::BoolLit(..)
         | Expr::Nil(_) => {}
     }
