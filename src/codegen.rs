@@ -2763,8 +2763,10 @@ impl<'ctx> CodeGen<'ctx> {
             Statement::PlaceAssignment { target, expr, span } => {
                 self.set_debug_loc(*span);
                 let val = self.compile_expr(expr)?;
+                // A dynamic string's character is replaced through the
+                // runtime; a short string's is stored in its buffer below.
                 if let Expr::Index { array, index, .. } = target
-                    && self.is_string_expr(array)
+                    && self.resolve_type(&self.infer_declared_type(array)) == PascalType::String
                 {
                     let (slot, _) = self.resolve_array_base(array, *span)?;
                     let idx = self.compile_expr(index)?;
@@ -5494,24 +5496,42 @@ impl<'ctx> CodeGen<'ctx> {
                             )
                         });
                 }
-                // `New(PType, Init(args))`: construct and return an object.
+                // `New(PType, Init(args))` (or `Init` without arguments):
+                // construct and return an object.
                 if name == "new"
                     && args.len() == 2
-                    && let (
-                        Expr::Var(ptype, _),
+                    && let Expr::Var(ptype, _) = &args[0]
+                    && let Some(target) = self.cast_target(ptype)
+                {
+                    let (ctor, ctor_args): (&str, &[Expr]) = match &args[1] {
                         Expr::Call {
                             name: ctor,
                             args: ctor_args,
                             ..
-                        },
-                    ) = (&args[0], &args[1])
-                    && let Some(target) = self.cast_target(ptype)
-                {
+                        } => (ctor, ctor_args),
+                        Expr::Var(ctor, _) => (ctor, &[]),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                "New's second argument must be a constructor call",
+                                Some(*span),
+                            ));
+                        }
+                    };
                     return self.construct_new(&target, ctor, ctor_args, *span);
                 }
                 // `String(x)`: a string stays as it is; a char becomes a
                 // one-character string.
                 if name == "string" && args.len() == 1 {
+                    // `String(P^)` with an untyped `P`: the short string
+                    // there, as in Turbo Pascal and FPC's default modes.
+                    if let Expr::Deref(inner, _) = &args[0]
+                        && let PascalType::Pointer(pointed) =
+                            self.resolve_type(&self.infer_declared_type(inner))
+                        && *pointed == PascalType::Untyped
+                    {
+                        let address = self.compile_expr(inner)?.into_pointer_value();
+                        return self.short_to_c_string(address, *span);
+                    }
                     let val = self.compile_expr(&args[0])?;
                     if val.is_pointer_value() {
                         return Ok(val);
@@ -5571,6 +5591,29 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 // Built-in functions
                 if name == "length" && args.len() == 1 {
+                    // A short string's length is its length byte, whatever
+                    // its characters are.
+                    if self.is_addressable(&args[0])
+                        && matches!(
+                            self.resolve_type(&self.infer_declared_type(&args[0])),
+                            PascalType::ShortString { .. }
+                        )
+                    {
+                        let err = |e: inkwell::builder::BuilderError| {
+                            CodeGenError::new(e.to_string(), Some(*span))
+                        };
+                        let (slot, _) = self.resolve_array_base(&args[0], *span)?;
+                        let len = self
+                            .builder
+                            .build_load(self.context.i8_type(), slot, "short_len")
+                            .map_err(err)?
+                            .into_int_value();
+                        return Ok(self
+                            .builder
+                            .build_int_z_extend(len, self.context.i64_type(), "len")
+                            .map_err(err)?
+                            .into());
+                    }
                     let val = self.compile_expr(&args[0])?;
                     let f = self.module.get_function("bruto_str_length").unwrap();
                     let r = self

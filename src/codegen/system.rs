@@ -617,6 +617,62 @@ impl<'ctx> CodeGen<'ctx> {
                     .basic()
                     .unwrap()
             }
+            // SysUtils.Format(Fmt, [Args]): SysUtils' BrutoCFormat makes the
+            // format C's, then snprintf fills it in.
+            ("format", 2) if self.module.get_function("brutocformat").is_some() => {
+                let Expr::SetConstructor { elements, .. } = &args[1] else {
+                    return Err(CodeGenError::new(
+                        "Format takes its values as a list: Format(Fmt, [A, B])",
+                        Some(span),
+                    ));
+                };
+                let c_format = self.compile_expr(&Expr::Call {
+                    name: "brutocformat".to_string(),
+                    args: vec![args[0].clone()],
+                    span,
+                })?;
+                let mut values: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+                for element in elements {
+                    let SetElement::Single(e) = element else {
+                        return Err(CodeGenError::new(
+                            "a range can't be a Format value",
+                            Some(span),
+                        ));
+                    };
+                    let v = self.compile_expr(e)?;
+                    let v = self.as_string_value(v, span)?;
+                    let v: BasicValueEnum = if v.is_int_value() {
+                        self.to_i64(v, span)?.into()
+                    } else {
+                        v
+                    };
+                    values.push(v.into());
+                }
+                let malloc = self.libc("malloc", ptr.fn_type(&[i64_ty.into()], false));
+                let buf = self
+                    .builder
+                    .build_call(malloc, &[i64_ty.const_int(1024, false).into()], "formatted")
+                    .map_err(err)?
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap();
+                let snprintf = self.libc(
+                    "snprintf",
+                    self.context
+                        .i32_type()
+                        .fn_type(&[ptr.into(), i64_ty.into(), ptr.into()], true),
+                );
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![
+                    buf.into(),
+                    i64_ty.const_int(1024, false).into(),
+                    c_format.into(),
+                ];
+                call_args.extend(values);
+                self.builder
+                    .build_call(snprintf, &call_args, "")
+                    .map_err(err)?;
+                buf
+            }
             // HexStr(Value, Digits): the low `Digits` hex digits of Value.
             ("hexstr", 2) => {
                 let value = self.compile_expr(&args[0])?;
@@ -819,7 +875,7 @@ impl<'ctx> CodeGen<'ctx> {
             ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) | ("unicodetoutf8", 4) => {
                 PascalType::Integer
             }
-            ("paramstr", 1) | ("hexstr", 2) => PascalType::String,
+            ("paramstr", 1) | ("hexstr", 2) | ("format", 2) => PascalType::String,
             ("get_frame" | "get_pc_addr", 0) | ("get_caller_frame", 1 | 2) => {
                 PascalType::Pointer(Box::new(PascalType::Untyped))
             }

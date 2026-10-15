@@ -1101,6 +1101,33 @@ fn eval_primary(t: &[CondTok], pos: &mut usize, defs: &HashSet<String>) -> Optio
                 _ => 0,
             })
         }
+        // `sizeof(T)`. The preprocessor can't see declarations, so this
+        // knows the built-in types, plus Free Vision's `Sw_` aliases,
+        // which follow `FV_UNICODE`.
+        CondTok::Word(w) if w == "SIZEOF" => {
+            (t.get(*pos) == Some(&CondTok::Op("(".into()))).then(|| *pos += 1)?;
+            let Some(CondTok::Word(name)) = t.get(*pos).cloned() else {
+                return None;
+            };
+            *pos += 1;
+            (t.get(*pos) == Some(&CondTok::Op(")".into()))).then(|| *pos += 1)?;
+            let unicode = defs.contains("FV_UNICODE");
+            Some(match name.as_str() {
+                "BYTE" | "SHORTINT" | "CHAR" | "ANSICHAR" | "BOOLEAN" => 1,
+                "WORD" | "SMALLINT" | "WIDECHAR" => 2,
+                "LONGINT" | "LONGWORD" | "CARDINAL" | "DWORD" => 4,
+                "INTEGER" | "INT64" | "QWORD" | "POINTER" | "PTRINT" | "PTRUINT" | "SIZEINT"
+                | "SIZEUINT" | "ANSISTRING" | "UNICODESTRING" | "WIDESTRING" | "REAL"
+                | "DOUBLE" => 8,
+                "SHORTSTRING" => 256,
+                "SW_STRING" if unicode => 8,
+                "SW_STRING" => 256,
+                "SW_CHAR" if unicode => 2,
+                "SW_CHAR" => 1,
+                "SW_WORD" | "SW_INTEGER" => 8,
+                _ => return None,
+            })
+        }
         CondTok::Word(w) => Some(match w.as_str() {
             "TRUE" => 1,
             "FALSE" => 0,
@@ -1133,6 +1160,9 @@ pub struct Parser {
     pub directives: Directives,
     /// A preprocessing error, reported by the first `parse_*` call.
     lex_error: Option<ParseError>,
+    /// The routines whose bodies are being parsed, innermost last: name
+    /// and parameter names, for a bare `inherited`.
+    routines: Vec<(String, Vec<String>)>,
 }
 
 impl Parser {
@@ -1161,6 +1191,7 @@ impl Parser {
             pos: 0,
             directives: lexer.directives,
             lex_error: lexer.error,
+            routines: Vec::new(),
         }
     }
 
@@ -2271,7 +2302,15 @@ impl Parser {
         decl.type_decls = decls.type_decls;
         decl.vars = decls.vars;
         decl.nested_procs = decls.procedures;
-        decl.body = self.parse_block()?;
+        let params = decl
+            .params
+            .iter()
+            .flat_map(|g| g.names.iter().cloned())
+            .collect();
+        self.routines.push((decl.name.clone(), params));
+        let body = self.parse_block();
+        self.routines.pop();
+        decl.body = body?;
         self.expect(&Tok::Semi)?;
         Ok(decl)
     }
@@ -2528,6 +2567,14 @@ impl Parser {
             Tok::KwInherited => {
                 let span = self.span();
                 self.advance();
+                // A bare `inherited;` calls the same method with the same
+                // arguments.
+                if matches!(self.peek(), Tok::Semi | Tok::End | Tok::Else | Tok::Until)
+                    && let Some((method, params)) = self.routines.last().cloned()
+                {
+                    let args = params.into_iter().map(|p| Expr::Var(p, span)).collect();
+                    return Ok(Statement::Inherited { method, args, span });
+                }
                 let (method, _) = self.expect_member_name()?;
                 let args = self.parse_call_args()?;
                 Ok(Statement::Inherited { method, args, span })

@@ -18,6 +18,8 @@ const UNITS: &[(&str, &str)] = &[
     ("unix.pp", include_str!("../rtl/unix.pp")),
     ("termio.pp", include_str!("../rtl/termio.pp")),
     ("dos.pp", include_str!("../rtl/dos.pp")),
+    ("cwstring.pp", include_str!("../rtl/cwstring.pp")),
+    ("sysutils.pp", include_str!("../rtl/sysutils.pp")),
     ("brutoconsole.pp", include_str!("../rtl/brutoconsole.pp")),
     ("video.pp", include_str!("../rtl/video.pp")),
     ("keyboard.pp", include_str!("../rtl/keyboard.pp")),

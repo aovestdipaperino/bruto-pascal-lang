@@ -3120,6 +3120,51 @@ end.
     }
 
     #[test]
+    fn sysutils_format_and_string_edges() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}
+uses SysUtils;
+type
+  TBase = object
+    procedure Show(N: Integer); virtual;
+    constructor Init;
+  end;
+  TChild = object(TBase)
+    procedure Show(N: Integer); virtual;
+  end;
+constructor TBase.Init; begin end;
+procedure TBase.Show(N: Integer); begin writeln('base ', N); end;
+procedure TChild.Show(N: Integer);
+begin
+  writeln('child');
+  inherited;
+end;
+var
+  C: TChild;
+  Never: AnsiString;
+  S: string[20];
+begin
+  writeln(Format('$%4.4x|%d|%s|%5s', [255, -7, 'ab', 'r']));
+  writeln(IntToStr(42), ' ', IntToHex(171, 2), ' ', UpperCase('MiX'), ' [', Trim('  t  '), ']');
+  C.Init;
+  C.Show(3);
+  writeln(Never = '', ' [', Copy('hello', 0, 2), '] [', Copy('hi', 2, 50), ']');
+  S := 'abc';
+  Inc(S[0]);
+  S[Length(S)] := '/';
+  writeln(S, ' ', Length(S));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "$00FF|-7|ab|    r\n42 AB MIX [t]\nchild\nbase 3\ntrue [he] [i]\nabc/ 4\n"
+        );
+    }
+
+    #[test]
     fn conditional_compilation() {
         let (ok, out) = build_and_run_source(
             "program T;
