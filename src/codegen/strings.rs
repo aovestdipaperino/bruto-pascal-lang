@@ -83,6 +83,157 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// `bruto_latin1_to_utf8(dest, max, src, n) -> i64`: FPC's
+    /// `UnicodeToUtf8` for 8-bit characters. Writes at most `max - 1`
+    /// bytes and a NUL to `dest` (or only counts, when `dest` is nil) and
+    /// returns the bytes used, the NUL included.
+    pub(super) fn latin1_to_utf8_fn(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("bruto_latin1_to_utf8") {
+            return f;
+        }
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let i8_ty = self.context.i8_type();
+        let i64_ty = self.context.i64_type();
+        let f = self.module.add_function(
+            "bruto_latin1_to_utf8",
+            i64_ty.fn_type(
+                &[ptr.into(), i64_ty.into(), ptr.into(), i64_ty.into()],
+                false,
+            ),
+            None,
+        );
+        f.set_linkage(Linkage::Internal);
+        let b = self.context.create_builder();
+        let entry = self.context.append_basic_block(f, "entry");
+        let head = self.context.append_basic_block(f, "head");
+        let body = self.context.append_basic_block(f, "body");
+        let write = self.context.append_basic_block(f, "write");
+        let write_ascii = self.context.append_basic_block(f, "write_ascii");
+        let write_pair = self.context.append_basic_block(f, "write_pair");
+        let next = self.context.append_basic_block(f, "next");
+        let done = self.context.append_basic_block(f, "done");
+        let terminate = self.context.append_basic_block(f, "terminate");
+        let finish = self.context.append_basic_block(f, "finish");
+        let dest = f.get_nth_param(0).unwrap().into_pointer_value();
+        let max = f.get_nth_param(1).unwrap().into_int_value();
+        let src = f.get_nth_param(2).unwrap().into_pointer_value();
+        let n = f.get_nth_param(3).unwrap().into_int_value();
+        let zero = i64_ty.const_zero();
+        let one = i64_ty.const_int(1, false);
+
+        b.position_at_end(entry);
+        let counting = b.build_is_null(dest, "counting").unwrap();
+        b.build_unconditional_branch(head).unwrap();
+
+        // head: i, out
+        b.position_at_end(head);
+        let i = b.build_phi(i64_ty, "i").unwrap();
+        let out = b.build_phi(i64_ty, "out").unwrap();
+        let iv = i.as_basic_value().into_int_value();
+        let outv = out.as_basic_value().into_int_value();
+        let more = b
+            .build_int_compare(inkwell::IntPredicate::SLT, iv, n, "more")
+            .unwrap();
+        b.build_conditional_branch(more, body, done).unwrap();
+
+        // body: one character, one or two bytes
+        b.position_at_end(body);
+        let at = unsafe { b.build_in_bounds_gep(i8_ty, src, &[iv], "at").unwrap() };
+        let c = b.build_load(i8_ty, at, "c").unwrap().into_int_value();
+        let c = b.build_int_z_extend(c, i64_ty, "c64").unwrap();
+        let ascii = b
+            .build_int_compare(
+                inkwell::IntPredicate::ULT,
+                c,
+                i64_ty.const_int(0x80, false),
+                "ascii",
+            )
+            .unwrap();
+        let need = b
+            .build_select(ascii, one, i64_ty.const_int(2, false), "need")
+            .unwrap()
+            .into_int_value();
+        let new_out = b.build_int_add(outv, need, "new_out").unwrap();
+        // Room for the bytes and the NUL?
+        let fits = b
+            .build_int_compare(inkwell::IntPredicate::SLT, new_out, max, "fits")
+            .unwrap();
+        let ok = b.build_or(counting, fits, "ok").unwrap();
+        b.build_conditional_branch(ok, write, done).unwrap();
+
+        b.position_at_end(write);
+        let skip_write = counting;
+        let to_ascii = b
+            .build_and(ascii, b.build_not(skip_write, "w").unwrap(), "to_ascii")
+            .unwrap();
+        let to_pair = b
+            .build_and(
+                b.build_not(ascii, "na").unwrap(),
+                b.build_not(skip_write, "w2").unwrap(),
+                "to_pair",
+            )
+            .unwrap();
+        let check_pair = self.context.append_basic_block(f, "check_pair");
+        b.build_conditional_branch(to_ascii, write_ascii, check_pair)
+            .unwrap();
+        b.position_at_end(check_pair);
+        b.build_conditional_branch(to_pair, write_pair, next)
+            .unwrap();
+
+        b.position_at_end(write_ascii);
+        let slot = unsafe { b.build_in_bounds_gep(i8_ty, dest, &[outv], "slot").unwrap() };
+        let byte = b.build_int_truncate(c, i8_ty, "byte").unwrap();
+        b.build_store(slot, byte).unwrap();
+        b.build_unconditional_branch(next).unwrap();
+
+        b.position_at_end(write_pair);
+        let lead = b
+            .build_or(
+                b.build_right_shift(c, i64_ty.const_int(6, false), false, "hi6")
+                    .unwrap(),
+                i64_ty.const_int(0xC0, false),
+                "lead",
+            )
+            .unwrap();
+        let trail = b
+            .build_or(
+                b.build_and(c, i64_ty.const_int(0x3F, false), "lo6")
+                    .unwrap(),
+                i64_ty.const_int(0x80, false),
+                "trail",
+            )
+            .unwrap();
+        let slot = unsafe { b.build_in_bounds_gep(i8_ty, dest, &[outv], "slot").unwrap() };
+        b.build_store(slot, b.build_int_truncate(lead, i8_ty, "l8").unwrap())
+            .unwrap();
+        let out1 = b.build_int_add(outv, one, "out1").unwrap();
+        let slot = unsafe {
+            b.build_in_bounds_gep(i8_ty, dest, &[out1], "slot2")
+                .unwrap()
+        };
+        b.build_store(slot, b.build_int_truncate(trail, i8_ty, "t8").unwrap())
+            .unwrap();
+        b.build_unconditional_branch(next).unwrap();
+
+        b.position_at_end(next);
+        let i1 = b.build_int_add(iv, one, "i1").unwrap();
+        b.build_unconditional_branch(head).unwrap();
+        i.add_incoming(&[(&zero, entry), (&i1, next)]);
+        out.add_incoming(&[(&zero, entry), (&new_out, next)]);
+
+        b.position_at_end(done);
+        b.build_conditional_branch(counting, finish, terminate)
+            .unwrap();
+        b.position_at_end(terminate);
+        let slot = unsafe { b.build_in_bounds_gep(i8_ty, dest, &[outv], "end").unwrap() };
+        b.build_store(slot, i8_ty.const_zero()).unwrap();
+        b.build_unconditional_branch(finish).unwrap();
+        b.position_at_end(finish);
+        let total = b.build_int_add(outv, one, "total").unwrap();
+        b.build_return(Some(&total)).unwrap();
+        f
+    }
+
     /// `bruto_short_to_cstr(short) -> ptr`: copy a short string's
     /// characters into a new NUL-terminated buffer.
     fn short_to_c_string_fn(&self) -> FunctionValue<'ctx> {

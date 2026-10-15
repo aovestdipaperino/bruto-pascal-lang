@@ -162,14 +162,7 @@ fn add_decls(
 /// The values of enumerations declared inside `ty`, which are names in
 /// the enclosing scope.
 fn enum_values(ty: &PascalType, out: &mut HashSet<String>) {
-    match ty {
-        PascalType::Enum { values, .. } => out.extend(values.iter().map(|v| lower(v))),
-        PascalType::Set { elem }
-        | PascalType::Array { elem, .. }
-        | PascalType::ArrayExpr { elem, .. }
-        | PascalType::Pointer(elem) => enum_values(elem, out),
-        _ => {}
-    }
+    ty.for_each_enum(&mut |values| out.extend(values.iter().map(|v| lower(v))));
 }
 
 /// Every object type's parent and own fields and methods, which a

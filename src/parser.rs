@@ -1376,6 +1376,7 @@ impl Parser {
 
         // Implementation may have its own (private) uses clause.
         // We accept it and merge it with the interface uses.
+        let interface_uses = uses.clone();
         let mut all_uses = uses;
         if *self.peek() == Tok::KwUses {
             for u in self.parse_uses_clause()? {
@@ -1438,6 +1439,7 @@ impl Parser {
         Ok(Unit {
             name,
             uses: all_uses,
+            interface_uses,
             interface_consts,
             interface_types,
             interface_vars,

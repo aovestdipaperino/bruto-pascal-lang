@@ -165,6 +165,152 @@ impl<'ctx> CodeGen<'ctx> {
         let i64_ty = self.context.i64_type();
         let void = self.context.void_type();
         match (name, args.len()) {
+            // Erase(F) / Rename(F, NewName): the file `Assign` named
+            // (its path is the second word of the runtime's file record).
+            ("erase", 1) | ("rename", 2) => {
+                let (slot, _) = self.resolve_array_base(&args[0], span)?;
+                let file = self
+                    .builder
+                    .build_load(ptr, slot, "file")
+                    .map_err(err)?
+                    .into_pointer_value();
+                let path_slot = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(
+                            self.context.i8_type(),
+                            file,
+                            &[i64_ty.const_int(8, false)],
+                            "path_slot",
+                        )
+                        .map_err(err)?
+                };
+                let path = self
+                    .builder
+                    .build_load(ptr, path_slot, "path")
+                    .map_err(err)?;
+                let status = if name == "erase" {
+                    let unlink = self.libc("unlink", i32_ty.fn_type(&[ptr.into()], false));
+                    self.builder
+                        .build_call(unlink, &[path.into()], "unlink")
+                        .map_err(err)?
+                } else {
+                    let new_name = self.compile_expr(&args[1])?;
+                    let rename =
+                        self.libc("rename", i32_ty.fn_type(&[ptr.into(), ptr.into()], false));
+                    let status = self
+                        .builder
+                        .build_call(rename, &[path.into(), new_name.into()], "rename")
+                        .map_err(err)?;
+                    let strdup = self.libc("strdup", ptr.fn_type(&[ptr.into()], false));
+                    let copy = self
+                        .builder
+                        .build_call(strdup, &[new_name.into()], "new_path")
+                        .map_err(err)?
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap();
+                    self.builder.build_store(path_slot, copy).map_err(err)?;
+                    status
+                };
+                // A failure is I/O error 2 (file not found) in InOutRes.
+                let status = status
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap()
+                    .into_int_value();
+                let failed = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        status,
+                        i32_ty.const_zero(),
+                        "io_failed",
+                    )
+                    .map_err(err)?;
+                let code = self
+                    .builder
+                    .build_select(
+                        failed,
+                        i32_ty.const_int(2, false),
+                        i32_ty.const_zero(),
+                        "io",
+                    )
+                    .map_err(err)?;
+                let inoutres = self.global_vars["inoutres"];
+                self.builder.build_store(inoutres, code).map_err(err)?;
+            }
+            // GetDir(Drive, Dir): the current directory (drives don't
+            // exist here).
+            ("getdir", 2) => {
+                let (slot, ty) = self.resolve_array_base(&args[1], span)?;
+                let malloc = self.libc("malloc", ptr.fn_type(&[i64_ty.into()], false));
+                let buf = self
+                    .builder
+                    .build_call(malloc, &[i64_ty.const_int(4096, false).into()], "cwd_buf")
+                    .map_err(err)?
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap();
+                let getcwd = self.libc("getcwd", ptr.fn_type(&[ptr.into(), i64_ty.into()], false));
+                self.builder
+                    .build_call(
+                        getcwd,
+                        &[buf.into(), i64_ty.const_int(4096, false).into()],
+                        "cwd",
+                    )
+                    .map_err(err)?;
+                self.store_value(slot, buf, &ty, span)?;
+            }
+            // ChDir / MkDir / RmDir(Path), reporting failure in InOutRes.
+            ("chdir" | "mkdir" | "rmdir", 1) => {
+                let path = self.compile_expr(&args[0])?;
+                let status = match name {
+                    "mkdir" => {
+                        let mkdir =
+                            self.libc("mkdir", i32_ty.fn_type(&[ptr.into(), i32_ty.into()], false));
+                        self.builder
+                            .build_call(
+                                mkdir,
+                                &[path.into(), i32_ty.const_int(0o777, false).into()],
+                                "mkdir",
+                            )
+                            .map_err(err)?
+                    }
+                    _ => {
+                        let f = self.libc(name, i32_ty.fn_type(&[ptr.into()], false));
+                        self.builder
+                            .build_call(f, &[path.into()], name)
+                            .map_err(err)?
+                    }
+                };
+                let status = status
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap()
+                    .into_int_value();
+                let failed = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        status,
+                        i32_ty.const_zero(),
+                        "io_failed",
+                    )
+                    .map_err(err)?;
+                let code = self
+                    .builder
+                    .build_select(
+                        failed,
+                        i32_ty.const_int(3, false),
+                        i32_ty.const_zero(),
+                        "io",
+                    )
+                    .map_err(err)?;
+                let inoutres = self.global_vars["inoutres"];
+                self.builder.build_store(inoutres, code).map_err(err)?;
+            }
+            // Assert(Cond [, Msg]): off, as in FPC without `{$C+}`.
+            ("assert", 1 | 2) => {}
             // Move(Source, Dest, Count)
             ("move", 3) => {
                 let src = self.address_of_arg(&args[0], span)?;
@@ -446,6 +592,31 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?
                     .into()
             }
+            // UnicodeToUtf8(Dest, MaxBytes, Source, Chars): Bruto's wide
+            // strings are 8-bit (Latin-1), encoded here as UTF-8.
+            ("unicodetoutf8", 4) => {
+                let dest = self.compile_expr(&args[0])?;
+                let max = self.int_arg(&args[1], span)?;
+                let src = self.compile_expr(&args[2])?;
+                let chars = self.int_arg(&args[3], span)?;
+                if !dest.is_pointer_value() || !src.is_pointer_value() {
+                    return Err(CodeGenError::new(
+                        "UnicodeToUtf8 takes two pointers and two counts",
+                        Some(span),
+                    ));
+                }
+                let f = self.latin1_to_utf8_fn();
+                self.builder
+                    .build_call(
+                        f,
+                        &[dest.into(), max.into(), src.into(), chars.into()],
+                        "utf8_len",
+                    )
+                    .map_err(err)?
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap()
+            }
             // Swap(W): exchange the two bytes of a 16-bit value.
             ("swap", 1) => {
                 let v = self.int_arg(&args[0], span)?;
@@ -562,7 +733,9 @@ impl<'ctx> CodeGen<'ctx> {
             return None;
         }
         Some(match (name, arg_count) {
-            ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) => PascalType::Integer,
+            ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) | ("unicodetoutf8", 4) => {
+                PascalType::Integer
+            }
             ("paramstr", 1) => PascalType::String,
             ("get_frame" | "get_pc_addr", 0) | ("get_caller_frame", 1 | 2) => {
                 PascalType::Pointer(Box::new(PascalType::Untyped))
@@ -586,6 +759,7 @@ impl<'ctx> CodeGen<'ctx> {
         for (name, ty, initial) in [
             ("filemode", byte, 2u64),
             ("exitcode", longint.clone(), 0),
+            ("inoutres", longint.clone(), 0),
             // File handle constants.
             ("unusedhandle", longint.clone(), u64::MAX),
             ("stdinputhandle", longint.clone(), 0),

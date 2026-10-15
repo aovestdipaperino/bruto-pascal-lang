@@ -14,7 +14,7 @@
 //! handled.
 
 use crate::ast::*;
-use crate::rename::{Rename, rewrite_program};
+use crate::rename::{Rename, rewrite_block, rewrite_proc, rewrite_program};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -45,14 +45,55 @@ pub struct Resolved {
 /// Run the semantic pass over a copy of `program`.
 pub fn resolve_program(program: &Program) -> Result<Resolved, SemaError> {
     let mut program = program.clone();
+    add_system_constants(&mut program);
     let display_names = fold_identifier_case(&mut program);
     strip_unit_qualifiers(&mut program);
     name_overloads(&mut program);
+    name_nested_routines(&mut program);
+    avoid_c_symbols(&mut program);
     let program = fold_constant_bounds(&program)?;
     Ok(Resolved {
         program,
         display_names,
     })
+}
+
+/// FPC's System constants for a Unix target, unless the program declares
+/// its own.
+fn add_system_constants(program: &mut Program) {
+    let declared: HashSet<String> = program
+        .consts
+        .iter()
+        .map(|c| c.name.to_ascii_lowercase())
+        .chain(
+            program
+                .vars
+                .iter()
+                .flat_map(|v| v.names.iter().map(|n| n.to_ascii_lowercase())),
+        )
+        .collect();
+    let span = program.span;
+    let constants: [(&str, Expr); 9] = [
+        ("DirectorySeparator", Expr::CharLit(b'/', span)),
+        ("DriveSeparator", Expr::StrLit(String::new(), span)),
+        ("PathSeparator", Expr::CharLit(b':', span)),
+        ("ExtensionSeparator", Expr::CharLit(b'.', span)),
+        ("LineEnding", Expr::CharLit(b'\n', span)),
+        ("sLineBreak", Expr::CharLit(b'\n', span)),
+        ("AllFilesMask", Expr::StrLit("*".to_string(), span)),
+        ("MaxPathLen", Expr::IntLit(4096, span)),
+        ("FileNameCaseSensitive", Expr::BoolLit(true, span)),
+    ];
+    let prelude = constants
+        .into_iter()
+        .filter(|(name, _)| !declared.contains(&name.to_ascii_lowercase()))
+        .map(|(name, value)| ConstDecl {
+            name: name.to_string(),
+            ty: None,
+            value,
+            span,
+        });
+    program.consts.splice(0..0, prelude);
 }
 
 /// Lower-case every identifier in `program`, returning the first spelling
@@ -62,6 +103,118 @@ pub fn fold_identifier_case(program: &mut Program) -> HashMap<String, String> {
     let folder = CaseFolder::default();
     rewrite_program(program, &folder);
     folder.first_spelling.into_inner()
+}
+
+/// C functions the generated code and its runtime call. A Pascal routine
+/// of the same name would take the C function's place in the module.
+const C_SYMBOLS: &[&str] = &[
+    "_exit", "atan", "atexit", "atoll", "calloc", "chdir", "exit", "fclose", "feof", "fflush",
+    "fgetc", "fgets", "fileno", "fopen", "fprintf", "fputc", "free", "fscanf", "fseek", "ftell",
+    "getchar", "getcwd", "main", "malloc", "memcpy", "memmove", "memset", "mkdir", "printf",
+    "putchar", "realloc", "rename", "rmdir", "scanf", "signal", "snprintf", "strcat", "strcmp",
+    "strcpy", "strdup", "strlen", "strstr", "ungetc", "unlink", "write",
+];
+
+/// Rename Pascal routines whose name is a C function the program also
+/// uses (`TTYName` calling the C `ttyname`, `GetEnv` calling `getenv`),
+/// so each keeps its own symbol: `ttyname@pascal`.
+fn avoid_c_symbols(program: &mut Program) {
+    let c_symbols: HashSet<String> = C_SYMBOLS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(program.procedures.iter().filter_map(|p| p.external.clone()))
+        .collect();
+    let names: HashMap<String, String> = program
+        .procedures
+        .iter()
+        .filter(|p| p.owner.is_none() && p.external.is_none() && c_symbols.contains(&p.name))
+        .map(|p| (p.name.clone(), format!("{}@pascal", p.name)))
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    rewrite_program(
+        program,
+        &NestedNames {
+            names,
+            locals: RefCell::new(Vec::new()),
+        },
+    );
+}
+
+/// Give every nested routine a symbol of its own, `outer/inner`, so two
+/// routines can each have a nested `DragWindow` in one module. Calls and
+/// references in the parent and its other nested routines follow, unless
+/// a deeper declaration of the same name hides it.
+fn name_nested_routines(program: &mut Program) {
+    for proc in &mut program.procedures {
+        let symbol = match &proc.owner {
+            Some(owner) => format!("{owner}.{}", proc.name),
+            None => proc.name.clone(),
+        };
+        name_nested_in(proc, &symbol);
+    }
+}
+
+fn name_nested_in(proc: &mut ProcDecl, symbol: &str) {
+    if proc.nested_procs.is_empty() {
+        return;
+    }
+    let renamer = NestedNames {
+        names: proc
+            .nested_procs
+            .iter()
+            .map(|n| (n.name.clone(), format!("{symbol}/{}", n.name)))
+            .collect(),
+        locals: RefCell::new(Vec::new()),
+    };
+    rewrite_block(&mut proc.body, &renamer);
+    for nested in &mut proc.nested_procs {
+        rewrite_proc(nested, &renamer);
+    }
+    for nested in &mut proc.nested_procs {
+        let symbol = nested.name.clone();
+        name_nested_in(nested, &symbol);
+    }
+}
+
+struct NestedNames {
+    /// Nested routine name -> its symbol.
+    names: HashMap<String, String>,
+    /// Names declared in the routines being walked below the parent.
+    locals: RefCell<Vec<HashSet<String>>>,
+}
+
+impl Rename for NestedNames {
+    fn rename(&self, name: &str) -> String {
+        match self.names.get(name) {
+            Some(symbol) if !self.locals.borrow().iter().any(|l| l.contains(name)) => {
+                symbol.clone()
+            }
+            _ => name.to_string(),
+        }
+    }
+
+    fn rename_member(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn enter_routine(&self, p: &ProcDecl) {
+        let names = p
+            .params
+            .iter()
+            .flat_map(|g| g.names.iter().cloned())
+            .chain(p.vars.iter().flat_map(|v| v.names.iter().cloned()))
+            .chain(p.consts.iter().map(|c| c.name.clone()))
+            .chain(p.type_decls.iter().map(|t| t.name.clone()))
+            .chain(p.nested_procs.iter().map(|n| n.name.clone()))
+            .collect();
+        self.locals.borrow_mut().push(names);
+    }
+
+    fn leave_routine(&self) {
+        self.locals.borrow_mut().pop();
+    }
 }
 
 /// Give each distinct signature of an overloaded top-level routine its
@@ -136,16 +289,27 @@ fn strip_unit_qualifiers(program: &mut Program) {
         .chain(std::iter::once("system".to_string()))
         .filter(|u| !declared.contains(u))
         .collect();
-    rewrite_program(program, &UnitQualifiers { units });
+    rewrite_program(
+        program,
+        &UnitQualifiers {
+            units,
+            locals: RefCell::new(Vec::new()),
+        },
+    );
 }
 
 struct UnitQualifiers {
     units: HashSet<String>,
+    /// Names declared by the routines being walked: a local `Mouse` is
+    /// not the unit.
+    locals: RefCell<Vec<HashSet<String>>>,
 }
 
 impl UnitQualifiers {
     fn is_unit(&self, expr: &Expr) -> bool {
-        matches!(expr, Expr::Var(name, _) if self.units.contains(name))
+        matches!(expr, Expr::Var(name, _)
+            if self.units.contains(name)
+                && !self.locals.borrow().iter().any(|l| l.contains(name)))
     }
 
     /// `System.X` must reach the built-in even where a method or routine
@@ -160,6 +324,22 @@ impl UnitQualifiers {
 }
 
 impl Rename for UnitQualifiers {
+    fn enter_routine(&self, p: &ProcDecl) {
+        let names = p
+            .params
+            .iter()
+            .flat_map(|g| g.names.iter().cloned())
+            .chain(p.vars.iter().flat_map(|v| v.names.iter().cloned()))
+            .chain(p.consts.iter().map(|c| c.name.clone()))
+            .chain(p.nested_procs.iter().map(|n| n.name.clone()))
+            .collect();
+        self.locals.borrow_mut().push(names);
+    }
+
+    fn leave_routine(&self) {
+        self.locals.borrow_mut().pop();
+    }
+
     fn rename(&self, name: &str) -> String {
         // A qualified type name, `objects.trect`. (`system.x` is kept: it
         // marks a call that must reach the built-in.)
@@ -324,7 +504,9 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
     Some(match name {
         "ansichar" => PascalType::Char,
         "widechar" | "unicodechar" => sized(16, false),
-        "shortstring" => PascalType::ShortString { max: 255 },
+        // `OpenString` (a `var` parameter taking any short string) is
+        // treated as the longest one.
+        "shortstring" | "openstring" => PascalType::ShortString { max: 255 },
         "ansistring" | "rawbytestring" | "unicodestring" | "widestring" => PascalType::String,
         "single" | "double" | "extended" | "currency" | "comp" => PascalType::Real,
         // A file variable is one pointer to the runtime's file record;
@@ -353,11 +535,11 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
 
 impl ConstEnv {
     fn add_enum_values(&mut self, ty: &PascalType) {
-        if let PascalType::Enum { values, .. } = ty {
+        ty.for_each_enum(&mut |values| {
             for (i, name) in values.iter().enumerate() {
                 self.values.insert(name.clone(), i as i64);
             }
-        }
+        });
     }
 
     fn eval(&self, e: &ConstExpr) -> Result<i64, String> {
@@ -479,6 +661,9 @@ impl ConstEnv {
                 {
                     local.values.insert(c.name.clone(), value);
                 }
+            }
+            for td in &proc.type_decls {
+                local.add_type_bounds(&td.name, &td.ty);
             }
             for td in &mut proc.type_decls {
                 local.resolve_type(&mut td.ty, td.span)?;

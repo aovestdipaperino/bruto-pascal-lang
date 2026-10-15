@@ -412,6 +412,7 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
     let mut loaded: Vec<ast::Unit> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut on_stack: HashSet<String> = HashSet::new();
+    let mut pending: Vec<String> = Vec::new();
 
     for unit_name in program.uses.clone() {
         load_unit_recursive(
@@ -420,7 +421,18 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
             &mut loaded,
             &mut visited,
             &mut on_stack,
+            &mut pending,
         )?;
+        while let Some(dep) = pending.pop() {
+            load_unit_recursive(
+                &dep,
+                search_dirs,
+                &mut loaded,
+                &mut visited,
+                &mut on_stack,
+                &mut pending,
+            )?;
+        }
     }
 
     scope::separate_unit_scopes(program, &mut loaded);
@@ -467,6 +479,7 @@ fn load_unit_recursive(
     loaded: &mut Vec<ast::Unit>,
     visited: &mut HashSet<String>,
     on_stack: &mut HashSet<String>,
+    pending: &mut Vec<String>,
 ) -> Result<(), String> {
     let key = name.to_ascii_lowercase();
     if visited.contains(&key) {
@@ -500,12 +513,21 @@ fn load_unit_recursive(
         ));
     }
 
-    for dep in unit.uses.clone() {
-        load_unit_recursive(&dep, search_dirs, loaded, visited, on_stack)?;
+    for dep in unit.interface_uses.clone() {
+        load_unit_recursive(&dep, search_dirs, loaded, visited, on_stack, pending)?;
     }
 
     on_stack.remove(&key);
     visited.insert(key);
+    // Units only the implementation uses may use this one, or one being
+    // loaded further up, in turn: they wait until the current chain of
+    // interface dependencies is done.
+    pending.extend(
+        unit.uses
+            .iter()
+            .filter(|u| !unit.interface_uses.contains(u))
+            .cloned(),
+    );
     loaded.push(unit);
     Ok(())
 }
@@ -2926,6 +2948,146 @@ end.
         );
         assert!(ok, "program failed: {out}");
         assert_eq!(out, "15104 8\n4 3\n0 true\ntrue\n");
+    }
+
+    #[test]
+    fn implementation_uses_may_form_a_cycle() {
+        let a: &[u8] = b"unit UA;
+interface
+function AName: string;
+implementation
+uses UB;
+function AName: string;
+begin
+  AName := 'a' + BName;
+end;
+end.
+";
+        let b: &[u8] = b"unit UB;
+interface
+uses UA;
+function BName: string;
+function Both: string;
+implementation
+function BName: string;
+begin
+  BName := 'b';
+end;
+function Both: string;
+begin
+  Both := AName + '!';
+end;
+end.
+";
+        let (ok, out) = build_and_run_in_dir(
+            "bruto_unit_cycle_test",
+            &[("UA.pas", a), ("UB.pas", b)],
+            "program Main;
+uses UB;
+begin
+  writeln(Both);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "ab!\n");
+    }
+
+    #[test]
+    fn free_vision_object_idioms() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}
+const
+  Pal = #$71#$70 + #$37;
+type
+  TCallback = procedure(P: Pointer) is nested;
+  PBase = ^TBase;
+  TBase = object
+    Count: Integer;
+    constructor Init(Ok: Boolean);
+    procedure Each(F: TCallback);
+  end;
+  PChild = ^TChild;
+  TChild = object(TBase)
+    constructor Init(Ok: Boolean);
+    function Depth(N: Integer): Integer;
+  end;
+
+constructor TBase.Init(Ok: Boolean);
+begin
+  Count := 3;
+  if not Ok then
+    Fail;
+end;
+
+procedure TBase.Each(F: TCallback);
+var I: Integer;
+begin
+  for I := 1 to Count do
+    F(nil);
+end;
+
+constructor TChild.Init(Ok: Boolean);
+begin
+  if not inherited Init(Ok) then
+    Fail;
+end;
+
+function TChild.Depth(N: Integer): Integer;
+var Seen: Integer;
+  procedure Visit(P: Pointer);
+  begin
+    Inc(Seen);
+  end;
+begin
+  if N = 0 then
+    Depth := 0
+  else
+    Depth := Depth(N - 1) + 1;
+  Seen := 0;
+  Each(TCallback(@Visit));
+  if N = 2 then
+    writeln('visited ', Seen);
+end;
+
+procedure Outer1;
+  procedure Helper; begin writeln('one'); end;
+begin
+  Helper;
+end;
+
+procedure Outer2;
+  procedure Helper; begin writeln('two'); end;
+begin
+  Helper;
+end;
+
+function GetEnv(Name: string): string;
+  function c_getenv(N: PChar): PChar; cdecl; external 'c' name 'getenv';
+begin
+  GetEnv := 'x';
+end;
+
+var
+  P: PChild;
+  S: string;
+  C: Char;
+begin
+  P := New(PChild, Init(True));
+  writeln(P^.Depth(2));
+  writeln(New(PChild, Init(False)) = nil);
+  Outer1;
+  Outer2;
+  C := 'b';
+  S := 'a' + C + #$63;
+  writeln(S, ' ', Length(Pal), ' ', Pos(C, S));
+  writeln(GetEnv('HOME'));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "visited 3\n2\ntrue\none\ntwo\nabc 3 2\nx\n");
     }
 
     #[test]

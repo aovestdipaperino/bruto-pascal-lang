@@ -64,6 +64,8 @@ pub(super) struct MethodInfo {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MethodContext<'ctx> {
     pub self_ptr: PointerValue<'ctx>,
+    /// In a constructor's own body, where `Fail` can be used.
+    pub in_constructor: bool,
 }
 
 /// The object a method is called on, and how.
@@ -120,7 +122,14 @@ impl<'ctx> CodeGen<'ctx> {
             ));
         }
         for (fname, fty) in &decl.fields {
-            fields.push((fname.clone(), self.resolve_type(fty)));
+            // A pointer keeps its declared type, resolved where it is
+            // used: it may point to an object declared further down
+            // (`Owner: PGroup` in `TView`, before `TGroup`).
+            let ty = match self.resolve_type(fty) {
+                PascalType::Pointer(_) => fty.clone(),
+                resolved => resolved,
+            };
+            fields.push((fname.clone(), ty));
         }
 
         let mut methods = parent
@@ -362,6 +371,42 @@ impl<'ctx> CodeGen<'ctx> {
         let object = self.current_object.clone()?;
         let ctx = self.method_context?;
         has(&object).then_some((object, ctx.self_ptr))
+    }
+
+    /// A method function calling itself with arguments: its name is also
+    /// its result variable, which hides it from `implicit_method`.
+    pub(super) fn recursive_method(&self, name: &str) -> Option<(String, PointerValue<'ctx>)> {
+        if self.bypass_user || self.current_function.as_deref() != Some(name) {
+            return None;
+        }
+        let object = self.current_object.clone()?;
+        let ctx = self.method_context?;
+        self.objects[&object]
+            .methods
+            .contains_key(name)
+            .then_some((object, ctx.self_ptr))
+    }
+
+    /// Whether `object.method` is `TAncestor.Init(...)`: a constructor
+    /// called through a type name, on Self.
+    pub(super) fn ancestor_constructor(&self, object: &Expr, method: &str) -> bool {
+        matches!(object, Expr::Var(type_name, _)
+            if self.lookup_var(type_name).is_none()
+                && self
+                    .objects
+                    .get(type_name)
+                    .and_then(|o| o.methods.get(method))
+                    .is_some_and(|m| m.kind == RoutineKind::Constructor))
+    }
+
+    /// Whether `inherited method` here calls a constructor.
+    pub(super) fn inherited_is_constructor(&self, method: &str) -> bool {
+        self.current_object
+            .as_ref()
+            .and_then(|o| self.objects[o].parent.as_ref())
+            .and_then(|p| self.objects.get(p))
+            .and_then(|p| p.methods.get(method))
+            .is_some_and(|m| m.kind == RoutineKind::Constructor)
     }
 
     /// The object type `implicit_method` would call `name` on.

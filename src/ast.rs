@@ -59,7 +59,11 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub struct Unit {
     pub name: String,
+    /// Every unit used, in the interface and the implementation.
     pub uses: Vec<String>,
+    /// The units the interface uses, which must not lead back here; the
+    /// implementation's may.
+    pub interface_uses: Vec<String>,
     pub interface_consts: Vec<ConstDecl>,
     pub interface_types: Vec<TypeDecl>,
     pub interface_vars: Vec<VarDecl>,
@@ -276,6 +280,42 @@ pub enum PascalType {
         lo: ConstExpr,
         hi: ConstExpr,
     },
+}
+
+impl PascalType {
+    /// Call `f` with the values of every enumeration written inside this
+    /// type, as in `Phase: (phFocused, phPreProcess)` in a record or
+    /// object, each of which names a constant.
+    pub fn for_each_enum(&self, f: &mut impl FnMut(&[String])) {
+        match self {
+            PascalType::Enum { values, .. } => f(values),
+            PascalType::Record {
+                fields, variant, ..
+            } => {
+                for (_, t) in fields {
+                    t.for_each_enum(f);
+                }
+                if let Some(v) = variant {
+                    v.tag_type.for_each_enum(f);
+                    for (_, vfields) in &v.variants {
+                        for (_, t) in vfields {
+                            t.for_each_enum(f);
+                        }
+                    }
+                }
+            }
+            PascalType::Object(obj) => {
+                for (_, t) in &obj.fields {
+                    t.for_each_enum(f);
+                }
+            }
+            PascalType::Array { elem, .. }
+            | PascalType::ArrayExpr { elem, .. }
+            | PascalType::Set { elem }
+            | PascalType::Pointer(elem) => elem.for_each_enum(f),
+            _ => {}
+        }
+    }
 }
 
 /// A compile-time integer expression used where the language needs a

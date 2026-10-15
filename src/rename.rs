@@ -96,7 +96,7 @@ pub(crate) fn rewrite_unit<R: Rename>(unit: &mut Unit, n: &R) {
     }
 }
 
-fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
+pub(crate) fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
     if let Some(owner) = &mut p.owner {
         p.name = n.rename_member(&p.name);
         *owner = n.rename(owner);
@@ -250,7 +250,7 @@ fn rewrite_const_expr<R: Rename>(e: &mut ConstExpr, n: &R) {
     }
 }
 
-fn rewrite_block<R: Rename>(block: &mut Block, n: &R) {
+pub(crate) fn rewrite_block<R: Rename>(block: &mut Block, n: &R) {
     for s in &mut block.statements {
         rewrite_stmt(s, n);
     }

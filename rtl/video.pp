@@ -17,6 +17,7 @@ type
   PVideoCell = ^TVideoCell;
   TVideoBuf = array[0..32759] of TVideoCell;
   PVideoBuf = ^TVideoBuf;
+  TSystemCodePage = Word;
 
 const
   Black = 0;
@@ -88,6 +89,12 @@ procedure GetVideoMode(var Mode: TVideoMode);
 function SetVideoMode(const Mode: TVideoMode): Boolean;
 function GetVideoModeCount: Word;
 function GetVideoModeData(Index: Word; var Data: TVideoMode): Boolean;
+{ Cells always hold code page 437 characters. }
+function GetActiveCodePage: TSystemCodePage;
+function GetLegacyCodePage: TSystemCodePage;
+procedure ActivateCodePage(CodePage: TSystemCodePage);
+function GetSupportedCodePageCount: Integer;
+function GetSupportedCodePage(Index: Integer): TSystemCodePage;
 
 implementation
 
@@ -328,6 +335,30 @@ begin
   GetVideoModeData := Index = 0;
   if Index = 0 then
     GetVideoMode(Data);
+end;
+
+function GetActiveCodePage: TSystemCodePage;
+begin
+  GetActiveCodePage := 437;
+end;
+
+function GetLegacyCodePage: TSystemCodePage;
+begin
+  GetLegacyCodePage := 437;
+end;
+
+procedure ActivateCodePage(CodePage: TSystemCodePage);
+begin
+end;
+
+function GetSupportedCodePageCount: Integer;
+begin
+  GetSupportedCodePageCount := 1;
+end;
+
+function GetSupportedCodePage(Index: Integer): TSystemCodePage;
+begin
+  GetSupportedCodePage := 437;
 end;
 
 end.
