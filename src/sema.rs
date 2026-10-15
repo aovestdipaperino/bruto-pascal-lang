@@ -764,8 +764,8 @@ impl ConstEnv {
             | PascalType::String
             | PascalType::Boolean
             | PascalType::Char
-        | PascalType::WideChar
-        | PascalType::UnicodeString
+            | PascalType::WideChar
+            | PascalType::UnicodeString
             | PascalType::Enum { .. }
             | PascalType::Subrange { .. }
             | PascalType::SizedInt { .. }

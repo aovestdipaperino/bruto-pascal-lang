@@ -23,7 +23,10 @@ const UNITS: &[(&str, &str)] = &[
     ("dos.pp", include_str!("../rtl/dos.pp")),
     ("cwstring.pp", include_str!("../rtl/cwstring.pp")),
     ("fpwidestring.pp", include_str!("../rtl/fpwidestring.pp")),
-    ("graphemebreakproperty.pp", include_str!("../rtl/graphemebreakproperty.pp")),
+    (
+        "graphemebreakproperty.pp",
+        include_str!("../rtl/graphemebreakproperty.pp"),
+    ),
     ("sysutils.pp", include_str!("../rtl/sysutils.pp")),
     ("brutoconsole.pp", include_str!("../rtl/brutoconsole.pp")),
     ("video.pp", include_str!("../rtl/video.pp")),

@@ -140,7 +140,9 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// The Unicode text of `p`, if it is a string literal's global.
     pub(super) fn literal_text_of(&self, p: PointerValue<'ctx>) -> Option<String> {
-        self.literal_texts.get(&(p.as_value_ref() as usize)).cloned()
+        self.literal_texts
+            .get(&(p.as_value_ref() as usize))
+            .cloned()
     }
 
     /// A fresh UnicodeString holding `text`, built from UTF-16 data fixed
@@ -268,9 +270,9 @@ impl<'ctx> CodeGen<'ctx> {
             } => {
                 fields.iter().any(|(_, t)| self.holds_unicode_string(t))
                     || variant.is_some_and(|v| {
-                        v.variants.iter().any(|(_, fs)| {
-                            fs.iter().any(|(_, t)| self.holds_unicode_string(t))
-                        })
+                        v.variants
+                            .iter()
+                            .any(|(_, fs)| fs.iter().any(|(_, t)| self.holds_unicode_string(t)))
                     })
             }
             _ => false,
@@ -382,10 +384,7 @@ impl<'ctx> CodeGen<'ctx> {
         // String operations: one side a UnicodeString, or a WideChar
         // added to a string or char.
         let string_op = (l_ustr || r_ustr) && stringy(lhs) && stringy(rhs)
-            || op == BinOp::Add
-                && (l_wide || r_wide)
-                && stringy(lhs)
-                && stringy(rhs);
+            || op == BinOp::Add && (l_wide || r_wide) && stringy(lhs) && stringy(rhs);
         if string_op {
             if op == BinOp::Add {
                 return Ok(Ok(self.ustr_concat(lhs, rhs, span)?));
@@ -394,7 +393,12 @@ impl<'ctx> CodeGen<'ctx> {
                 let order = self.ustr_compare(lhs, rhs, span)?;
                 let result = self
                     .builder
-                    .build_int_compare(pred, order, self.context.i64_type().const_zero(), "ustr_cmp")
+                    .build_int_compare(
+                        pred,
+                        order,
+                        self.context.i64_type().const_zero(),
+                        "ustr_cmp",
+                    )
                     .map_err(err)?;
                 return Ok(Ok(result.into()));
             }
@@ -410,7 +414,9 @@ impl<'ctx> CodeGen<'ctx> {
                     let w = self.to_wide_char(v, span)?.into_int_value();
                     Ok(self.char_code(w, span)?.into())
                 }
-                BasicValueEnum::IntValue(i) if i.get_type().get_bit_width() <= 16 && i.get_type().get_bit_width() > 1 => {
+                BasicValueEnum::IntValue(i)
+                    if i.get_type().get_bit_width() <= 16 && i.get_type().get_bit_width() > 1 =>
+                {
                     Ok(self.char_code(i, span)?.into())
                 }
                 _ => Ok(v),
@@ -434,7 +440,10 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<(), CodeGenError> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let old = self.builder.build_load(ptr_ty, slot, "ustr_old").map_err(err)?;
+        let old = self
+            .builder
+            .build_load(ptr_ty, slot, "ustr_old")
+            .map_err(err)?;
         let idx = self.to_i64(index, span)?;
         let ch = self.to_wide_char(ch, span)?.into_int_value();
         let code = self.char_code(ch, span)?;
@@ -516,7 +525,11 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     None => i64_ty.const_int(i64::MAX as u64, false),
                 };
-                self.ustr_runtime("bruto_ustr_copy", &[s.into(), idx.into(), count.into()], span)?
+                self.ustr_runtime(
+                    "bruto_ustr_copy",
+                    &[s.into(), idx.into(), count.into()],
+                    span,
+                )?
             }
             ("pos", 2 | 3) if args[..2].iter().any(|a| self.is_wide_expr(a)) => {
                 let sub = self.compile_expr(first)?;

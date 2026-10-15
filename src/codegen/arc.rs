@@ -219,9 +219,7 @@ pub(super) fn contains_label(stmt: &Statement) -> bool {
             then_branch,
             else_branch,
             ..
-        } => {
-            block_has_label(then_branch) || else_branch.as_ref().is_some_and(block_has_label)
-        }
+        } => block_has_label(then_branch) || else_branch.as_ref().is_some_and(block_has_label),
         Statement::While { body, .. }
         | Statement::For { body, .. }
         | Statement::ForIn { body, .. }
@@ -232,9 +230,7 @@ pub(super) fn contains_label(stmt: &Statement) -> bool {
             else_branch,
             ..
         } => {
-            branches
-                .iter()
-                .any(|b| b.body.iter().any(contains_label))
+            branches.iter().any(|b| b.body.iter().any(contains_label))
                 || else_branch
                     .as_ref()
                     .is_some_and(|e| e.iter().any(contains_label))

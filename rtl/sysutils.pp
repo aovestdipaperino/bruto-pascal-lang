@@ -25,9 +25,14 @@ function BrutoCFormat(const Fmt: string): string;
 implementation
 
 function c_access(Path: PChar; Mode: cint): cint; cdecl; external 'c' name 'access';
+{$ifdef WINDOWS}
+function win_GetFileAttributesA(Path: PChar): LongWord; cdecl; external 'kernel32' name 'GetFileAttributesA';
+procedure win_Sleep(Milliseconds: LongWord); cdecl; external 'kernel32' name 'Sleep';
+{$else}
 function c_usleep(Micros: cuint): cint; cdecl; external 'c' name 'usleep';
 function c_opendir(Path: PChar): Pointer; cdecl; external 'c' name 'opendir';
 function c_closedir(Dir: Pointer): cint; cdecl; external 'c' name 'closedir';
+{$endif}
 
 function IntToStr(Value: Int64): string;
 var
@@ -117,6 +122,21 @@ begin
   FileExists := c_access(PChar(FileName), 0) = 0;
 end;
 
+{$ifdef WINDOWS}
+function DirectoryExists(const Directory: string): Boolean;
+var
+  Attributes: LongWord;
+begin
+  Attributes := win_GetFileAttributesA(PChar(Directory));
+  { INVALID_FILE_ATTRIBUTES, else FILE_ATTRIBUTE_DIRECTORY }
+  DirectoryExists := (Attributes <> $FFFFFFFF) and ((Attributes and $10) <> 0);
+end;
+
+procedure Sleep(Milliseconds: LongWord);
+begin
+  win_Sleep(Milliseconds);
+end;
+{$else}
 function DirectoryExists(const Directory: string): Boolean;
 var
   D: Pointer;
@@ -131,6 +151,7 @@ procedure Sleep(Milliseconds: LongWord);
 begin
   c_usleep(Milliseconds * 1000);
 end;
+{$endif}
 
 function BrutoCFormat(const Fmt: string): string;
 var

@@ -769,7 +769,10 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .status()
             .expect("run failed");
-        let captured = std::fs::read_to_string(&result.console_capture_path).unwrap_or_default();
+        // Windows writes the capture file in text mode (\r\n).
+        let captured = std::fs::read_to_string(&result.console_capture_path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
         let _ = std::fs::remove_file(&result.exe_path);
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&result.source_path);
@@ -2753,7 +2756,10 @@ end.
             .stdout(std::process::Stdio::null())
             .status()
             .expect("run failed");
-        let captured = std::fs::read_to_string(&result.console_capture_path).unwrap_or_default();
+        // Windows writes the capture file in text mode (\r\n).
+        let captured = std::fs::read_to_string(&result.console_capture_path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
         let _ = std::fs::remove_file(&result.exe_path);
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&result.console_capture_path);
@@ -2788,7 +2794,10 @@ end.
             .stdout(std::process::Stdio::null())
             .status()
             .expect("run failed");
-        let captured = std::fs::read_to_string(&result.console_capture_path).unwrap_or_default();
+        // Windows writes the capture file in text mode (\r\n).
+        let captured = std::fs::read_to_string(&result.console_capture_path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
         let _ = std::fs::remove_file(&result.exe_path);
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&result.console_capture_path);
@@ -2929,6 +2938,8 @@ end.
         );
     }
 
+    // Bruto's console units are Unix ones.
+    #[cfg(unix)]
     #[test]
     fn console_units_ship_with_the_compiler() {
         // Only the parts that don't need a terminal.
@@ -3279,6 +3290,8 @@ end.
         assert_eq!(out, "a.b.c.\n10 20 30 \n[the][quick][fox]\n");
     }
 
+    // Bruto's console units are Unix ones.
+    #[cfg(unix)]
     #[test]
     fn grapheme_clusters_and_display_widths() {
         let (ok, out) = build_and_run_source(
@@ -3414,7 +3427,10 @@ end.
         let Err(e) = result else {
             panic!("the call should not compile");
         };
-        assert!(format!("{e:?}").contains("takes 0 argument(s), found 1"), "{e:?}");
+        assert!(
+            format!("{e:?}").contains("takes 0 argument(s), found 1"),
+            "{e:?}"
+        );
     }
 
     #[test]

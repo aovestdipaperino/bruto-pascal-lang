@@ -1301,10 +1301,9 @@ impl<'ctx> CodeGen<'ctx> {
         global.set_alignment(32);
         global.set_initializer(&value);
         unsafe {
-            global.as_pointer_value().const_in_bounds_gep(
-                self.context.i8_type(),
-                &[i64_ty.const_int(16, false)],
-            )
+            global
+                .as_pointer_value()
+                .const_in_bounds_gep(self.context.i8_type(), &[i64_ty.const_int(16, false)])
         }
     }
 
@@ -1483,7 +1482,8 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(())
             }
             (_, PascalType::Array { lo, hi, elem })
-                if self.resolve_type(elem) == PascalType::Char && literal_text(value, false).is_some() =>
+                if self.resolve_type(elem) == PascalType::Char
+                    && literal_text(value, false).is_some() =>
             {
                 let span = &value.span();
                 let bytes: Vec<u8> = literal_text(value, false)
@@ -4249,7 +4249,10 @@ impl<'ctx> CodeGen<'ctx> {
             .call_ustr_runtime(helper, &[s_val.into(), code_slot.into()], span)?
             .unwrap();
         self.store_value(target, value, &target_ty, span)?;
-        let code = self.builder.build_load(i64_ty, code_slot, "code").map_err(err)?;
+        let code = self
+            .builder
+            .build_load(i64_ty, code_slot, "code")
+            .map_err(err)?;
         let (code_target, code_ty) = self.resolve_array_base(&args[2], span)?;
         self.store_value(code_target, code, &code_ty, span)
     }
@@ -5476,12 +5479,14 @@ impl<'ctx> CodeGen<'ctx> {
                 .into()),
             Expr::StrLit(s, _) => {
                 let p = self.string_literal(s);
-                self.literal_texts.insert(p.as_value_ref() as usize, s.clone());
+                self.literal_texts
+                    .insert(p.as_value_ref() as usize, s.clone());
                 Ok(p.into())
             }
             Expr::CodePageStrLit(bytes, text, _) => {
                 let p = self.string_literal(bytes);
-                self.literal_texts.insert(p.as_value_ref() as usize, text.clone());
+                self.literal_texts
+                    .insert(p.as_value_ref() as usize, text.clone());
                 Ok(p.into())
             }
             Expr::BoolLit(b, _) => Ok(self
@@ -9436,6 +9441,8 @@ mod tests {
         }
     }
 
+    // dSYM bundle + Apple-format DWARF: macOS-only.
+    #[cfg(target_os = "macos")]
     #[test]
     fn compile_and_run_simple_program() {
         let source = "program Test;\nvar\n  x: integer;\nbegin\n  x := 42;\n  writeln(x)\nend.\n";

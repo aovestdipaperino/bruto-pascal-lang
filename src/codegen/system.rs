@@ -776,9 +776,7 @@ impl<'ctx> CodeGen<'ctx> {
             return None;
         }
         Some(match (name, arg_count) {
-            ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) => {
-                PascalType::Integer
-            }
+            ("hi" | "lo" | "swap" | "ofs", 1) | ("paramcount", 0) => PascalType::Integer,
             ("paramstr", 1) | ("hexstr", 2) | ("format", 2) => PascalType::String,
             ("get_frame" | "get_pc_addr", 0) | ("get_caller_frame", 1 | 2) => {
                 PascalType::Pointer(Box::new(PascalType::Untyped))
