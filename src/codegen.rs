@@ -188,6 +188,8 @@ pub struct CodeGen<'ctx> {
     has_classes: bool,
     // Classes whose instance cleanup routines still need bodies.
     class_cleanups: Vec<String>,
+    // Other names of object types and classes: alias -> the type.
+    class_aliases: HashMap<String, String>,
     // Each routine's parameter defaults, one per parameter (by symbol).
     proc_param_defaults: HashMap<String, Vec<Option<Expr>>>,
     // Runtime error functions whose bodies are still to be written:
@@ -297,6 +299,7 @@ impl<'ctx> CodeGen<'ctx> {
             objects: HashMap::new(),
             has_classes: false,
             class_cleanups: Vec::new(),
+            class_aliases: HashMap::new(),
             runtime_error_stubs: std::cell::RefCell::new(Vec::new()),
             proc_param_defaults: HashMap::new(),
             with_objects: Vec::new(),
@@ -609,6 +612,19 @@ impl<'ctx> CodeGen<'ctx> {
                 && !decl.is_forward
             {
                 self.register_object(&td.name, decl, td.span)?;
+            }
+            // `TIntList = specialize TFPGList<Integer>`, `TMyList =
+            // TStringList`: another name for an object type or class.
+            if let PascalType::Named(target) = &td.ty {
+                let target = self
+                    .class_aliases
+                    .get(target)
+                    .cloned()
+                    .unwrap_or_else(|| target.clone());
+                if let Some(info) = self.objects.get(&target).cloned() {
+                    self.objects.insert(td.name.clone(), info);
+                    self.class_aliases.insert(td.name.clone(), target);
+                }
             }
         }
         self.emit_vmts();
@@ -1117,6 +1133,7 @@ impl<'ctx> CodeGen<'ctx> {
                 | PascalType::VarParam(_)
                 | PascalType::DynArray(_)
                 | PascalType::OpenArray(_)
+                | PascalType::Specialize { .. }
                 | PascalType::ShortString { .. } => {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
@@ -3730,6 +3747,8 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Object(_) => 0,
             PascalType::ClassOf(_) | PascalType::VarParam(_) | PascalType::DynArray(_) => 8,
             PascalType::OpenArray(_) => 16,
+            // Replaced by the generics pass before code generation.
+            PascalType::Specialize { .. } => 8,
             PascalType::ShortString { max } => *max as u64 + 1,
             PascalType::Integer
             | PascalType::Enum { .. }
@@ -6708,6 +6727,16 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r.into());
                 }
+                // Default(T): T's zero value (nil, 0, '', a zeroed record).
+                if name == "default"
+                    && args.len() == 1
+                    && let Expr::Var(tname, _) = &args[0]
+                    && let Some(ty) = self.type_of_name(tname)
+                {
+                    let resolved = self.resolve_type(&ty);
+                    let zero = self.llvm_type_for(&resolved).const_zero();
+                    return self.widen_loaded(zero, &resolved, *span);
+                }
                 if name == "sizeof" && args.len() == 1 {
                     let ty = match &args[0] {
                         Expr::Var(vname, _) => self.type_of_name(vname),
@@ -7702,6 +7731,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .as_basic_type_enum(),
             // `{ first element's address, highest index }`.
             PascalType::OpenArray(_) => self.open_array_type().as_basic_type_enum(),
+            PascalType::Specialize { .. } => self.context.i64_type().as_basic_type_enum(),
             // Constant-expression types are folded by the semantic pass;
             // `ArrayExpr` can't reach here.
             PascalType::Integer
@@ -9367,6 +9397,12 @@ impl<'ctx> CodeGen<'ctx> {
                     return target;
                 }
                 if let Some(ty) = self.unicode_builtin_type(name, args) {
+                    return ty;
+                }
+                if name == "default"
+                    && let [Expr::Var(tname, _)] = args.as_slice()
+                    && let Some(ty) = self.type_of_name(tname)
+                {
                     return ty;
                 }
                 // Built-in functions

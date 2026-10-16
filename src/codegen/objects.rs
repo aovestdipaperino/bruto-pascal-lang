@@ -344,7 +344,12 @@ impl<'ctx> CodeGen<'ctx> {
     pub(super) fn emit_vmts(&mut self) {
         let ptr = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
-        let mut names: Vec<String> = self.objects.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .objects
+            .keys()
+            .filter(|n| !self.class_aliases.contains_key(*n))
+            .cloned()
+            .collect();
         names.sort();
         // Cells holding each VMT's address, for parent links.
         for name in &names {
@@ -423,6 +428,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// The VMT of an object type.
     pub(super) fn vmt_of(&self, name: &str) -> PointerValue<'ctx> {
+        let name = self.class_aliases.get(name).map_or(name, |n| n.as_str());
         self.module
             .get_global(&format!("vmt.{name}"))
             .map(|g| g.as_pointer_value())

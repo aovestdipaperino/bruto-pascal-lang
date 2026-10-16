@@ -181,6 +181,11 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
             }
         }
         PascalType::ClassOf(_) => {}
+        PascalType::Specialize { args, .. } => {
+            for a in args {
+                collect_type(a, n);
+            }
+        }
         PascalType::VarParam(inner)
         | PascalType::DynArray(inner)
         | PascalType::OpenArray(inner) => collect_type(inner, n),

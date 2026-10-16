@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod codegen;
+mod generics;
 pub mod obfuscate;
 pub mod parser;
 mod pascal_syntax;
@@ -4903,6 +4904,276 @@ end.
         );
         assert!(ok, "program failed: {out}");
         assert_eq!(out, "8\na,bb,ccc\n");
+    }
+
+    #[test]
+    fn generic_classes_and_records() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+type
+  generic TStack<T> = class
+  private
+    FItems: array of T;
+    FCount: Integer;
+    function GetTop: T;
+  public
+    procedure Push(const Item: T);
+    function Pop: T;
+    function IsEmpty: Boolean;
+    property Count: Integer read FCount;
+    property Top: T read GetTop;
+  end;
+
+  generic TPair<TKey, TValue> = record
+    Key: TKey;
+    Value: TValue;
+  end;
+
+  TIntStack = specialize TStack<Integer>;
+  TStrStack = specialize TStack<string>;
+  TNamedAge = specialize TPair<string, Integer>;
+  TPairStack = specialize TStack<TNamedAge>;
+
+procedure TStack.Push(const Item: T);
+begin
+  if FCount = Length(FItems) then
+    SetLength(FItems, FCount * 2 + 4);
+  FItems[FCount] := Item;
+  Inc(FCount);
+end;
+
+function TStack.Pop: T;
+begin
+  Dec(FCount);
+  Result := FItems[FCount];
+  FItems[FCount] := Default(T);
+end;
+
+function TStack.GetTop: T;
+begin
+  Result := FItems[FCount - 1];
+end;
+
+function TStack.IsEmpty: Boolean;
+begin
+  Result := FCount = 0;
+end;
+
+var
+  I: TIntStack;
+  S: TStrStack;
+  P: TPairStack;
+  Pair: TNamedAge;
+  K: Integer;
+begin
+  I := TIntStack.Create;
+  for K := 1 to 10 do I.Push(K * K);
+  Write(I.Count, ' ', I.Top, ':');
+  while not I.IsEmpty do Write(' ', I.Pop);
+  WriteLn;
+  S := TStrStack.Create;
+  S.Push('a'); S.Push('b' + 'c'); S.Push('def');
+  WriteLn(S.Pop, S.Pop, S.Count);
+  P := specialize TStack<TNamedAge>.Create;
+  Pair.Key := 'ann'; Pair.Value := 31;
+  P.Push(Pair);
+  Pair.Key := 'bob'; Pair.Value := 42;
+  P.Push(Pair);
+  WriteLn(P.Pop.Key, ' ', P.Top.Value, ' ', SizeOf(TNamedAge));
+  I.Free; S.Free; P.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "10 100: 100 81 64 49 36 25 16 9 4 1\ndefbc1\nbob 31 16\n"
+        );
+    }
+
+    #[test]
+    fn fgl_lists_and_maps() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+uses SysUtils, fgl;
+type
+  TIntList = specialize TFPGList<Integer>;
+  TStrList = specialize TFPGList<string>;
+  TThing = class
+    Name: string;
+    constructor Create(const AName: string);
+    destructor Destroy; override;
+  end;
+  TThings = specialize TFPGObjectList<TThing>;
+  TAges = specialize TFPGMap<string, Integer>;
+
+var Destroyed: Integer;
+
+constructor TThing.Create(const AName: string);
+begin
+  Name := AName;
+end;
+
+destructor TThing.Destroy;
+begin
+  Inc(Destroyed);
+  inherited Destroy;
+end;
+
+function CompareInts(const A, B: Integer): Integer;
+begin
+  Result := A - B;
+end;
+
+function CompareLen(const A, B: string): Integer;
+begin
+  Result := Length(A) - Length(B);
+end;
+
+var
+  L: TIntList;
+  S: TStrList;
+  T: TThings;
+  M: TAges;
+  I, Age: Integer;
+  Str: string;
+begin
+  L := TIntList.Create;
+  for I := 1 to 8 do L.Add((I * 37) mod 11);
+  L.Sort(@CompareInts);
+  for I in L do Write(I, ' ');
+  WriteLn('| ', L.Count, ' ', L.First, ' ', L.Last, ' ', L.IndexOf(4), ' ', L.IndexOf(99));
+  L.Delete(0); L.Insert(0, 100); L.Remove(10); L[1] := -1;
+  for I := 0 to L.Count - 1 do Write(L[I], ' ');
+  WriteLn;
+  S := TStrList.Create;
+  S.Add('ccc'); S.Add('a'); S.Add('bb');
+  S.Sort(@CompareLen);
+  for Str in S do Write(Str, ';');
+  WriteLn(S.IndexOf('bb'));
+  T := TThings.Create;
+  T.Add(TThing.Create('x')); T.Add(TThing.Create('y')); T.Add(TThing.Create('z'));
+  T.Delete(1);
+  WriteLn(T.Count, ' ', T[1].Name, ' ', Destroyed);
+  T.Free;
+  WriteLn(Destroyed);
+  M := TAges.Create;
+  M.Add('bob', 40); M.Add('ann', 31); M['cid'] := 25; M['bob'] := 41;
+  WriteLn(M.Count, ' ', M['bob'], ' ', M.Keys[0], ' ', M.Data[1], ' ', M.IndexOf('cid'));
+  M.Sorted := True;
+  for I := 0 to M.Count - 1 do Write(M.Keys[I], '=', M.Data[I], ' ');
+  WriteLn(M.TryGetData('ann', Age), Age, ' ', M.TryGetData('zed', Age), Age);
+  M.Remove('ann');
+  WriteLn(M.Count, ' ', M.Keys[0]);
+  try
+    WriteLn(M['nobody']);
+  except
+    on E: Exception do WriteLn(E.ClassName);
+  end;
+  L.Free; S.Free; M.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "1 2 4 5 6 8 9 10 | 8 1 10 2 -1\n100 -1 4 5 6 8 9 \na;bb;ccc;1\n2 z 1\n3\n3 41 bob 31 2\nann=31 bob=41 cid=25 TRUE31 FALSE0\n2 bob\nEListError\n"
+        );
+    }
+
+    #[test]
+    fn generics_collections() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode delphi}{$H+}
+uses SysUtils, Generics.Collections;
+type
+  TThing = class
+    Name: string;
+    constructor Create(const AName: string);
+    destructor Destroy; override;
+  end;
+var
+  Freed: Integer;
+constructor TThing.Create(const AName: string); begin Name := AName; end;
+destructor TThing.Destroy; begin Inc(Freed); inherited; end;
+
+var
+  L: TList<Integer>;
+  S: TList<string>;
+  O: TObjectList<TThing>;
+  St: TStack<string>;
+  Q: TQueue<Integer>;
+  D: TDictionary<string, Integer>;
+  Keys: TArray<string>;
+  Pair: TPair<string, Integer>;
+  I, V, Total: Integer;
+  K: string;
+  Found: SizeInt;
+begin
+  L := TList<Integer>.Create;
+  L.AddRange([5, 3, 9, 1]);
+  L.Add(7);
+  L.Insert(0, 42);
+  L.Sort;
+  for I in L do Write(I, ' ');
+  WriteLn('| ', L.Count, ' ', L.IndexOf(9), ' ', L.Contains(4), ' ', L.First, ' ', L.Last);
+  WriteLn(L.BinarySearch(7, Found), ' ', Found, ' ', L.BinarySearch(4, Found), ' ', Found);
+  L.Reverse; L.Delete(0); L.Remove(1);
+  for I in L.ToArray do Write(I, ' ');
+  WriteLn;
+  S := TList<string>.Create;
+  S.AddRange(['pear', 'apple', 'fig']);
+  S.Sort;
+  WriteLn(S[0], ' ', S[2], ' ', S.Count);
+  O := TObjectList<TThing>.Create;
+  O.Add(TThing.Create('a')); O.Add(TThing.Create('b')); O.Add(TThing.Create('c'));
+  O.Delete(1);
+  WriteLn(O.Count, ' ', O[1].Name, ' ', Freed);
+  O.Free;
+  WriteLn(Freed);
+  St := TStack<string>.Create;
+  St.Push('x'); St.Push('y'); St.Push('z');
+  WriteLn(St.Pop, St.Peek, St.Count);
+  Q := TQueue<Integer>.Create;
+  for I := 1 to 10 do Q.Enqueue(I);
+  for I := 1 to 7 do Q.Dequeue;
+  for I := 11 to 14 do Q.Enqueue(I);
+  Write(Q.Count, ':');
+  while Q.Count > 0 do Write(' ', Q.Dequeue);
+  WriteLn;
+  D := TDictionary<string, Integer>.Create;
+  for I := 1 to 100 do D.Add('k' + IntToStr(I), I * I);
+  D.AddOrSetValue('k5', -5);
+  D.Remove('k10');
+  D['k20'] := 20;
+  WriteLn(D.Count, ' ', D['k5'], ' ', D.ContainsKey('k10'), ' ', D.ContainsKey('k99'), ' ', D['k20'],
+    ' ', D.TryGetValue('k3', V), V, ' ', D.TryGetValue('none', V), V, ' ', D.ContainsValue(9801));
+  Total := 0;
+  for Pair in D do Total := Total + Pair.Value;
+  Keys := D.Keys.ToArray;
+  WriteLn(Total, ' ', Length(Keys), ' ', D.Keys.Count);
+  try
+    D.Add('k1', 0);
+  except
+    on E: Exception do WriteLn(E.ClassName);
+  end;
+  try
+    V := D['missing'];
+  except
+    on E: Exception do WriteLn(E.ClassName);
+  end;
+  L.Free; S.Free; St.Free; Q.Free; D.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "1 3 5 7 9 42 | 6 4 FALSE 1 42\nTRUE 3 FALSE -1\n9 7 5 3 \napple pear 3\n2 c 1\n3\nzy2\n7: 8 9 10 11 12 13 14\n99 -5 FALSE TRUE 20 TRUE9 FALSE0 TRUE\n337840 99 99\nEListError\nEListError\n"
+        );
     }
 
     #[test]

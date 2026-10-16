@@ -780,10 +780,17 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn dx_args(&self, routine: &str, args: &[Expr]) -> Result<Vec<Expr>, CodeGenError> {
-        if TYPE_ARG_BUILTINS.contains(&routine) {
-            return Ok(args.to_vec());
-        }
-        args.iter().map(|a| self.dx(a)).collect()
+        // `SizeOf(TFoo)`: a type name stays one.
+        args.iter()
+            .map(|a| match a {
+                Expr::Var(name, _)
+                    if TYPE_ARG_BUILTINS.contains(&routine) && self.lookup_var(name).is_none() =>
+                {
+                    Ok(a.clone())
+                }
+                _ => self.dx(a),
+            })
+            .collect()
     }
 
     /// Rewrite the class operations in an expression.

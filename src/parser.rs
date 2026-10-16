@@ -1249,6 +1249,8 @@ pub struct Parser {
     short_strings: Vec<bool>,
     /// For each token, whether `Integer` meant a 32-bit LongInt there.
     int32: Vec<bool>,
+    /// Aliases for the specializations written in expressions.
+    hidden_types: Vec<TypeDecl>,
     pos: usize,
     pub directives: Directives,
     /// A preprocessing error, reported by the first `parse_*` call.
@@ -1303,6 +1305,7 @@ impl Parser {
             tokens,
             short_strings,
             int32,
+            hidden_types: Vec::new(),
             pos: 0,
             directives: lexer.directives,
             lex_error: lexer.error,
@@ -1431,7 +1434,11 @@ impl Parser {
             overloads: std::collections::HashMap::new(),
             labels: decls.labels,
             consts: decls.consts,
-            type_decls: decls.type_decls,
+            type_decls: decls
+                .type_decls
+                .into_iter()
+                .chain(std::mem::take(&mut self.hidden_types))
+                .collect(),
             vars: decls.vars,
             procedures: decls.procedures,
             body,
@@ -1489,16 +1496,26 @@ impl Parser {
     /// problem, not the parser's.
     fn parse_uses_clause(&mut self) -> Result<Vec<String>, ParseError> {
         self.expect(&Tok::KwUses)?;
-        let mut names = Vec::new();
-        let (first, _) = self.expect_ident()?;
-        names.push(first);
+        let mut names = vec![self.parse_unit_name()?];
         while *self.peek() == Tok::Comma {
             self.advance();
-            let (name, _) = self.expect_ident()?;
-            names.push(name);
+            names.push(self.parse_unit_name()?);
         }
         self.expect(&Tok::Semi)?;
         Ok(names)
+    }
+
+    /// A unit's name, dotted ones (`Generics.Collections`) included.
+    fn parse_unit_name(&mut self) -> Result<String, ParseError> {
+        let (mut name, _) = self.expect_ident()?;
+        while *self.peek() == Tok::Dot
+            && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
+        {
+            self.advance();
+            let (part, _) = self.expect_ident()?;
+            name = format!("{name}.{part}");
+        }
+        Ok(name)
     }
 
     /// Parse a unit file: `unit Name; interface ... implementation ... end.`
@@ -1514,7 +1531,7 @@ impl Parser {
         }
         let span = self.span();
         self.expect(&Tok::KwUnit)?;
-        let (name, _) = self.expect_ident()?;
+        let name = self.parse_unit_name()?;
         self.expect(&Tok::Semi)?;
 
         self.expect(&Tok::KwInterface)?;
@@ -1600,7 +1617,10 @@ impl Parser {
             interface_vars,
             interface_proc_headers,
             impl_consts,
-            impl_types,
+            impl_types: impl_types
+                .into_iter()
+                .chain(std::mem::take(&mut self.hidden_types))
+                .collect(),
             impl_vars,
             procedures,
             init,
@@ -1635,6 +1655,13 @@ impl Parser {
         };
         self.advance();
         let (first, _) = self.expect_member_name()?;
+        // `function TList<T>.Add`: the generic's parameters, repeated.
+        if *self.peek() == Tok::Lt && self.type_args_then_dot(self.pos) {
+            while *self.peek() != Tok::Gt {
+                self.advance();
+            }
+            self.advance();
+        }
         let (owner, name) = if *self.peek() == Tok::Dot {
             self.advance();
             let (method, _) = self.expect_member_name()?;
@@ -1759,7 +1786,18 @@ impl Parser {
         let mut decls = Vec::new();
         while self.at_decl_name() {
             let span = self.span();
+            // `generic TList<T> = ...` (objfpc) or `TList<T> = ...` (delphi).
+            if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("generic"))
+                && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
+            {
+                self.advance();
+            }
             let (decl_name, _) = self.expect_ident()?;
+            let type_params = if *self.peek() == Tok::Lt {
+                self.parse_type_params()?
+            } else {
+                Vec::new()
+            };
             self.expect(&Tok::Eq)?;
             let mut ty = self.parse_type()?;
             if let PascalType::Enum { ref mut name, .. } = ty {
@@ -1771,6 +1809,7 @@ impl Parser {
                 name: decl_name,
                 ty,
                 span,
+                type_params,
             });
         }
         if decls.is_empty() {
@@ -1780,6 +1819,102 @@ impl Parser {
             });
         }
         Ok(decls)
+    }
+
+    /// `<T, U: class; V>`: a generic's type parameters (constraints are
+    /// accepted and ignored).
+    fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect(&Tok::Lt)?;
+        let mut params = Vec::new();
+        loop {
+            let (name, _) = self.expect_ident()?;
+            params.push(name);
+            if *self.peek() == Tok::Colon {
+                self.advance();
+                // `class`, `record`, `constructor`, a type name, or several.
+                loop {
+                    match self.peek() {
+                        Tok::Gt | Tok::Semi => break,
+                        Tok::Comma
+                            if !matches!(
+                                self.tokens.get(self.pos + 1),
+                                Some((Tok::Ident(_), _))
+                            ) || matches!(
+                                self.tokens.get(self.pos + 2),
+                                Some((Tok::Colon | Tok::Comma | Tok::Gt | Tok::Semi, _))
+                            ) =>
+                        {
+                            break;
+                        }
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                }
+            }
+            match self.peek() {
+                Tok::Comma | Tok::Semi => {
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+        self.expect(&Tok::Gt)?;
+        Ok(params)
+    }
+
+    /// `<A, B>` after a generic's name: the type arguments.
+    fn parse_type_args(&mut self) -> Result<Vec<PascalType>, ParseError> {
+        self.expect(&Tok::Lt)?;
+        let mut args = vec![self.parse_type()?];
+        while *self.peek() == Tok::Comma {
+            self.advance();
+            args.push(self.parse_type()?);
+        }
+        self.expect(&Tok::Gt)?;
+        Ok(args)
+    }
+
+    /// Whether `<` at `pos` starts type arguments followed by `.`, as in
+    /// `TList<Integer>.Create` (Delphi mode).
+    fn type_args_then_dot(&self, pos: usize) -> bool {
+        let mut depth = 0;
+        let mut p = pos;
+        while let Some((t, _)) = self.tokens.get(p) {
+            match t {
+                Tok::Lt => depth += 1,
+                Tok::Gt => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(self.tokens.get(p + 1), Some((Tok::Dot, _)));
+                    }
+                }
+                Tok::Ident(_)
+                | Tok::Comma
+                | Tok::TyInteger
+                | Tok::TyString
+                | Tok::TyReal
+                | Tok::TyChar
+                | Tok::TyBoolean
+                | Tok::Dot => {}
+                _ => return false,
+            }
+            p += 1;
+        }
+        false
+    }
+
+    /// A specialization used in an expression: a hidden alias type for it,
+    /// named so no program can spell it.
+    fn hidden_specialization(&mut self, name: String, args: Vec<PascalType>, span: Span) -> String {
+        let alias = format!("specialize${}", self.hidden_types.len() + 1);
+        self.hidden_types.push(TypeDecl {
+            name: alias.clone(),
+            ty: PascalType::Specialize { name, args },
+            span,
+            type_params: Vec::new(),
+        });
+        alias
     }
 
     // ── const section ────────────────────────────────────
@@ -2096,6 +2231,21 @@ impl Parser {
                     max: 255,
                 })))
             }
+            Tok::Ident(w)
+                if w.eq_ignore_ascii_case("specialize")
+                    && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _))) =>
+            {
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                let args = self.parse_type_args()?;
+                Ok(PascalType::Specialize { name, args })
+            }
+            Tok::Ident(name) if matches!(self.tokens.get(self.pos + 1), Some((Tok::Lt, _))) => {
+                let name = name.clone();
+                self.advance();
+                let args = self.parse_type_args()?;
+                Ok(PascalType::Specialize { name, args })
+            }
             Tok::Ident(name) => {
                 let mut name = name.clone();
                 self.advance();
@@ -2250,10 +2400,17 @@ impl Parser {
         let is_class = *self.peek() != Tok::KwObject;
         self.advance();
         let mut parent = None;
+        let mut parent_args = Vec::new();
         if *self.peek() == Tok::LParen {
             self.advance();
+            if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("specialize")) {
+                self.advance();
+            }
             let (first, _) = self.expect_ident()?;
             parent = Some(first);
+            if *self.peek() == Tok::Lt {
+                parent_args = self.parse_type_args()?;
+            }
             // Implemented interfaces are accepted and ignored.
             while *self.peek() == Tok::Comma {
                 self.advance();
@@ -2269,6 +2426,7 @@ impl Parser {
             is_forward: false,
             properties: Vec::new(),
             class_vars: Vec::new(),
+            parent_args,
         };
         // After `class var`, fields are class variables until the next
         // section.
@@ -3887,6 +4045,24 @@ impl Parser {
         }
     }
 
+    /// The class after `is` / `as`: a name, or a specialization
+    /// (`TBox<string>`, `specialize TBox<string>`).
+    fn parse_class_operand(&mut self) -> Result<Expr, ParseError> {
+        let span = self.span();
+        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("specialize")) {
+            self.advance();
+        }
+        if matches!(self.peek(), Tok::Ident(_))
+            && matches!(self.tokens.get(self.pos + 1), Some((Tok::Lt, _)))
+        {
+            let (name, _) = self.expect_ident()?;
+            let args = self.parse_type_args()?;
+            let alias = self.hidden_specialization(name, args, span);
+            return Ok(Expr::Var(alias, span));
+        }
+        self.parse_unary()
+    }
+
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_comparison()
     }
@@ -3907,7 +4083,11 @@ impl Parser {
             };
             let span = self.span();
             self.advance();
-            let right = self.parse_additive()?;
+            let right = if op == BinOp::Is {
+                self.parse_class_operand()?
+            } else {
+                self.parse_additive()?
+            };
             left = Expr::BinOp {
                 op,
                 left: Box::new(left),
@@ -3957,7 +4137,11 @@ impl Parser {
             };
             let span = self.span();
             self.advance();
-            let right = self.parse_unary()?;
+            let right = if op == BinOp::As {
+                self.parse_class_operand()?
+            } else {
+                self.parse_unary()?
+            };
             left = Expr::BinOp {
                 op,
                 left: Box::new(left),
@@ -4206,6 +4390,23 @@ impl Parser {
                     args: vec![arg],
                     span,
                 })
+            }
+            // `specialize TList<Integer>.Create`, `TList<Integer>.Create`.
+            Tok::Ident(w)
+                if (w.eq_ignore_ascii_case("specialize")
+                    && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
+                    && matches!(self.tokens.get(self.pos + 2), Some((Tok::Lt, _))))
+                    || (matches!(self.tokens.get(self.pos + 1), Some((Tok::Lt, _)))
+                        && self.type_args_then_dot(self.pos + 1)) =>
+            {
+                let span = self.span();
+                if w.eq_ignore_ascii_case("specialize") {
+                    self.advance();
+                }
+                let (name, _) = self.expect_ident()?;
+                let args = self.parse_type_args()?;
+                let alias = self.hidden_specialization(name, args, span);
+                self.parse_postfix(Expr::Var(alias, span), span)
             }
             Tok::Ident(name) => {
                 let span = self.span();

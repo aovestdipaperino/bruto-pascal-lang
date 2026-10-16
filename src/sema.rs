@@ -48,6 +48,8 @@ pub fn resolve_program(program: &Program) -> Result<Resolved, SemaError> {
     add_system_constants(&mut program);
     let display_names = fold_identifier_case(&mut program);
     strip_unit_qualifiers(&mut program);
+    crate::generics::instantiate_generics(&mut program)
+        .map_err(|(message, span)| SemaError { message, span })?;
     name_overloads(&mut program);
     name_method_overloads(&mut program);
     name_nested_routines(&mut program);
@@ -293,6 +295,15 @@ fn name_method_overloads(program: &mut Program) {
     // Per type: (key, base name, signature) of its own methods.
     let mut own: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
     let mut renamed = false;
+    // `TIntList = TFPGList<Integer>`: a parent may be named by an alias.
+    let aliases: HashMap<String, String> = program
+        .type_decls
+        .iter()
+        .filter_map(|t| match &t.ty {
+            PascalType::Named(n) => Some((t.name.clone(), n.clone())),
+            _ => None,
+        })
+        .collect();
     for td in program.type_decls.iter_mut() {
         let PascalType::Object(obj) = &mut td.ty else {
             continue;
@@ -306,6 +317,7 @@ fn name_method_overloads(program: &mut Program) {
                 .filter(|p| *p != td.name)
         });
         let mut table = parent
+            .map(|p| aliases.get(&p).cloned().unwrap_or(p))
             .and_then(|p| known.get(&p).cloned())
             .unwrap_or_default();
         let mut mine: Vec<(String, String, String)> = Vec::new();
@@ -814,6 +826,11 @@ impl ConstEnv {
                 }
             }
             PascalType::ClassOf(_) => {}
+            PascalType::Specialize { args, .. } => {
+                for a in args {
+                    self.resolve_type(a, span)?;
+                }
+            }
             PascalType::VarParam(inner)
             | PascalType::DynArray(inner)
             | PascalType::OpenArray(inner) => self.resolve_type(inner, span)?,

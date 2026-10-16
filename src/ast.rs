@@ -87,6 +87,9 @@ pub struct TypeDecl {
     pub name: String,
     pub ty: PascalType,
     pub span: Span,
+    /// A generic type's parameters (`generic TList<T> = class`); empty
+    /// for an ordinary type.
+    pub type_params: Vec<String>,
 }
 
 /// Constant declaration: `name = value` or `name: type = value` (typed/mutable)
@@ -260,6 +263,13 @@ pub enum PascalType {
     /// A `var` / `out` (or untyped `const`) parameter of a procedural
     /// type: passed by reference.
     VarParam(Box<PascalType>),
+    /// `specialize TList<Integer>` (or `TList<Integer>`): generic type
+    /// `name` with these arguments. The generics pass replaces it with the
+    /// name of the instantiation it makes.
+    Specialize {
+        name: String,
+        args: Vec<PascalType>,
+    },
     /// `array of T` as a variable's type: a dynamic array, a reference
     /// counted heap block of elements indexed from 0 (nil when empty).
     DynArray(Box<PascalType>),
@@ -480,6 +490,9 @@ pub struct ObjectType {
     /// `class var` fields: one variable shared by the class and its
     /// descendants.
     pub class_vars: Vec<(String, PascalType)>,
+    /// The type arguments of a parent that is a specialization
+    /// (`class(TBox<T>)`); the generics pass makes it a plain name.
+    pub parent_args: Vec<PascalType>,
 }
 
 /// A class property: `property Name[Index: T]: T read Getter write

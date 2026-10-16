@@ -42,6 +42,9 @@ pub(crate) fn rewrite_program<R: Rename>(program: &mut Program, n: &R) {
     }
     for td in &mut program.type_decls {
         td.name = n.rename(&td.name);
+        for p in &mut td.type_params {
+            *p = n.rename(p);
+        }
         rewrite_type(&mut td.ty, n);
     }
     for v in &mut program.vars {
@@ -73,6 +76,9 @@ pub(crate) fn rewrite_unit<R: Rename>(unit: &mut Unit, n: &R) {
     }
     for td in unit.interface_types.iter_mut().chain(&mut unit.impl_types) {
         td.name = n.rename(&td.name);
+        for p in &mut td.type_params {
+            *p = n.rename(p);
+        }
         rewrite_type(&mut td.ty, n);
     }
     for v in unit.interface_vars.iter_mut().chain(&mut unit.impl_vars) {
@@ -113,6 +119,9 @@ pub(crate) fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
     }
     for td in &mut p.type_decls {
         td.name = n.rename(&td.name);
+        for p in &mut td.type_params {
+            *p = n.rename(p);
+        }
         rewrite_type(&mut td.ty, n);
     }
     for group in &mut p.params {
@@ -143,7 +152,7 @@ pub(crate) fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
     n.leave_routine();
 }
 
-fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
+pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
     match ty {
         PascalType::Object(obj) => {
             if let Some(parent) = &mut obj.parent {
@@ -167,6 +176,9 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
                 if let Some(rt) = &mut m.return_type {
                     rewrite_type(rt, n);
                 }
+            }
+            for a in &mut obj.parent_args {
+                rewrite_type(a, n);
             }
             for (vname, vty) in &mut obj.class_vars {
                 *vname = n.rename_member(vname);
@@ -194,6 +206,12 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
             }
         }
         PascalType::ClassOf(name) => *name = n.rename(name),
+        PascalType::Specialize { name, args } => {
+            *name = n.rename(name);
+            for a in args {
+                rewrite_type(a, n);
+            }
+        }
         PascalType::VarParam(inner)
         | PascalType::DynArray(inner)
         | PascalType::OpenArray(inner) => rewrite_type(inner, n),
