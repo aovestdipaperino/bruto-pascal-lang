@@ -90,12 +90,16 @@ type
     property Items[Index: Integer]: Pointer read Get write Put; default;
   end;
 
+  { Compiled with type information: its descendants' default sections
+    are published, as in FPC. }
+{$M+}
   TPersistent = class(TObject)
   protected
     procedure AssignTo(Dest: TPersistent); virtual;
   public
     procedure Assign(Source: TPersistent); virtual;
   end;
+{$M-}
 
   { A component: owned components are freed with their owner. }
   TComponent = class(TPersistent)
@@ -113,10 +117,11 @@ type
     procedure RemoveComponent(AComponent: TComponent);
     function FindComponent(const AName: string): TComponent;
     property Owner: TComponent read FOwner;
-    property Name: string read FName write FName;
-    property Tag: PtrInt read FTag write FTag;
     property Components[Index: Integer]: TComponent read GetComponent;
     property ComponentCount: Integer read GetComponentCount;
+  published
+    property Name: string read FName write FName stored False;
+    property Tag: PtrInt read FTag write FTag default 0;
   end;
   TComponentClass = class of TComponent;
 

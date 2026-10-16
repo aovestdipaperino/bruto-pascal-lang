@@ -52,6 +52,7 @@ type
   end;
 
   { A method pointer's parts: `TMethod(OnClick).Data` is the instance. }
+  PMethod = ^TMethod;
   TMethod = record
     Code, Data: Pointer;
   end;
@@ -66,6 +67,8 @@ type
     class function ClassNameIs(const Name: AnsiString): Boolean;
     class function ClassParent: TClass;
     class function InstanceSize: SizeInt;
+    { The class's type information (a PTypeInfo). }
+    class function ClassInfo: Pointer;
     class function InheritsFrom(AClass: TClass): Boolean;
     function ClassType: TClass;
     procedure AfterConstruction; virtual;
@@ -308,6 +311,15 @@ end;
 function TObject.ToString: AnsiString;
 begin
   ToString := ClassName;
+end;
+
+class function TObject.ClassInfo: Pointer;
+type
+  PClassInfoWords = ^TClassInfoWords;
+  TClassInfoWords = array[0..7] of Pointer;
+begin
+  { The VMT's seventh word. }
+  ClassInfo := PClassInfoWords(Pointer(Self))^[6];
 end;
 
 type

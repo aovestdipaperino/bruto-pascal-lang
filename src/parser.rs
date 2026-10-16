@@ -306,6 +306,8 @@ struct Lexer {
     int32: bool,
     /// `{$interfaces corba}`: interfaces declared here aren't counted.
     corba: bool,
+    /// `{$M+}`: classes declared here have published members.
+    type_info: bool,
     /// `{$DEFINE NAME := text}` macros: upper-case name -> replacement.
     macros: std::collections::HashMap<String, String>,
     conditions: Vec<Condition>,
@@ -395,6 +397,7 @@ impl Lexer {
             short_strings: false,
             int32: false,
             corba: false,
+            type_info: false,
             conditions: Vec::new(),
             include_dirs: options.include_dirs.clone(),
             error: None,
@@ -539,6 +542,7 @@ impl Lexer {
             },
             "longstrings" => self.short_strings = first_word(rest) == "OFF",
             "interfaces" => self.corba = first_word(rest) == "CORBA",
+            "typeinfo" => self.type_info = first_word(rest) == "ON",
             "codepage" => self.cp437 = matches!(first_word(rest).as_str(), "CP437" | "437"),
             "include" => self.include(rest, span),
             "i" if !rest.starts_with(['+', '-']) => self.include(rest, span),
@@ -555,6 +559,7 @@ impl Lexer {
                         b'R' => self.directives.range_check = on,
                         b'Q' => self.directives.overflow_check = on,
                         b'I' => self.directives.io_check = on,
+                        b'M' => self.type_info = on,
                         _ => {}
                     }
                 }
@@ -1255,6 +1260,8 @@ pub struct Parser {
     int32: Vec<bool>,
     /// For each token, whether interfaces were CORBA ones there.
     corba: Vec<bool>,
+    /// For each token, whether `{$M+}` was on there.
+    type_info: Vec<bool>,
     /// Aliases for the specializations written in expressions.
     hidden_types: Vec<TypeDecl>,
     pos: usize,
@@ -1290,6 +1297,7 @@ impl Parser {
         let mut short_strings = Vec::new();
         let mut int32 = Vec::new();
         let mut corba = Vec::new();
+        let mut type_info = Vec::new();
         loop {
             let (tok, span) = lexer.next_token();
             let is_eof = tok == Tok::Eof;
@@ -1305,6 +1313,7 @@ impl Parser {
             short_strings.push(lexer.short_strings);
             int32.push(lexer.int32);
             corba.push(lexer.corba);
+            type_info.push(lexer.type_info);
             if is_eof {
                 break;
             }
@@ -1314,6 +1323,7 @@ impl Parser {
             short_strings,
             int32,
             corba,
+            type_info,
             hidden_types: Vec::new(),
             pos: 0,
             directives: lexer.directives,
@@ -2449,6 +2459,7 @@ impl Parser {
     fn parse_object_type(&mut self) -> Result<PascalType, ParseError> {
         let is_interface = *self.peek() == Tok::KwInterface;
         let is_corba = is_interface && self.corba[self.pos];
+        let type_info = self.type_info[self.pos];
         let is_class = !is_interface && *self.peek() != Tok::KwObject;
         self.advance();
         let mut parent = None;
@@ -2507,7 +2518,12 @@ impl Parser {
             guid,
             is_corba,
             resolutions: Vec::new(),
+            published: Vec::new(),
+            default_section: Vec::new(),
+            type_info,
         };
+        // The section being read: None before any visibility keyword.
+        let mut section: Option<String> = None;
         // After `class var`, fields are class variables until the next
         // section.
         let mut in_class_vars = false;
@@ -2587,6 +2603,11 @@ impl Parser {
                 {
                     self.advance();
                     if let Some(prop) = self.parse_property()? {
+                        match section.as_deref() {
+                            Some("published") => obj.published.push(prop.name.clone()),
+                            None => obj.default_section.push(prop.name.clone()),
+                            _ => {}
+                        }
                         obj.properties.push(prop);
                     }
                 }
@@ -2599,6 +2620,10 @@ impl Parser {
                         Some((Tok::Colon | Tok::Comma, _))
                     ) =>
                 {
+                    let lower = word.to_ascii_lowercase();
+                    if lower != "strict" {
+                        section = Some(lower);
+                    }
                     self.advance();
                     in_class_vars = false;
                 }
@@ -2619,6 +2644,11 @@ impl Parser {
                 Tok::Ident(_) => {
                     let decl = self.parse_var_decl()?;
                     for name in decl.names {
+                        match section.as_deref() {
+                            Some("published") if !in_class_vars => obj.published.push(name.clone()),
+                            None if !in_class_vars => obj.default_section.push(name.clone()),
+                            _ => {}
+                        }
                         if in_class_vars {
                             obj.class_vars.push((name, decl.ty.clone()));
                         } else {
@@ -2675,6 +2705,8 @@ impl Parser {
             index: None,
             is_default: false,
             implements: Vec::new(),
+            default_value: None,
+            stored: None,
             span,
         };
         loop {
@@ -2696,13 +2728,19 @@ impl Parser {
                     let n = self.parse_int_literal()?;
                     prop.index = Some(if negative { -n } else { n });
                 }
-                // `default V` / `stored S`: streaming hints, skipped.
+                // `default V` / `stored S`: streaming hints.
                 Tok::Ident(w)
                     if (w.eq_ignore_ascii_case("default") || w.eq_ignore_ascii_case("stored"))
                         && !matches!(self.tokens.get(self.pos + 1), Some((Tok::Semi, _))) =>
                 {
+                    let is_default = w.eq_ignore_ascii_case("default");
                     self.advance();
-                    self.parse_expr()?;
+                    let value = DefaultValue(self.parse_expr()?);
+                    if is_default {
+                        prop.default_value = Some(value);
+                    } else {
+                        prop.stored = Some(value);
+                    }
                 }
                 Tok::Ident(w) if w.eq_ignore_ascii_case("nodefault") => {
                     self.advance();

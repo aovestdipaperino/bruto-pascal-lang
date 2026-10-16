@@ -6258,7 +6258,216 @@ end.
         );
         let _ = std::fs::remove_file("bruto_ws_test.txt");
         assert!(ok, "program failed: {out}");
-        assert_eq!(out, "clGreen 1 [clGreen ]szHugeszSmall6\nszLarge 5 clGreen\nclGreen    42 3.50 TRUE x 18446744073709551615|   abc| 1.250000000E+00\n7szLarge\nclGreen szLarge\n");
+        assert_eq!(
+            out,
+            "clGreen 1 [clGreen ]szHugeszSmall6\nszLarge 5 clGreen\nclGreen    42 3.50 TRUE x 18446744073709551615|   abc| 1.250000000E+00\n7szLarge\nclGreen szLarge\n"
+        );
+    }
+
+    #[test]
+    fn enum_type_information_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program en;
+{$mode objfpc}{$H+}
+uses TypInfo;
+type
+  TColor = (clRed, clGreen, clBlue);
+  TSize = (szSmall = 1, szLarge = 5);
+  TColors = set of TColor;
+var
+  C: TColor;
+  S: string;
+  P: PTypeInfo;
+  D: PTypeData;
+  Cs: TColors;
+begin
+  C := clGreen;
+  WriteLn(C, ' ', Ord(C));
+  WriteStr(S, C);
+  WriteLn(S, ' ', GetEnumName(TypeInfo(TColor), 2), ' ', GetEnumValue(TypeInfo(TColor), 'clblue'));
+  P := TypeInfo(TColor);
+  WriteLn(P^.Name, ' ', P^.Kind = tkEnumeration);
+  D := GetTypeData(P);
+  WriteLn(D^.MinValue, ' ', D^.MaxValue);
+  WriteLn(GetEnumName(TypeInfo(Boolean), 1), ' ', GetEnumNameCount(TypeInfo(TColor)));
+  WriteLn(GetEnumValue(TypeInfo(TColor), 'nothing'));
+  Cs := [clRed, clBlue];
+  WriteLn(SetToString(PTypeInfo(TypeInfo(TColors)), Integer(Cs), True));
+  WriteLn(PTypeInfo(TypeInfo(Integer))^.Name, ' ', PTypeInfo(TypeInfo(string))^.Name);
+  WriteLn(szLarge);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "clGreen 1\nclGreen clBlue 2\nTColor TRUE\n0 2\nTrue 3\n-1\n[clRed,clBlue]\nLongInt AnsiString\nszLarge\n"
+        );
+    }
+
+    #[test]
+    fn published_properties_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program pr;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, TypInfo;
+type
+  TShape = (shCircle, shSquare, shTriangle);
+  TStyle = (stBold, stItalic, stUnder);
+  TStyles = set of TStyle;
+
+  TBase = class(TPersistent)
+  private
+    FName: string;
+    FTag: Integer;
+  published
+    property Name: string read FName write FName;
+    property Tag: Integer read FTag write FTag default 0;
+  end;
+
+  TWidget = class(TBase)
+  private
+    FWidth: Integer;
+    FShape: TShape;
+    FStyles: TStyles;
+    FRatio: Double;
+    FVisible: Boolean;
+    FCaption: string;
+    FCoords: array[0..1] of Integer;
+    FOwnerW: TObject;
+    FSmall: Byte;
+    function GetCaption: string;
+    procedure SetCaption(const V: string);
+    function GetCoord(Index: Integer): Integer;
+    procedure SetCoord(Index: Integer; V: Integer);
+    function GetArea: Integer; virtual;
+  public
+    Hidden: Integer;
+  published
+    property Width: Integer read FWidth write FWidth;
+    property Shape: TShape read FShape write FShape default shSquare;
+    property Styles: TStyles read FStyles write FStyles;
+    property Ratio: Double read FRatio write FRatio;
+    property Visible: Boolean read FVisible write FVisible;
+    property Caption: string read GetCaption write SetCaption;
+    property X: Integer index 0 read GetCoord write SetCoord;
+    property Y: Integer index 1 read GetCoord write SetCoord;
+    property Area: Integer read GetArea;
+    property Other: TObject read FOwnerW write FOwnerW;
+    property Small: Byte read FSmall write FSmall;
+  end;
+
+  TBig = class(TWidget)
+    function GetArea: Integer; override;
+  end;
+
+function TWidget.GetCaption: string; begin Result := '<' + FCaption + '>'; end;
+procedure TWidget.SetCaption(const V: string); begin FCaption := UpperCase(V); end;
+function TWidget.GetCoord(Index: Integer): Integer; begin Result := FCoords[Index]; end;
+procedure TWidget.SetCoord(Index: Integer; V: Integer); begin FCoords[Index] := V * 10; end;
+function TWidget.GetArea: Integer; begin Result := FWidth * FWidth; end;
+function TBig.GetArea: Integer; begin Result := 1000 + FWidth; end;
+
+var
+  W: TWidget;
+  L: PPropList;
+  N, I: Integer;
+  P: PPropInfo;
+begin
+  W := TBig.Create;
+  N := GetPropList(W, L);
+  WriteLn(N);
+  for I := 0 to N - 1 do
+    WriteLn(I, ' ', L^[I]^.Name, ' ', L^[I]^.PropType^.Name, ' ', Ord(L^[I]^.PropType^.Kind), ' ', L^[I]^.NameIndex);
+  FreeMem(L);
+  SetStrProp(W, 'Name', 'w1');
+  SetOrdProp(W, 'Tag', 42);
+  SetOrdProp(W, 'Width', 7);
+  SetEnumProp(W, 'Shape', 'shTriangle');
+  SetSetProp(W, 'Styles', '[stBold,stUnder]');
+  SetFloatProp(W, 'Ratio', 1.5);
+  SetOrdProp(W, 'Visible', 1);
+  SetStrProp(W, 'Caption', 'hello');
+  SetOrdProp(W, 'X', 3);
+  SetOrdProp(W, 'Y', 4);
+  SetObjectProp(W, 'Other', W);
+  SetOrdProp(W, 'Small', 200);
+  WriteLn(W.Name, ' ', W.Tag, ' ', W.Width, ' ', W.Shape, ' ', W.Ratio:0:2, ' ', W.Visible, ' ', W.Caption, ' ', W.X, ' ', W.Y);
+  WriteLn(GetStrProp(W, 'Name'), ' ', GetOrdProp(W, 'Tag'), ' ', GetEnumProp(W, 'Shape'), ' ', GetSetProp(W, 'Styles', True));
+  WriteLn(GetFloatProp(W, 'Ratio'):0:3, ' ', GetOrdProp(W, 'Visible'), ' ', GetStrProp(W, 'Caption'), ' ', GetOrdProp(W, 'X'), ' ', GetOrdProp(W, 'Area'));
+  WriteLn(GetObjectProp(W, 'Other') = W, ' ', GetOrdProp(W, 'Small'), ' ', GetObjectPropClass(W, 'Other').ClassName);
+  WriteLn(IsPublishedProp(W, 'Hidden'), ' ', IsPublishedProp(W, 'width'), ' ', PropIsType(W, 'Shape', tkEnumeration));
+  P := GetPropInfo(W, 'Shape');
+  WriteLn(P^.Default, ' ', GetPropInfo(W, 'Width')^.Default = Low(LongInt), ' ', IsStoredProp(W, P));
+  WriteLn(GetTypeData(PTypeInfo(W.ClassInfo))^.PropCount, ' ', PTypeInfo(W.ClassInfo)^.Name, ' ', GetTypeData(PTypeInfo(W.ClassInfo))^.ParentInfo^.Name);
+  N := GetPropList(PTypeInfo(W.ClassInfo), [tkInteger, tkEnumeration], nil, True);
+  GetMem(L, N * SizeOf(Pointer));
+  GetPropList(PTypeInfo(W.ClassInfo), [tkInteger, tkEnumeration], L, True);
+  for I := 0 to N - 1 do Write(L^[I]^.Name, ' ');
+  WriteLn;
+  FreeMem(L);
+  try
+    GetOrdProp(W, 'Nope');
+  except
+    on E: Exception do WriteLn(E.ClassName, ': ', E.Message);
+  end;
+  W.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "13\n0 Name AnsiString 9 0\n1 Tag LongInt 1 1\n2 Width LongInt 1 2\n3 Shape TShape 3 3\n4 Styles TStyles 5 4\n5 Ratio Double 4 5\n6 Visible Boolean 18 6\n7 Caption AnsiString 9 7\n8 X LongInt 1 8\n9 Y LongInt 1 9\n10 Area LongInt 1 10\n11 Other TObject 15 11\n12 Small Byte 1 12\nw1 42 7 shTriangle 1.50 TRUE <HELLO> 30 40\nw1 42 shTriangle [stBold,stUnder]\n1.500 1 <HELLO> 30 1007\nTRUE 200 TObject\nFALSE TRUE TRUE\n1 TRUE TRUE\n13 TBig TWidget\nArea Shape Small Tag Width X Y \nEPropertyError: Unknown property: \"Nope\"\n"
+        );
+    }
+
+    #[test]
+    fn component_published_properties_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program comp;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, TypInfo;
+type
+  TColor = (clRed, clGreen);
+  TThing = class(TComponent)
+  private
+    FSize: Integer;
+    FColor: TColor;
+    FSecret: Integer;
+  public
+    property Secret: Integer read FSecret write FSecret;
+  { default section, published under $M+ }
+  published
+    property Size: Integer read FSize write FSize default 10;
+    property Color: TColor read FColor write FColor;
+  end;
+  TDefaulted = class(TPersistent)
+  private
+    FA: Integer;
+  property A: Integer read FA write FA;
+  end;
+var
+  T: TThing;
+  L: PPropList;
+  N, I: Integer;
+begin
+  T := TThing.Create(nil);
+  T.Name := 'Thing1';
+  N := GetPropList(T, L);
+  for I := 0 to N - 1 do
+    WriteLn(L^[I]^.Name, ': ', L^[I]^.PropType^.Name, ' stored=', IsStoredProp(T, L^[I]), ' default=', L^[I]^.Default);
+  FreeMem(L);
+  WriteLn(GetStrProp(T, 'Name'), ' ', IsPublishedProp(T, 'Secret'), ' ', IsPublishedProp(TDefaulted, 'A'));
+  T.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "Name: AnsiString stored=FALSE default=0\nTag: Int64 stored=TRUE default=0\nSize: LongInt stored=TRUE default=10\nColor: TColor stored=TRUE default=-2147483648\nThing1 FALSE FALSE\n"
+        );
     }
 
     #[test]

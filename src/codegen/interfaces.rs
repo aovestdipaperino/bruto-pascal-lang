@@ -146,6 +146,8 @@ impl<'ctx> CodeGen<'ctx> {
                 is_corba: decl.is_corba,
                 resolutions: HashMap::new(),
                 delegates: HashMap::new(),
+                type_info: false,
+                own_published: Vec::new(),
             },
         );
         Ok(())

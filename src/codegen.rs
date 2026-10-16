@@ -31,6 +31,7 @@ mod forin;
 mod interfaces;
 mod layout;
 mod objects;
+mod rtti;
 mod strings;
 mod system;
 mod unicode;
@@ -204,6 +205,10 @@ pub struct CodeGen<'ctx> {
     /// Delegating interface getters (class, interface) whose bodies are
     /// still to be written.
     intf_getters: Vec<(String, String)>,
+    /// The unit declaring each type that came from one.
+    type_units: HashMap<String, String>,
+    /// The program's name as written.
+    program_display_name: String,
     // Other names of object types and classes: alias -> the type.
     class_aliases: HashMap<String, String>,
     // Each routine's parameter defaults, one per parameter (by symbol).
@@ -320,6 +325,8 @@ impl<'ctx> CodeGen<'ctx> {
             intf_temps_used: 0,
             class_cleanups: Vec::new(),
             intf_getters: Vec::new(),
+            type_units: HashMap::new(),
+            program_display_name: String::new(),
             class_aliases: HashMap::new(),
             runtime_error_stubs: std::cell::RefCell::new(Vec::new()),
             proc_param_defaults: HashMap::new(),
@@ -518,6 +525,8 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(|e| CodeGenError::new(e.message, Some(e.span)))?;
         self.display_names = resolved.display_names;
         let program = &resolved.program;
+        self.type_units = program.type_units.clone();
+        self.program_display_name = self.display(&program.name.to_ascii_lowercase());
         self.overloads = program.overloads.clone();
         self.emit_runtime_decls();
         if self.instrument {
@@ -6975,6 +6984,9 @@ impl<'ctx> CodeGen<'ctx> {
                 if name == "typeof" && args.len() == 1 {
                     return self.compile_typeof(&args[0], *span);
                 }
+                if name == "typeinfo" && args.len() == 1 && !self.is_user_routine(name) {
+                    return self.compile_type_info(&args[0], *span);
+                }
                 if name == "supports"
                     && let Some(found) = self.compile_supports(args, *span)?
                 {
@@ -9617,6 +9629,28 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let i64_ty = self.context.i64_type();
+        // `TColors(N)`: a set holding N's bits; `Integer(S)`: a set's first
+        // 64 elements' bits, as FPC's casts of small sets give them.
+        if let PascalType::Set { .. } = target
+            && val.is_int_value()
+        {
+            let bits = self.to_i64(val, span)?;
+            let set_ty = self.llvm_type_for(target).into_array_type();
+            return Ok(self
+                .builder
+                .build_insert_value(set_ty.const_zero(), bits, 0, "set_bits")
+                .map_err(err)?
+                .as_basic_value_enum());
+        }
+        let val = if let BasicValueEnum::ArrayValue(a) = val
+            && a.get_type() == self.context.i64_type().array_type(4)
+        {
+            self.builder
+                .build_extract_value(a, 0, "set_bits")
+                .map_err(err)?
+        } else {
+            val
+        };
         match target {
             PascalType::Pointer(_) | PascalType::Proc { .. } | PascalType::ClassOf(_) => {
                 if val.is_pointer_value() {
@@ -9700,6 +9734,15 @@ impl<'ctx> CodeGen<'ctx> {
         let bool_ty = self.context.bool_type();
         match name {
             "integer" => {
+                let val = if let BasicValueEnum::ArrayValue(a) = val
+                    && a.get_type() == i64_ty.array_type(4)
+                {
+                    self.builder
+                        .build_extract_value(a, 0, "set_bits")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                } else {
+                    val
+                };
                 if val.is_int_value() {
                     let iv = val.into_int_value();
                     if iv.get_type().get_bit_width() < 64 {
@@ -10042,7 +10085,7 @@ impl<'ctx> CodeGen<'ctx> {
                 {
                     return target;
                 }
-                if name == "typeof" {
+                if name == "typeof" || name == "typeinfo" {
                     return PascalType::Pointer(Box::new(PascalType::Untyped));
                 }
                 if name == "string" && args.len() == 1 {
@@ -10247,6 +10290,16 @@ impl<'ctx> CodeGen<'ctx> {
                 // picks IntToStr(Int64) over IntToStr(QWord)).
                 let signed =
                     |t: &PascalType| !matches!(t, PascalType::SizedInt { signed: false, .. });
+                // An instance of a class, for a parameter of an ancestor
+                // class.
+                if let (Some(want), Some(have)) = (
+                    self.class_instance_of(&param),
+                    self.class_instance_of(&arg_ty),
+                ) && self.descends_from(&have, &want)
+                {
+                    total += 2;
+                    continue;
+                }
                 match (&param, &arg_ty) {
                     (
                         PascalType::Integer | PascalType::SizedInt { .. },
@@ -10282,6 +10335,18 @@ impl<'ctx> CodeGen<'ctx> {
             };
         }
         Some(total)
+    }
+
+    /// Whether object type `class` is `ancestor` or descends from it.
+    pub(super) fn descends_from(&self, class: &str, ancestor: &str) -> bool {
+        let mut cur = Some(class.to_string());
+        while let Some(c) = cur {
+            if c == ancestor {
+                return true;
+            }
+            cur = self.objects.get(&c).and_then(|o| o.parent.clone());
+        }
+        false
     }
 
     fn resolve_overload(&self, name: &str, args: &[Expr]) -> String {

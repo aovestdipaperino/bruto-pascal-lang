@@ -12,6 +12,62 @@ type
 
   TSystemCodePage = Word;
 
+  { Run-time type information, as `TypeInfo(T)` and a class's ClassInfo
+    give it (the TypInfo unit reads it). FPC's names; the layout is
+    Bruto's: a TTypeInfo, then its TTypeData. }
+  TTypeKind = (tkUnknown, tkInteger, tkChar, tkEnumeration, tkFloat, tkSet,
+    tkMethod, tkSString, tkLString, tkAString, tkWString, tkVariant, tkArray,
+    tkRecord, tkInterface, tkClass, tkObject, tkWChar, tkBool, tkInt64,
+    tkQWord, tkDynArray, tkInterfaceRaw, tkProcVar, tkUString, tkUChar,
+    tkHelper, tkFile, tkClassRef, tkPointer);
+  TOrdType = (otSByte, otUByte, otSWord, otUWord, otSLong, otULong, otSQWord,
+    otUQWord);
+  TFloatType = (ftSingle, ftDouble, ftExtended, ftComp, ftCurr);
+
+  PTypeInfo = ^TTypeInfo;
+  PPTypeInfo = ^PTypeInfo;
+  TTypeInfo = record
+    Kind: TTypeKind;
+    Name: ShortString;
+  end;
+
+  PTypeData = ^TTypeData;
+  TTypeData = record
+    { Ordinal types: their storage, bounds, and (an enumeration's) names,
+      indexed by value - MinValue. }
+    OrdType: TOrdType;
+    MinValue, MaxValue: LongInt;
+    BaseType: PTypeInfo;
+    NameList: Pointer;
+    { A set's element type. }
+    CompType: PTypeInfo;
+    MinInt64Value, MaxInt64Value: Int64;
+    MinQWordValue, MaxQWordValue: QWord;
+    FloatType: TFloatType;
+    { A class: its VMT, its parent's type information, its published
+      properties (own and inherited) and its own ones. }
+    ClassType: Pointer;
+    ParentInfo: PTypeInfo;
+    PropCount: SmallInt;
+    UnitName: ShortString;
+    OwnPropCount: LongInt;
+    OwnProps: Pointer;
+  end;
+
+  PPropInfo = ^TPropInfo;
+  TPropInfo = record
+    PropType: PTypeInfo;
+    { A field's offset (ptField), a method (ptStatic) or a constant
+      (ptConst), as PropProcs says: bits 0-1 for GetProc, 2-3 SetProc,
+      4-5 StoredProc. }
+    GetProc, SetProc, StoredProc: Pointer;
+    Index: LongInt;
+    Default: LongInt;
+    NameIndex: SmallInt;
+    PropProcs: Byte;
+    Name: ShortString;
+  end;
+
 { The C library's heap, which Bruto allocates from: on macOS the default
   malloc zone's statistics; elsewhere the figures are zero. }
 function GetFPCHeapStatus: TFPCHeapStatus;

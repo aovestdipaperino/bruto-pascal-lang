@@ -341,7 +341,7 @@ begin
     { Destroy is the first virtual method, after the class VMT's five
       header words. }
     VMT := PPointer(Instance)^;
-    TBrutoDestructor(PPointer(PtrUInt(VMT) + 6 * SizeOf(Pointer))^)(Instance, 1);
+    TBrutoDestructor(PPointer(PtrUInt(VMT) + 7 * SizeOf(Pointer))^)(Instance, 1);
   end;
 end;
 

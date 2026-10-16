@@ -31,9 +31,9 @@ use std::collections::HashMap;
 pub(super) const VMT_FIELD: &str = "__vmt";
 /// Words before the first slot in a class's VMT: size, -size, parent
 /// link, class name (a short string), the routine that releases the
-/// strings an instance holds (or nil), and the table of the interfaces
-/// the class implements (or nil).
-pub(super) const CLASS_VMT_HEADER_WORDS: u64 = 6;
+/// strings an instance holds (or nil), the table of the interfaces the
+/// class implements (or nil), and its type information (`ClassInfo`).
+pub(super) const CLASS_VMT_HEADER_WORDS: u64 = 7;
 
 /// What code generation knows about an object type.
 #[derive(Debug, Clone)]
@@ -74,6 +74,11 @@ pub(super) struct ObjectInfo {
     /// (`implements`), own and inherited: interface -> (the property,
     /// the class declaring it).
     pub delegates: HashMap<String, (PropertyDecl, String)>,
+    /// Compiled with `{$M+}`, or descending from a class that was: its
+    /// default section is published.
+    pub type_info: bool,
+    /// A class's own published fields and properties, in order.
+    pub own_published: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +316,17 @@ impl<'ctx> CodeGen<'ctx> {
                 .unwrap_or_else(|| intf.clone());
             resolutions.insert((intf, method.clone()), target.clone());
         }
+        let type_info = decl.type_info || parent.as_ref().is_some_and(|p| p.type_info);
+        let own_published: Vec<String> = decl
+            .fields
+            .iter()
+            .map(|(n, _)| n)
+            .chain(decl.properties.iter().map(|p| &p.name))
+            .filter(|n| {
+                decl.published.contains(n) || (type_info && decl.default_section.contains(n))
+            })
+            .cloned()
+            .collect();
         let mut delegates = parent
             .as_ref()
             .map(|p| p.delegates.clone())
@@ -353,6 +369,8 @@ impl<'ctx> CodeGen<'ctx> {
             is_corba: false,
             resolutions,
             delegates,
+            type_info,
+            own_published,
         };
 
         // Declare this type's own methods so calls and VMTs can refer to
@@ -428,11 +446,32 @@ impl<'ctx> CodeGen<'ctx> {
             .cloned()
             .collect();
         names.sort();
-        // Cells holding each VMT's address, for parent links.
+        // Cells holding each VMT's address, for parent links, and the VMTs
+        // themselves (filled below), which type information refers to.
         for name in &names {
             let cell = self.module.add_global(ptr, None, &format!("vmtref.{name}"));
             cell.set_linkage(Linkage::Internal);
             cell.set_constant(true);
+            let info = &self.objects[name];
+            let slots_ty = ptr.array_type(info.slots.len() as u32);
+            let header: Vec<inkwell::types::BasicTypeEnum> = if info.is_class {
+                vec![
+                    i64_ty.into(),
+                    i64_ty.into(),
+                    ptr.into(),
+                    ptr.into(),
+                    ptr.into(),
+                    ptr.into(),
+                    ptr.into(),
+                    slots_ty.into(),
+                ]
+            } else {
+                vec![i64_ty.into(), i64_ty.into(), ptr.into(), slots_ty.into()]
+            };
+            let vmt_ty = self.context.struct_type(&header, false);
+            let vmt = self.module.add_global(vmt_ty, None, &format!("vmt.{name}"));
+            vmt.set_linkage(Linkage::Internal);
+            vmt.set_constant(true);
         }
         for name in &names {
             let info = self.objects[name].clone();
@@ -462,10 +501,15 @@ impl<'ctx> CodeGen<'ctx> {
             let (vmt_ty, init) = if info.is_class {
                 let [class_name, cleanup] = self.class_header_words(name);
                 let interfaces = self.interface_table(name)?;
+                let class_ty = PascalType::Named(name.clone());
+                let class_info = self
+                    .type_info(&class_ty, Some(name))
+                    .unwrap_or_else(|| ptr.const_null());
                 let vmt_ty = self.context.struct_type(
                     &[
                         i64_ty.into(),
                         i64_ty.into(),
+                        ptr.into(),
                         ptr.into(),
                         ptr.into(),
                         ptr.into(),
@@ -481,6 +525,7 @@ impl<'ctx> CodeGen<'ctx> {
                     class_name.into(),
                     cleanup.into(),
                     interfaces.into(),
+                    class_info.into(),
                     ptr.const_array(&slot_values).into(),
                 ]);
                 (vmt_ty, init)
@@ -497,9 +542,8 @@ impl<'ctx> CodeGen<'ctx> {
                 ]);
                 (vmt_ty, init)
             };
-            let vmt = self.module.add_global(vmt_ty, None, &format!("vmt.{name}"));
-            vmt.set_linkage(Linkage::Internal);
-            vmt.set_constant(true);
+            let vmt = self.module.get_global(&format!("vmt.{name}")).unwrap();
+            let _ = vmt_ty;
             vmt.set_initializer(&init);
             let cell = self.module.get_global(&format!("vmtref.{name}")).unwrap();
             cell.set_initializer(&vmt.as_pointer_value());

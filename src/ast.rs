@@ -526,6 +526,13 @@ pub struct ObjectType {
     /// Method resolution clauses: `function IFoo.Bar = MyBar;` as
     /// (interface, its method, the class's method).
     pub resolutions: Vec<(String, String, String)>,
+    /// Fields and properties declared in a `published` section.
+    pub published: Vec<String>,
+    /// Fields and properties declared before any visibility section:
+    /// published in a class compiled with `{$M+}` or descending from one.
+    pub default_section: Vec<String>,
+    /// Declared with `{$M+}` (`{$TYPEINFO ON}`).
+    pub type_info: bool,
 }
 
 /// A class property: `property Name[Index: T]: T read Getter write
@@ -546,6 +553,10 @@ pub struct PropertyDecl {
     /// `implements IFoo, IBar`: the class's IFoo is what the property
     /// gives.
     pub implements: Vec<String>,
+    /// `default V`: the value streaming leaves out.
+    pub default_value: Option<DefaultValue>,
+    /// `stored False` / `stored IsStored`.
+    pub stored: Option<DefaultValue>,
     pub span: Span,
 }
 

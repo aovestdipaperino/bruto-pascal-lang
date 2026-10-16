@@ -56,6 +56,7 @@ const TYPE_ARG_BUILTINS: &[&str] = &[
     "low",
     "default",
     "supports",
+    "typeinfo",
 ];
 
 impl<'ctx> CodeGen<'ctx> {
