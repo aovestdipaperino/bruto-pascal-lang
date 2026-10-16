@@ -505,33 +505,32 @@ impl<'ctx> CodeGen<'ctx> {
         code: IntValue<'ctx>,
         span: Span,
     ) -> Result<(), CodeGenError> {
+        // FPC's report, at the routine calling RunError; no exception.
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
-        let ptr = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
-        let void = self.context.void_type();
-        let dprintf = self.libc(
-            "dprintf",
-            i32_ty.fn_type(&[i32_ty.into(), ptr.into()], true),
-        );
-        let format = self.string_literal("Runtime error %lld\n");
-        self.builder
-            .build_call(
-                dprintf,
-                &[
-                    i32_ty.const_int(2, false).into(),
-                    format.into(),
-                    code.into(),
-                ],
-                "",
-            )
-            .map_err(err)?;
         let code32 = self
             .builder
             .build_int_truncate(code, i32_ty, "code")
             .map_err(err)?;
-        let exit = self.libc("exit", void.fn_type(&[i32_ty.into()], false));
+        let here = self
+            .current_fn
+            .unwrap()
+            .as_global_value()
+            .as_pointer_value();
+        let report = self
+            .module
+            .get_function("bruto_runtime_error")
+            .ok_or_else(|| CodeGenError::new("the runtime error routine is missing", Some(span)))?;
         self.builder
-            .build_call(exit, &[code32.into()], "")
+            .build_call(
+                report,
+                &[
+                    code32.into(),
+                    here.into(),
+                    self.context.bool_type().const_zero().into(),
+                ],
+                "",
+            )
             .map_err(err)?;
         Ok(())
     }

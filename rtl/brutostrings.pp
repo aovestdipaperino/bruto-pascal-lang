@@ -48,7 +48,13 @@ const
   BrutoDynArray = 8;
   BrutoAStrFlags = 14;
 
+type
+  { Called with a runtime error's code before the program stops; SysUtils
+    raises the matching exception from it. }
+  TBrutoRunErrorHook = procedure(Code: LongInt);
+
 var
+  BrutoRunErrorHook: TBrutoRunErrorHook;
   { Strings made by the statement being run and not yet stored anywhere
     (reference count 0): freed when it ends, unless stored by then. }
   BrutoPool: PBrutoPointers;
@@ -57,6 +63,14 @@ var
 
 function bruto_astr_len(S: Pointer): Int64;
 function bruto_astr_alloc(Len: Int64): Pointer;
+
+{ Runtime error Code at Address: with UseHook, SysUtils may raise the
+  matching exception; otherwise FPC's report goes to stderr and the
+  program stops with exit code Code. }
+procedure bruto_runtime_error(Code: LongInt; Address: Pointer; UseHook: Boolean);
+{ Report memory access faults (nil pointers...) as runtime error 216, as
+  FPC does. }
+procedure bruto_install_fault_handlers;
 
 { Dynamic arrays: a pointer to the first of Count elements of ElemSize
   bytes (zeroed), with the string header before it; nil when empty.
@@ -445,6 +459,67 @@ begin
     Move((P + Index * ElemSize)^, (P + (Index + 1) * ElemSize)^, (Len - Index) * ElemSize);
   FillChar((P + Index * ElemSize)^, ElemSize, 0);
   bruto_dynarr_insert_gap := Index;
+end;
+
+function bruto_rt_snprintf(Buf: PChar; Size: PtrUInt; Fmt: PChar): LongInt; cdecl; varargs;
+  external 'c' name 'snprintf';
+function bruto_rt_fflush(Stream: Pointer): LongInt; cdecl; external 'c' name 'fflush';
+procedure bruto_rt_exit(Code: LongInt); cdecl; external 'c' name 'exit';
+function bruto_rt_signal(Sig: LongInt; Handler: Pointer): Pointer; cdecl; external 'c' name 'signal';
+{$ifdef WINDOWS}
+function bruto_rt_write(Fd: LongInt; Buf: PChar; Count: LongWord): LongInt; cdecl; external 'c' name '_write';
+{$else}
+function bruto_rt_write(Fd: LongInt; Buf: PChar; Count: PtrUInt): PtrInt; cdecl; external 'c' name 'write';
+function bruto_rt_sigemptyset(Set_: Pointer): LongInt; cdecl; external 'c' name 'sigemptyset';
+function bruto_rt_sigaddset(Set_: Pointer; Sig: LongInt): LongInt; cdecl; external 'c' name 'sigaddset';
+function bruto_rt_sigprocmask(How: LongInt; Set_, Old: Pointer): LongInt; cdecl; external 'c' name 'sigprocmask';
+{$endif}
+
+procedure bruto_runtime_error(Code: LongInt; Address: Pointer; UseHook: Boolean);
+var
+  Buf: array[0..127] of Char;
+  N: LongInt;
+begin
+  if UseHook and (BrutoRunErrorHook <> nil) then
+    BrutoRunErrorHook(Code);
+  bruto_rt_fflush(nil);
+  N := bruto_rt_snprintf(@Buf, SizeOf(Buf), 'Runtime error %d at $%016llX'#10'  $%016llX'#10#10,
+    Code, PtrUInt(Address), PtrUInt(Address));
+  bruto_rt_write(2, @Buf, N);
+  bruto_rt_exit(Code);
+end;
+
+{ SIGSEGV / SIGBUS. The signal is unblocked first: a handler raising an
+  exception doesn't return through the kernel. }
+procedure bruto_fault_handler(Sig: LongInt);
+{$ifndef WINDOWS}
+var
+  Mask: array[0..127] of Byte;
+{$endif}
+begin
+{$ifndef WINDOWS}
+  bruto_rt_sigemptyset(@Mask);
+  bruto_rt_sigaddset(@Mask, Sig);
+  { SIG_UNBLOCK: 2 on macOS, 1 on Linux. }
+{$ifdef DARWIN}
+  bruto_rt_sigprocmask(2, @Mask, nil);
+{$else}
+  bruto_rt_sigprocmask(1, @Mask, nil);
+{$endif}
+{$endif}
+  bruto_runtime_error(216, nil, True);
+end;
+
+procedure bruto_install_fault_handlers;
+begin
+  bruto_rt_signal(11, @bruto_fault_handler);
+{$ifdef DARWIN}
+  bruto_rt_signal(10, @bruto_fault_handler);
+{$else}
+{$ifndef WINDOWS}
+  bruto_rt_signal(7, @bruto_fault_handler);
+{$endif}
+{$endif}
 end;
 
 function bruto_astr_from_pchar(P: Pointer): Pointer;

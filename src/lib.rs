@@ -4805,6 +4805,66 @@ end.
     }
 
     #[test]
+    fn division_by_zero_is_runtime_error_200() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses SysUtils;
+var A, B: Integer;
+begin
+  A := 10; B := 0;
+  try writeln(A div B); except on E: Exception do writeln(E.ClassName, ': ', E.Message); end;
+  try writeln(A mod B); except on E: EDivByZero do writeln('mod: ', E.Message); end;
+  writeln('done');
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "EDivByZero: Division by zero\nmod: Division by zero\ndone\n"
+        );
+        let result = MiniPascal
+            .build("program T;\nvar A, B: Integer;\nbegin\n  A := 1; B := 0;\n  writeln(A div B);\nend.\n")
+            .expect("build failed");
+        let run = std::process::Command::new(&result.exe_path)
+            .output()
+            .expect("run failed");
+        let _ = std::fs::remove_file(&result.exe_path);
+        let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
+        let _ = std::fs::remove_file(&result.source_path);
+        let _ = std::fs::remove_file(&result.console_capture_path);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(200), "{stderr}");
+        assert!(stderr.starts_with("Runtime error 200 at $"), "{stderr}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nil_dereference_is_an_access_violation() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses SysUtils;
+var P: PInteger; I: Integer;
+begin
+  P := nil;
+  for I := 1 to 3 do
+    try
+      if I = 2 then P^ := 5 else writeln(P^);
+    except
+      on E: EAccessViolation do writeln(I, ' ', E.Message);
+    end;
+  writeln('done');
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "1 Access violation\n2 Access violation\n3 Access violation\ndone\n"
+        );
+    }
+
+    #[test]
     fn class_instances_and_their_strings_are_freed() {
         let (ok, out) = build_and_run_source(
             "program T;

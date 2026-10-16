@@ -697,6 +697,14 @@ impl<'ctx> CodeGen<'ctx> {
         if self.arc {
             self.call_ustr_runtime("bruto_arc_enable", &[], program.span)?;
         }
+        // Memory access faults are runtime error 216, as in FPC.
+        if self
+            .module
+            .get_function("bruto_install_fault_handlers")
+            .is_some()
+        {
+            self.call_ustr_runtime("bruto_install_fault_handlers", &[], program.span)?;
+        }
 
         // Store each constant's value into its global before the body runs.
         for c in &program.consts {
@@ -8276,14 +8284,18 @@ impl<'ctx> CodeGen<'ctx> {
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
                 }
-                BinOp::Div => self
-                    .builder
-                    .build_int_signed_div(l, r, "div")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
-                BinOp::Mod => self
-                    .builder
-                    .build_int_signed_rem(l, r, "mod_")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?,
+                BinOp::Div => {
+                    self.check_divisor(r, span)?;
+                    self.builder
+                        .build_int_signed_div(l, r, "div")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                }
+                BinOp::Mod => {
+                    self.check_divisor(r, span)?;
+                    self.builder
+                        .build_int_signed_rem(l, r, "mod_")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                }
                 BinOp::Eq => self
                     .builder
                     .build_int_compare(inkwell::IntPredicate::EQ, l, r, "eq")
@@ -8808,6 +8820,8 @@ impl<'ctx> CodeGen<'ctx> {
             .build_conditional_branch(flag, fail_bb, ok_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         self.builder.position_at_end(fail_bb);
+        // EIntOverflow with SysUtils.
+        self.call_run_error_hook(self.context.i32_type().const_int(215, false), span)?;
         let f = self.module.get_function("bruto_overflow_fail").unwrap();
         self.builder
             .build_call(f, &[i64_ty.const_int(span.line as u64, false).into()], "")
@@ -8820,6 +8834,40 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// If `{$R+}` is enabled, emit a check that `idx` is in `[lo, hi]` and abort otherwise.
+    /// Runtime error 200 (EDivByZero with SysUtils) for an integer division
+    /// by zero, as FPC reports it on every target.
+    fn check_divisor(
+        &mut self,
+        divisor: inkwell::values::IntValue<'ctx>,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        if divisor.is_const() && !divisor.is_null() {
+            return Ok(());
+        }
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                divisor,
+                divisor.get_type().const_zero(),
+                "div_zero",
+            )
+            .map_err(err)?;
+        let func = self.current_fn.unwrap();
+        let fail_bb = self.context.append_basic_block(func, "div_by_zero");
+        let ok_bb = self.context.append_basic_block(func, "div_ok");
+        self.builder
+            .build_conditional_branch(zero, fail_bb, ok_bb)
+            .map_err(err)?;
+        self.builder.position_at_end(fail_bb);
+        let fail = self.runtime_error_fn(200, "division by zero");
+        self.builder.build_call(fail, &[], "").map_err(err)?;
+        self.builder.build_unreachable().map_err(err)?;
+        self.builder.position_at_end(ok_bb);
+        Ok(())
+    }
+
     fn emit_range_check(
         &mut self,
         idx: inkwell::values::IntValue<'ctx>,
@@ -8860,6 +8908,8 @@ impl<'ctx> CodeGen<'ctx> {
             .build_conditional_branch(bad, fail_bb, ok_bb)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
         self.builder.position_at_end(fail_bb);
+        // ERangeError with SysUtils.
+        self.call_run_error_hook(self.context.i32_type().const_int(201, false), span)?;
         let f = self.module.get_function("bruto_range_check_fail").unwrap();
         self.builder
             .build_call(

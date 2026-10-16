@@ -66,10 +66,6 @@ type
     function ToString: AnsiString; virtual;
   end;
 
-  { Called with a runtime error's code before the program stops; SysUtils
-    raises the matching exception from it. }
-  TBrutoRunErrorHook = procedure(Code: LongInt);
-
 const
   vtInteger = 0;
   vtBoolean = 1;
@@ -99,7 +95,6 @@ var
   { The newest record of a running routine's string locals, which an
     exception leaving it releases. }
   BrutoCleanupTop: Pointer;
-  BrutoRunErrorHook: TBrutoRunErrorHook;
 
 { Raise Obj: go back to the innermost `try`, or report it and stop. }
 procedure BrutoRaise(Obj: TObject; Address: Pointer);

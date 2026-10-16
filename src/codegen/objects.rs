@@ -473,37 +473,29 @@ impl<'ctx> CodeGen<'ctx> {
             let i64_ty = self.context.i64_type();
             let ptr = self.context.ptr_type(AddressSpace::default());
             let void_ty = self.context.void_type();
-            self.call_run_error_hook(i32_ty.const_int(code as u64, false), Span::default())?;
-            let message = format!("Runtime error {code}: {what}\n");
-            let text = self
+            let _ = (i64_ty, ptr, void_ty, what);
+            // FPC's report (or SysUtils' exception), at the caller.
+            let ret_addr = inkwell::intrinsics::Intrinsic::find("llvm.returnaddress")
+                .and_then(|i| i.get_declaration(&self.module, &[]))
+                .unwrap();
+            let address = self
                 .builder
-                .build_global_string_ptr(&message, "runtime_error_msg")
+                .build_call(ret_addr, &[i32_ty.const_zero().into()], "caller")
                 .unwrap()
-                .as_pointer_value();
-            let write = self.module.get_function("write").unwrap_or_else(|| {
-                self.module.add_function(
-                    "write",
-                    i64_ty.fn_type(&[i32_ty.into(), ptr.into(), i64_ty.into()], false),
-                    None,
-                )
-            });
+                .try_as_basic_value()
+                .basic()
+                .unwrap();
+            let report = self.module.get_function("bruto_runtime_error").unwrap();
             self.builder
                 .build_call(
-                    write,
+                    report,
                     &[
-                        i32_ty.const_int(2, false).into(),
-                        text.into(),
-                        i64_ty.const_int(message.len() as u64, false).into(),
+                        i32_ty.const_int(code as u64, false).into(),
+                        address.into(),
+                        self.context.bool_type().const_int(1, false).into(),
                     ],
                     "",
                 )
-                .unwrap();
-            let exit = self.module.get_function("exit").unwrap_or_else(|| {
-                self.module
-                    .add_function("exit", void_ty.fn_type(&[i32_ty.into()], false), None)
-            });
-            self.builder
-                .build_call(exit, &[i32_ty.const_int(code as u64, false).into()], "")
                 .unwrap();
             self.builder.build_unreachable().unwrap();
         }
