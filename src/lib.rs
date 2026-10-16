@@ -41,6 +41,30 @@ impl Language for MiniPascal {
         Box::new(PascalHighlighter::new())
     }
 
+    fn check_at(&self, source: &str, source_path: Option<&Path>) -> Option<Result<String, String>> {
+        let mut search_dirs = search_dirs_for(source_path);
+        let lines = source.lines().count();
+        let Some(unit) = self.library_name(source) else {
+            return Some(
+                check_program(source.to_string(), search_dirs)
+                    .map(|()| format!("{lines} lines, no errors")),
+            );
+        };
+        // A unit is checked through a program that uses it, the unit's
+        // text (unsaved changes too) found first.
+        let dir = std::env::temp_dir().join(format!("bruto_check_{}", std::process::id()));
+        let written = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(dir.join(format!("{unit}.pas")), source));
+        if let Err(e) = written {
+            return Some(Err(format!("Failed to write the unit: {e}")));
+        }
+        search_dirs.insert(0, dir.clone());
+        let program = format!("program BrutoCheck;\nuses {unit};\nbegin\nend.\n");
+        let result = check_program(program, search_dirs);
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(result.map(|()| format!("unit, {lines} lines, no errors")))
+    }
+
     fn library_name(&self, source: &str) -> Option<String> {
         let words = header_words(source);
         match words.as_slice() {
@@ -110,6 +134,37 @@ impl Language for MiniPascal {
             true,
         ))
     }
+}
+
+/// Parse, resolve and generate code for the program `source` (finding
+/// units in `search_dirs`) without emitting or linking anything: the
+/// errors a build would report.
+fn check_program(source: String, search_dirs: Vec<PathBuf>) -> Result<(), String> {
+    // As a build does: parsing and code generation recurse deeply.
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(move || -> Result<(), String> {
+            let mut parser = Parser::with_options(
+                &source,
+                &parser::ParseOptions {
+                    file: None,
+                    include_dirs: search_dirs.clone(),
+                },
+            );
+            let mut program = parser
+                .parse_program()
+                .map_err(|e| format!("Parse error: {e}"))?;
+            resolve_uses(&mut program, &search_dirs)?;
+            let context = Context::create();
+            let mut codegen = CodeGen::new(&context, "bruto_check.pas");
+            codegen.set_directives(parser.directives);
+            codegen
+                .compile(&program)
+                .map_err(|e| format!("Codegen error: {e}"))
+        })
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "the compiler crashed".to_string())?
 }
 
 /// The first words of `source`, lower-case, up to its first `begin`,
@@ -9704,6 +9759,32 @@ end.
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&prof_path);
         let _ = std::fs::remove_file(result.profile_map_path.unwrap());
+    }
+
+    #[test]
+    fn compile_checks_programs_and_units_without_linking() {
+        let lang = MiniPascal;
+        let dir = std::env::temp_dir().join(format!("bruto_check_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let unit_path = dir.join("helper.pas");
+        let unit = "unit Helper;\ninterface\nfunction Twice(N: Integer): Integer;\nimplementation\nfunction Twice(N: Integer): Integer;\nbegin\n  Result := N * 2;\nend;\nend.\n";
+        std::fs::write(&unit_path, unit).unwrap();
+        let ok = lang.check_at(unit, Some(&unit_path)).unwrap();
+        assert_eq!(ok, Ok("unit, 9 lines, no errors".to_string()));
+        // The window's text is checked, not the file on disk.
+        let broken = unit.replace("N * 2", "N * Missing");
+        let err = lang
+            .check_at(&broken, Some(&unit_path))
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("missing") && err.contains("line 7"), "{err}");
+        let main_path = dir.join("main.pas");
+        let main = "program Main;\nuses Helper;\nbegin\n  WriteLn(Twice(21))\nend.\n";
+        assert_eq!(
+            lang.check_at(main, Some(&main_path)).unwrap(),
+            Ok("5 lines, no errors".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
