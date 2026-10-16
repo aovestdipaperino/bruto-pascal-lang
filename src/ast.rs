@@ -477,6 +477,9 @@ pub struct ObjectType {
     /// `TFoo = class;`: declared here, defined later in the same section.
     pub is_forward: bool,
     pub properties: Vec<PropertyDecl>,
+    /// `class var` fields: one variable shared by the class and its
+    /// descendants.
+    pub class_vars: Vec<(String, PascalType)>,
 }
 
 /// A class property: `property Name[Index: T]: T read Getter write

@@ -2175,6 +2175,52 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
         }
+        // A class instance being destroyed (not by `inherited Destroy`) gets
+        // BeforeDestruction first, as in FPC.
+        if let Some((owner, _)) = &method
+            && frees_instance
+            && self.objects[owner]
+                .methods
+                .contains_key("beforedestruction")
+        {
+            let err = |e: inkwell::builder::BuilderError| {
+                CodeGenError::new(e.to_string(), Some(proc.span))
+            };
+            let flag = func.get_nth_param(1).unwrap().into_int_value();
+            let self_ptr = self.method_context.unwrap().self_ptr;
+            let call_bb = self.context.append_basic_block(func, "before_destruction");
+            let body_bb = self.context.append_basic_block(func, "destroying");
+            let outermost = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    flag,
+                    self.context.i64_type().const_zero(),
+                    "outermost",
+                )
+                .map_err(err)?;
+            self.builder
+                .build_conditional_branch(outermost, call_bb, body_bb)
+                .map_err(err)?;
+            self.builder.position_at_end(call_bb);
+            let owner = owner.clone();
+            self.call_method(
+                objects::Receiver {
+                    object: &owner,
+                    self_ptr,
+                    dispatch: objects::Dispatch::Virtual,
+                    vmt: None,
+                    class: None,
+                },
+                "beforedestruction",
+                &[],
+                proc.span,
+            )?;
+            self.builder
+                .build_unconditional_branch(body_bb)
+                .map_err(err)?;
+            self.builder.position_at_end(body_bb);
+        }
         // A class's constructor that raises destroys the instance it made.
         let constructor_frame = match &method {
             Some((owner, _)) if is_constructor && self.objects[owner].is_class => {

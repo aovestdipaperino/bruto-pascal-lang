@@ -420,6 +420,13 @@ impl<'ctx> CodeGen<'ctx> {
         let d = |e: &Expr| self.dx(e);
         Ok(Some(match stmt {
             Statement::Assignment { target, expr, span } => {
+                if let Some(global) = self.implicit_class_var(target) {
+                    return Ok(Some(Statement::Assignment {
+                        target: global,
+                        expr: d(expr)?,
+                        span: *span,
+                    }));
+                }
                 if self.lookup_var(target).is_none()
                     && let Some((class, prop, recv)) = self.implicit_property(target)
                 {
@@ -440,6 +447,13 @@ impl<'ctx> CodeGen<'ctx> {
                 span,
             } => {
                 let recv = Expr::Var(target.clone(), *span);
+                if let Some(global) = self.class_var_of(&recv, field) {
+                    return Ok(Some(Statement::Assignment {
+                        target: global,
+                        expr: d(expr)?,
+                        span: *span,
+                    }));
+                }
                 if let Some(class) = self.class_instance_of(&self.infer_declared_type(&recv)) {
                     return self
                         .member_write(recv, &class, field, d(expr)?, *span)
@@ -698,7 +712,9 @@ impl<'ctx> CodeGen<'ctx> {
     fn involves_class(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Var(name, _) => {
-                self.lookup_var(name).is_none() && self.implicit_property(name).is_some()
+                self.lookup_var(name).is_none()
+                    && (self.implicit_property(name).is_some()
+                        || self.implicit_class_var(name).is_some())
             }
             Expr::FieldAccess { record, .. } | Expr::Index { array: record, .. } => {
                 self.involves_class(record)
@@ -731,6 +747,23 @@ impl<'ctx> CodeGen<'ctx> {
         Some((class.clone(), prop.clone(), recv))
     }
 
+    /// The global of class variable `name` reachable by its bare name in
+    /// the method being compiled.
+    fn implicit_class_var(&self, name: &str) -> Option<String> {
+        if self.lookup_var(name).is_some() {
+            return None;
+        }
+        let class = self.current_object.as_ref()?;
+        self.objects.get(class)?.class_vars.get(name).cloned()
+    }
+
+    /// The global of class variable `field` of the class `object` names
+    /// (as a type, a class reference or an instance).
+    fn class_var_of(&self, object: &Expr, field: &str) -> Option<String> {
+        let class = self.class_receiver(object)?;
+        self.objects.get(&class)?.class_vars.get(field).cloned()
+    }
+
     fn default_property(&self, class: &str) -> Option<PropertyDecl> {
         let info = self.objects.get(class)?;
         info.properties
@@ -759,6 +792,9 @@ impl<'ctx> CodeGen<'ctx> {
         let b = |e: &Expr| -> Result<Box<Expr>, CodeGenError> { Ok(Box::new(self.dx(e)?)) };
         Ok(match expr {
             Expr::Var(name, span) if self.lookup_var(name).is_none() => {
+                if let Some(global) = self.implicit_class_var(name) {
+                    return Ok(Expr::Var(global, *span));
+                }
                 // A class name as a value: its VMT, a class reference.
                 if self.is_class_name(name) {
                     return Ok(Expr::Call {
@@ -771,6 +807,13 @@ impl<'ctx> CodeGen<'ctx> {
                     return self.property_read(recv, &class, &prop, vec![], *span);
                 }
                 expr.clone()
+            }
+            Expr::FieldAccess {
+                record,
+                field,
+                span,
+            } if self.class_var_of(record, field).is_some() => {
+                Expr::Var(self.class_var_of(record, field).unwrap(), *span)
             }
             Expr::FieldAccess {
                 record,
@@ -1220,11 +1263,25 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<Statement, CodeGenError> {
         match target {
             Expr::Var(name, _) if self.lookup_var(name).is_none() => {
+                if let Some(global) = self.implicit_class_var(name) {
+                    return Ok(Statement::Assignment {
+                        target: global,
+                        expr: value,
+                        span,
+                    });
+                }
                 if let Some((class, prop, recv)) = self.implicit_property(name) {
                     return self.property_write(recv, &class, &prop, vec![], value, span);
                 }
             }
             Expr::FieldAccess { record, field, .. } => {
+                if let Some(global) = self.class_var_of(record, field) {
+                    return Ok(Statement::Assignment {
+                        target: global,
+                        expr: value,
+                        span,
+                    });
+                }
                 let rec = self.dx(record)?;
                 if let Some(class) = self.class_instance_of(&self.infer_declared_type(&rec)) {
                     return self.member_write(rec, &class, field, value, span);

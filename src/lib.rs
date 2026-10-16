@@ -4722,6 +4722,89 @@ end.
     }
 
     #[test]
+    fn class_variables_and_construction_hooks() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+type
+  TCounter = class
+  private
+    class var FCount: Integer;
+    class var FNames: string;
+  public
+    Id: Integer;
+    constructor Create;
+    destructor Destroy; override;
+    procedure AfterConstruction; override;
+    procedure BeforeDestruction; override;
+    class function Count: Integer;
+  end;
+  TSub = class(TCounter)
+    constructor Create;
+  end;
+
+function IntToStr(I: Integer): string;
+begin
+  Str(I, Result);
+end;
+
+constructor TCounter.Create;
+begin
+  Inc(FCount);
+  Id := FCount;
+  FNames := FNames + IntToStr(Id);
+  WriteLn('create ', Id);
+end;
+
+destructor TCounter.Destroy;
+begin
+  WriteLn('destroy ', Id);
+  Dec(FCount);
+  inherited Destroy;
+end;
+
+procedure TCounter.AfterConstruction;
+begin
+  WriteLn('after construction ', Id);
+end;
+
+procedure TCounter.BeforeDestruction;
+begin
+  WriteLn('before destruction ', Id);
+end;
+
+class function TCounter.Count: Integer;
+begin
+  Result := FCount;
+end;
+
+constructor TSub.Create;
+begin
+  inherited Create;
+  WriteLn('sub ', Id);
+end;
+
+var A, B: TCounter;
+begin
+  A := TCounter.Create;
+  B := TSub.Create;
+  WriteLn(TCounter.Count, ' ', A.Count, ' ', TSub.FCount, ' ', TCounter.FNames);
+  TCounter.FCount := TCounter.FCount + 10;
+  WriteLn(TSub.Count);
+  A.Free;
+  B.Free;
+  WriteLn(TCounter.Count);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "create 1\nafter construction 1\ncreate 2\nsub 2\nafter construction 2\n2 2 2 12\n12\nbefore destruction 1\ndestroy 1\nbefore destruction 2\ndestroy 2\n10\n"
+        );
+    }
+
+    #[test]
     fn class_instances_and_their_strings_are_freed() {
         let (ok, out) = build_and_run_source(
             "program T;

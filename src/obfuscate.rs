@@ -165,6 +165,10 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
                     collect_type(&group.ty, n);
                 }
             }
+            for (vname, vty) in &obj.class_vars {
+                n.declare(vname);
+                collect_type(vty, n);
+            }
             for p in &obj.properties {
                 n.declare(&p.name);
                 for group in &p.params {

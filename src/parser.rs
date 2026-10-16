@@ -2234,7 +2234,11 @@ impl Parser {
             is_class,
             is_forward: false,
             properties: Vec::new(),
+            class_vars: Vec::new(),
         };
+        // After `class var`, fields are class variables until the next
+        // section.
+        let mut in_class_vars = false;
         if is_class && *self.peek() == Tok::Semi {
             obj.is_forward = obj.parent.is_none();
             return Ok(PascalType::Object(Box::new(obj)));
@@ -2253,6 +2257,9 @@ impl Parser {
                 );
             if class_method {
                 self.advance();
+            }
+            if !matches!(self.peek(), Tok::Ident(_)) || self.at_routine() {
+                in_class_vars = false;
             }
             match self.peek().clone() {
                 Tok::End => {
@@ -2306,25 +2313,30 @@ impl Parser {
                     ) =>
                 {
                     self.advance();
+                    in_class_vars = false;
                 }
                 // `var` before a group of fields.
                 Tok::Var if is_class => {
                     self.advance();
+                    in_class_vars = false;
                 }
                 Tok::Ident(word)
                     if is_class
                         && word.eq_ignore_ascii_case("class")
                         && matches!(self.tokens.get(self.pos + 1), Some((Tok::Var, _))) =>
                 {
-                    return Err(ParseError {
-                        message: "class variables ('class var') are not supported yet".into(),
-                        span: self.span(),
-                    });
+                    self.advance();
+                    self.advance();
+                    in_class_vars = true;
                 }
                 Tok::Ident(_) => {
                     let decl = self.parse_var_decl()?;
                     for name in decl.names {
-                        obj.fields.push((name, decl.ty.clone()));
+                        if in_class_vars {
+                            obj.class_vars.push((name, decl.ty.clone()));
+                        } else {
+                            obj.fields.push((name, decl.ty.clone()));
+                        }
                     }
                     if *self.peek() == Tok::Semi {
                         self.advance();

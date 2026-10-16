@@ -54,6 +54,8 @@ pub(super) struct ObjectInfo {
     pub properties: HashMap<String, PropertyDecl>,
     /// The name of a class's default array property.
     pub default_property: Option<String>,
+    /// Class variables, own and inherited: name -> the global holding it.
+    pub class_vars: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +243,16 @@ impl<'ctx> CodeGen<'ctx> {
             properties.insert(prop.name.clone(), prop.clone());
         }
 
+        let mut class_vars = parent
+            .as_ref()
+            .map(|p| p.class_vars.clone())
+            .unwrap_or_default();
+        for (vname, vty) in &decl.class_vars {
+            let global = format!("{name}.{vname}");
+            self.declare_global(&global, vty, span);
+            class_vars.insert(vname.clone(), global);
+        }
+
         let record = PascalType::Record {
             fields,
             variant: None,
@@ -263,6 +275,7 @@ impl<'ctx> CodeGen<'ctx> {
             is_class: decl.is_class,
             properties,
             default_property,
+            class_vars,
         };
 
         // Declare this type's own methods so calls and VMTs can refer to
@@ -754,6 +767,39 @@ impl<'ctx> CodeGen<'ctx> {
             }
         };
         let value = result.try_as_basic_value().basic();
+        // A class instance just made gets AfterConstruction, as in FPC.
+        if m.kind == RoutineKind::Constructor
+            && class.is_some()
+            && info.is_class
+            && info.methods.contains_key("afterconstruction")
+            && let Some(made) = value
+        {
+            let made = made.into_pointer_value();
+            let func = self.current_fn.unwrap();
+            let call_bb = self.context.append_basic_block(func, "after_construction");
+            let done_bb = self.context.append_basic_block(func, "constructed");
+            let null = self.builder.build_is_null(made, "made_nil").map_err(err)?;
+            self.builder
+                .build_conditional_branch(null, done_bb, call_bb)
+                .map_err(err)?;
+            self.builder.position_at_end(call_bb);
+            self.call_method(
+                Receiver {
+                    object,
+                    self_ptr: made,
+                    dispatch: Dispatch::Virtual,
+                    vmt: None,
+                    class: None,
+                },
+                "afterconstruction",
+                &[],
+                span,
+            )?;
+            self.builder
+                .build_unconditional_branch(done_bb)
+                .map_err(err)?;
+            self.builder.position_at_end(done_bb);
+        }
         match (value, m.kind, &m.return_type) {
             (Some(v), RoutineKind::Function, Some(rt)) => {
                 let rt = rt.clone();

@@ -168,6 +168,10 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
                     rewrite_type(rt, n);
                 }
             }
+            for (vname, vty) in &mut obj.class_vars {
+                *vname = n.rename_member(vname);
+                rewrite_type(vty, n);
+            }
             for p in &mut obj.properties {
                 p.name = n.rename_member(&p.name);
                 for group in &mut p.params {

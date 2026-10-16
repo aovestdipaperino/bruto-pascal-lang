@@ -803,6 +803,9 @@ impl ConstEnv {
                         self.resolve_type(rt, m.span)?;
                     }
                 }
+                for (_, t) in &mut obj.class_vars {
+                    self.resolve_type(t, span)?;
+                }
                 for p in &mut obj.properties {
                     for group in &mut p.params {
                         self.resolve_type(&mut group.ty, p.span)?;
