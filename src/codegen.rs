@@ -252,6 +252,9 @@ pub struct CodeGen<'ctx> {
     prof_next_id: u32,
     // `P <id> <line> <name>` / `L <id> <line> <col>` lines for <exe>.bruto-prof-map
     prof_map_lines: Vec<String>,
+    /// The files named in the map so far (`F <n> <path>`): source map
+    /// id -> map number.
+    prof_map_files: HashMap<u32, u32>,
     // Default output path baked into the program; `BRUTO_PROF_OUT` overrides
     // it at runtime. Set via `set_prof_output` before `compile`.
     prof_output: Option<String>,
@@ -357,6 +360,7 @@ impl<'ctx> CodeGen<'ctx> {
             instrument: false,
             prof_next_id: 1,
             prof_map_lines: Vec::new(),
+            prof_map_files: HashMap::new(),
             prof_output: None,
         }
     }
@@ -429,15 +433,34 @@ impl<'ctx> CodeGen<'ctx> {
         id
     }
 
+    /// The map's position for `span`: its line, and `:<n>` when it is in
+    /// another file than the program's (a unit, an include file), the
+    /// file declared by an `F <n> <path>` line the first time.
+    fn prof_position(&mut self, span: Span) -> String {
+        if span.file == crate::source_map::MAIN_FILE {
+            return span.line.to_string();
+        }
+        let next = self.prof_map_files.len() as u32 + 1;
+        let n = *self.prof_map_files.entry(span.file).or_insert(next);
+        if n == next {
+            let path = crate::source_map::path_of(span.file)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.prof_map_lines.push(format!("F {n} {path}"));
+        }
+        format!("{}:{n}", span.line)
+    }
+
     /// `__bruto_prof_enter(id)` at the current insertion point, registering
-    /// `name` at `line` as a routine.
-    fn emit_prof_enter(&mut self, name: &str, line: u32) -> Result<(), CodeGenError> {
+    /// `name` at `span` as a routine.
+    fn emit_prof_enter(&mut self, name: &str, span: Span) -> Result<(), CodeGenError> {
         if !self.instrument || self.prof_skip {
             return Ok(());
         }
         let id = self.prof_alloc_id();
         let name = self.display(name);
-        self.prof_map_lines.push(format!("P {id} {line} {name}"));
+        let at = self.prof_position(span);
+        self.prof_map_lines.push(format!("P {id} {at} {name}"));
         let f = self.module.get_function("__bruto_prof_enter").unwrap();
         self.builder
             .build_call(
@@ -468,8 +491,9 @@ impl<'ctx> CodeGen<'ctx> {
             return Ok(());
         }
         let id = self.prof_alloc_id();
+        let at = self.prof_position(span);
         self.prof_map_lines
-            .push(format!("L {id} {} {}", span.line, span.column));
+            .push(format!("L {id} {at} {}", span.column));
         let f = self.module.get_function("__bruto_prof_line").unwrap();
         self.builder
             .build_call(
@@ -742,7 +766,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Install signal handler to catch stack overflow / segfaults.
         self.set_debug_loc(program.span);
-        self.emit_prof_enter("program", program.body.span.line)?;
+        self.emit_prof_enter("program", program.body.span)?;
         if self.instrument
             && let Some(path) = self.prof_output.clone()
         {
@@ -2014,7 +2038,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.scope_file = proc.span.file;
         self.set_debug_loc(proc.span);
         let proc_name = proc.name.clone();
-        self.emit_prof_enter(&proc_name, proc.span.line)?;
+        self.emit_prof_enter(&proc_name, proc.span)?;
 
         // `const` interface parameters, which aren't counted.
         let uncounted: Vec<&String> = proc

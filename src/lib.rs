@@ -41,6 +41,27 @@ impl Language for MiniPascal {
         Box::new(PascalHighlighter::new())
     }
 
+    fn library_name(&self, source: &str) -> Option<String> {
+        let words = header_words(source);
+        match words.as_slice() {
+            [unit, name, ..] if unit == "unit" => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    fn used_libraries(&self, source: &str) -> Vec<String> {
+        let words = header_words(source);
+        let Some(at) = words.iter().position(|w| w == "uses") else {
+            return Vec::new();
+        };
+        words[at + 1..]
+            .iter()
+            .take_while(|w| *w != ";")
+            .filter(|w| *w != "," && *w != "in" && !w.starts_with('\''))
+            .cloned()
+            .collect()
+    }
+
     fn valid_breakpoint_lines(&self, source: &str) -> HashSet<usize> {
         let mut parser = Parser::new(source);
         let Ok(program) = parser.parse_program() else {
@@ -89,6 +110,77 @@ impl Language for MiniPascal {
             true,
         ))
     }
+}
+
+/// The first words of `source`, lower-case, up to its first `begin`,
+/// `type`, `var`, `const` or `implementation` (enough for the header and
+/// a `uses` clause): identifiers (dotted names whole), `;`, `,` and
+/// string literals (kept quoted), comments (braces nested, as in FPC's
+/// modes) and directives skipped.
+fn header_words(source: &str) -> Vec<String> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '{' {
+            // FPC's modes nest braces: `{ see ({$mode objfpc}) }`.
+            let mut depth = 0;
+            while i < chars.len() {
+                match chars[i] {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        } else if c == '(' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == ')') {
+                i += 1;
+            }
+            i += 2;
+        } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '\'' {
+            let start = i;
+            i += 1;
+            while i < chars.len() && chars[i] != '\'' {
+                i += 1;
+            }
+            i += 1;
+            words.push(chars[start..i.min(chars.len())].iter().collect());
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+            {
+                i += 1;
+            }
+            let word: String = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if matches!(
+                word.as_str(),
+                "begin" | "type" | "var" | "const" | "implementation" | "procedure" | "function"
+            ) {
+                break;
+            }
+            words.push(word);
+        } else {
+            if c == ';' || c == ',' {
+                words.push(c.to_string());
+            }
+            i += 1;
+        }
+    }
+    words
 }
 
 /// Directories searched for `uses` units: the source file's directory
@@ -9612,6 +9704,65 @@ end.
         let _ = std::fs::remove_dir_all(format!("{}.dSYM", result.exe_path));
         let _ = std::fs::remove_file(&prof_path);
         let _ = std::fs::remove_file(result.profile_map_path.unwrap());
+    }
+
+    #[test]
+    fn units_and_their_users_are_recognized() {
+        let lang = MiniPascal;
+        let unit = "{ A unit ({$mode objfpc}). }\n(* old style *)\nunit WriterCore;\n{$mode objfpc}\ninterface\nuses SysUtils;\nimplementation\nend.\n";
+        assert_eq!(lang.library_name(unit).as_deref(), Some("writercore"));
+        let program = "// a program\nprogram Check;\n{$mode objfpc}{$H+}\nuses\n  {$ifdef UNIX}cwstring,{$endif}\n  SysUtils, WriterCore in 'writercore.pas', Generics.Collections;\nvar I: Integer;\nbegin\nend.\n";
+        assert_eq!(lang.library_name(program), None);
+        assert_eq!(
+            lang.used_libraries(program),
+            ["cwstring", "sysutils", "writercore", "generics.collections"]
+        );
+        assert_eq!(lang.library_name("begin\n  WriteLn('unit')\nend.\n"), None);
+        assert!(lang.used_libraries("program P;\nbegin\nend.\n").is_empty());
+    }
+
+    #[test]
+    fn profile_names_unit_files() {
+        use bruto_lang::profile::ProfileKind;
+        let dir = std::env::temp_dir().join(format!("bruto_prof_units_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let unit = dir.join("helper.pas");
+        std::fs::write(
+            &unit,
+            "unit Helper;\ninterface\nfunction Twice(N: Integer): Integer;\nimplementation\nfunction Twice(N: Integer): Integer;\nvar K: Integer;\nbegin\n  Result := 0;\n  for K := 1 to 2 do\n    Result := Result + N;\nend;\nend.\n",
+        )
+        .unwrap();
+        let src = "program Main;\nuses Helper;\nvar I, S: Integer;\nbegin\n  S := 0;\n  for I := 1 to 100 do\n    S := S + Twice(I);\n  WriteLn(S)\nend.\n";
+        let main = dir.join("main.pas");
+        std::fs::write(&main, src).unwrap();
+        let lang = MiniPascal;
+        let mut job = lang.profile_job_at(src, Some(&main));
+        let result = job.poll_to_done().expect("profile build");
+        let status = std::process::Command::new(&result.exe_path)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run");
+        assert!(status.success());
+        let profile = lang.load_profile(&result).expect("load profile");
+        let unit_path = unit.canonicalize().unwrap().to_string_lossy().into_owned();
+        let twice = profile
+            .nodes
+            .iter()
+            .find(|n| n.kind == ProfileKind::Routine && n.name == "Twice")
+            .expect("Twice node");
+        assert_eq!(
+            (twice.line, twice.file.as_deref()),
+            (5, Some(unit_path.as_str()))
+        );
+        // The unit's lines are its own; the program's heat column only
+        // gets the program's lines (it has 9).
+        assert!(profile.nodes.iter().any(|n| n.kind == ProfileKind::Line
+            && n.line == 10
+            && n.file.as_deref() == Some(unit_path.as_str())));
+        let totals = profile.line_totals();
+        assert!(totals.keys().all(|l| *l <= 9), "{totals:?}");
+        assert_eq!(totals[&7].1, 100);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
