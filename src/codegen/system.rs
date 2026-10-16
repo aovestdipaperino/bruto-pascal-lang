@@ -540,7 +540,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// the operation made, runtime error 208, 207 or 205 (EZeroDivide,
     /// EInvalidOp, EOverflow with SysUtils), unless masked.
     pub(super) fn check_float(
-        &mut self,
+        &self,
         a: inkwell::values::FloatValue<'ctx>,
         b: Option<inkwell::values::FloatValue<'ctx>>,
         result: inkwell::values::FloatValue<'ctx>,
@@ -550,9 +550,9 @@ impl<'ctx> CodeGen<'ctx> {
         if self.in_runtime || self.current_fn.is_none() {
             return Ok(());
         }
-        let Some(classify) = self.module.get_function("bruto_float_error") else {
+        if self.module.get_function("bruto_float_error").is_none() {
             return Ok(());
-        };
+        }
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let f64_ty = self.context.f64_type();
         let wide = |cg: &Self, v: inkwell::values::FloatValue<'ctx>| {
@@ -587,6 +587,58 @@ impl<'ctx> CodeGen<'ctx> {
                 "fbad",
             )
             .map_err(err)?;
+        self.float_error_when(bad, a, b, result, op, span)
+    }
+
+    /// `Trunc(X)`/`Round(X)` of a real outside Int64's range (or a NaN):
+    /// an invalid operation, as the conversion traps in FPC (unless
+    /// masked, when it saturates).
+    pub(super) fn check_float_to_int(
+        &self,
+        x: inkwell::values::FloatValue<'ctx>,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        if self.in_runtime || self.current_fn.is_none() {
+            return Ok(());
+        }
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let f64_ty = self.context.f64_type();
+        let fabs = self.get_or_declare_f64_intrinsic("llvm.fabs.f64");
+        let magnitude = self
+            .builder
+            .build_call(fabs, &[x.into()], "fmag")
+            .map_err(err)?
+            .try_as_basic_value()
+            .basic()
+            .unwrap()
+            .into_float_value();
+        let bad = self
+            .builder
+            .build_float_compare(
+                inkwell::FloatPredicate::UGE,
+                magnitude,
+                f64_ty.const_float(9.223_372_036_854_775_808e18),
+                "fbig",
+            )
+            .map_err(err)?;
+        self.float_error_when(bad, x, f64_ty.const_zero(), x, 8, span)
+    }
+
+    /// When `bad` holds, the runtime error `bruto_float_error` gives for
+    /// operation `op` on `a` (and `b`) giving `result`, if any.
+    fn float_error_when(
+        &self,
+        bad: inkwell::values::IntValue<'ctx>,
+        a: inkwell::values::FloatValue<'ctx>,
+        b: inkwell::values::FloatValue<'ctx>,
+        result: inkwell::values::FloatValue<'ctx>,
+        op: u64,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        let Some(classify) = self.module.get_function("bruto_float_error") else {
+            return Ok(());
+        };
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let func = self.current_fn.unwrap();
         let check_bb = self.context.append_basic_block(func, "fcheck");
         let fail_bb = self.context.append_basic_block(func, "ferror");

@@ -5919,9 +5919,17 @@ end.
 ",
         );
         assert!(ok, "program failed: {out}");
+        // FPC on 64-bit ARM macOS reports every floating point trap as an
+        // access violation (runtime error 216).
+        let traps = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            "EAccessViolation: Access violation\n".repeat(6)
+        } else {
+            "EZeroDivide: Floating point division by zero\nEInvalidOp: Invalid floating point operation\nEInvalidOp: Invalid floating point operation\nEZeroDivide: Floating point division by zero\nEOverflow: Floating point overflow\nEOverflow: Floating point overflow\n".to_string()
+        };
         assert_eq!(
             out,
-            "EZeroDivide: Floating point division by zero\nEInvalidOp: Invalid floating point operation\nEInvalidOp: Invalid floating point operation\nEZeroDivide: Floating point division by zero\nEOverflow: Floating point overflow\nEOverflow: Floating point overflow\nEDivByZero: Division by zero\nunderflow masked  0.0000000000000000E+000\nmasked                     +Inf TRUE TRUE\ninf arithmetic ok TRUE\n"
+            traps
+                + "EDivByZero: Division by zero\nunderflow masked  0.0000000000000000E+000\nmasked                     +Inf TRUE TRUE\ninf arithmetic ok TRUE\n"
         );
     }
 
@@ -7949,6 +7957,152 @@ end.
         );
         assert!(ok, "program failed: {out}");
         assert_eq!(out, "TRUE FALSE TRUE FALSE\nFALSE FALSE\n");
+    }
+
+    /// Output as FPC on 64-bit ARM macOS gives it, where every floating
+    /// point trap is an access violation (other platforms raise
+    /// EZeroDivide, EInvalidOp and EOverflow).
+    fn fpc_arm64_float_traps(out: &str) -> String {
+        out.lines()
+            .map(|line| {
+                for class in ["EZeroDivide: ", "EInvalidOp: ", "EOverflow: "] {
+                    if let Some(at) = line.find(class) {
+                        return format!("{}EAccessViolation: Access violation\n", &line[..at]);
+                    }
+                }
+                format!("{line}\n")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn float_traps_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program f1;
+{$mode objfpc}
+uses SysUtils, Math;
+var A, B, C: Double; S: Single; I: Integer;
+procedure T(const N: string; Op: Integer);
+begin
+  try
+    case Op of
+      1: C := A / B;
+      2: C := Sqrt(-A);
+      3: C := Ln(-A);
+      4: C := Exp(1000 * A);
+      5: C := A * 1e308 * 1e308;
+      6: C := Ln(B);
+      7: C := 0 / B;
+      8: S := A * 1e300;
+      9: I := Trunc(A * 1e30);
+      10: C := Power(-1, 0.5);
+      11: C := A - Infinity + Infinity;
+      12: C := A * 1e-308 / 1e300;
+    end;
+    WriteLn(N, ' ok ', C);
+  except
+    on E: Exception do WriteLn(N, ' ', E.ClassName, ': ', E.Message);
+  end;
+end;
+begin
+  A := 1; B := 0;
+  T('div0', 1); T('sqrt', 2); T('ln-', 3); T('exp', 4); T('ovf', 5); T('ln0', 6); T('0/0', 7);
+  T('single', 8); T('trunc', 9); T('pow', 10); T('inf-inf', 11); T('underflow', 12);
+  WriteLn(GetExceptionMask = [], ' ', Integer(GetExceptionMask));
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+  T('masked div0', 1); T('masked 0/0', 7);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            fpc_arm64_float_traps(&out),
+            r#"div0 EAccessViolation: Access violation
+sqrt EAccessViolation: Access violation
+ln- EAccessViolation: Access violation
+exp EAccessViolation: Access violation
+ovf EAccessViolation: Access violation
+ln0 EAccessViolation: Access violation
+0/0 EAccessViolation: Access violation
+single EAccessViolation: Access violation
+trunc EAccessViolation: Access violation
+pow EAccessViolation: Access violation
+inf-inf EAccessViolation: Access violation
+underflow ok  0.0000000000000000E+000
+FALSE 50
+masked div0 ok                     +Inf
+masked 0/0 ok                      Nan
+"#
+        );
+    }
+
+    #[test]
+    fn float_traps_in_math_and_conversions_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program f3;
+{$mode objfpc}
+uses SysUtils, Math;
+var A, B, C: Double; S: Single; I: Int64; N: Integer;
+procedure T(const Name: string; Op: Integer);
+begin
+  try
+    case Op of
+      1: C := ArcSin(2 * A);
+      2: C := Tan(A) / B;
+      3: I := Round(A * 1e20);
+      4: C := Sqr(A * 1e200);
+      5: C := A / B + 1;
+      6: begin S := A * 3e38; S := S * 10; end;
+      7: C := Frac(A * Infinity);
+      8: C := Int(NaN);
+      9: N := Trunc(A * 3e9);
+      10: C := Log10(-A);
+      11: C := IntPower(10 * A, 400);
+
+    end;
+    WriteLn(Name, ' ok ', C, ' ', I, ' ', N, ' ', S);
+  except
+    on E: Exception do WriteLn(Name, ' ', E.ClassName, ': ', E.Message);
+  end;
+end;
+var K: Integer;
+begin
+  A := 1; B := 0;
+  for K := 1 to 11 do T(IntToStr(K), K);
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+  WriteLn('masked');
+  for K := 1 to 11 do T(IntToStr(K), K);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            fpc_arm64_float_traps(&out),
+            r#"1 EAccessViolation: Access violation
+2 EAccessViolation: Access violation
+3 EAccessViolation: Access violation
+4 EAccessViolation: Access violation
+5 EAccessViolation: Access violation
+6 EAccessViolation: Access violation
+7 EAccessViolation: Access violation
+8 ok                      Nan 0 0  3.000000005E+38
+9 ok                      Nan 0 -1294967296  3.000000005E+38
+10 EAccessViolation: Access violation
+11 EAccessViolation: Access violation
+masked
+1 ok                      Nan 0 -1294967296  3.000000005E+38
+2 ok                     +Inf 0 -1294967296  3.000000005E+38
+3 ok                     +Inf 9223372036854775807 -1294967296  3.000000005E+38
+4 ok                     +Inf 9223372036854775807 -1294967296  3.000000005E+38
+5 ok                     +Inf 9223372036854775807 -1294967296  3.000000005E+38
+6 ok                     +Inf 9223372036854775807 -1294967296             +Inf
+7 ok                      Nan 9223372036854775807 -1294967296             +Inf
+8 ok                      Nan 9223372036854775807 -1294967296             +Inf
+9 ok                      Nan 9223372036854775807 -1294967296             +Inf
+10 ok                      Nan 9223372036854775807 -1294967296             +Inf
+11 ok                     +Inf 9223372036854775807 -1294967296             +Inf
+"#
+        );
     }
 
     #[test]

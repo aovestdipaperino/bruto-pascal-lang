@@ -2594,10 +2594,20 @@ impl<'ctx> CodeGen<'ctx> {
             }
             let f32_ty = self.context.f32_type();
             return Ok(if to == f32_ty {
-                self.builder
+                let narrow = self
+                    .builder
                     .build_float_trunc(fv, ft, "ftrunc")
-                    .map_err(err)?
-                    .into()
+                    .map_err(err)?;
+                // A finite Double too large for a Single overflows, as
+                // the conversion traps in FPC.
+                if from == self.context.f64_type() {
+                    let back = self
+                        .builder
+                        .build_float_ext(narrow, from, "fback")
+                        .map_err(err)?;
+                    self.check_float(fv, Some(from.const_float(1.0)), back, 3, span)?;
+                }
+                narrow.into()
             } else {
                 self.builder
                     .build_float_ext(fv, ft, "fext")
@@ -7317,6 +7327,7 @@ impl<'ctx> CodeGen<'ctx> {
                             .builder
                             .build_float_mul(fv, fv, "sqr")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                        self.check_float(fv, Some(fv), r, 3, *span)?;
                         return Ok(r.into());
                     }
                     let iv = val.into_int_value();
@@ -7429,20 +7440,20 @@ impl<'ctx> CodeGen<'ctx> {
                     if name == "int" {
                         return Ok(whole.into());
                     }
-                    return Ok(self
+                    // X - Int(X), as FPC computes it: an infinity's is an
+                    // invalid operation.
+                    let frac = self
                         .builder
                         .build_float_sub(fval, whole, "frac")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                        .into());
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                    self.check_float(fval, Some(whole), frac, 2, *span)?;
+                    return Ok(frac.into());
                 }
                 if name == "trunc" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
-                    let r = self
-                        .builder
-                        .build_float_to_signed_int(fval, self.context.i64_type(), "trunc")
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    return Ok(r.into());
+                    self.check_float_to_int(fval, *span)?;
+                    return self.float_to_int_saturating(fval, *span);
                 }
                 if name == "round" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
@@ -7456,15 +7467,8 @@ impl<'ctx> CodeGen<'ctx> {
                         .try_as_basic_value()
                         .basic()
                         .unwrap();
-                    let r = self
-                        .builder
-                        .build_float_to_signed_int(
-                            rounded.into_float_value(),
-                            self.context.i64_type(),
-                            "round",
-                        )
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    return Ok(r.into());
+                    self.check_float_to_int(rounded.into_float_value(), *span)?;
+                    return self.float_to_int_saturating(rounded.into_float_value(), *span);
                 }
                 if name == "odd" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
@@ -9954,6 +9958,71 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// `x` converted to an Int64, saturating (as a masked invalid
+    /// conversion leaves it; a NaN is 0). Clamped by hand: LLVM 18's
+    /// `fptosi.sat` miscompiles reads of some by-value record parameters
+    /// on ARM64 at -O0.
+    fn float_to_int_saturating(
+        &self,
+        x: inkwell::values::FloatValue<'ctx>,
+        span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let i64_ty = self.context.i64_type();
+        let f64_ty = self.context.f64_type();
+        let limit = f64_ty.const_float(9.223_372_036_854_775_808e18);
+        let neg_limit = f64_ty.const_float(-9.223_372_036_854_775_808e18);
+        let in_range = self
+            .builder
+            .build_float_compare(inkwell::FloatPredicate::OLT, x, limit, "lt_max")
+            .map_err(err)?;
+        let above_min = self
+            .builder
+            .build_float_compare(inkwell::FloatPredicate::OGE, x, neg_limit, "ge_min")
+            .map_err(err)?;
+        let ok = self
+            .builder
+            .build_and(in_range, above_min, "in_range")
+            .map_err(err)?;
+        // Converted only when in range (a zero otherwise), then the
+        // saturated value chosen.
+        let safe = self
+            .builder
+            .build_select(ok, x, f64_ty.const_zero(), "safe")
+            .map_err(err)?
+            .into_float_value();
+        let converted = self
+            .builder
+            .build_float_to_signed_int(safe, i64_ty, "to_int")
+            .map_err(err)?;
+        let is_nan = self
+            .builder
+            .build_float_compare(inkwell::FloatPredicate::UNO, x, x, "is_nan")
+            .map_err(err)?;
+        let big = self
+            .builder
+            .build_select(
+                above_min,
+                i64_ty.const_int(i64::MAX as u64, false),
+                i64_ty.const_int(i64::MIN as u64, false),
+                "saturated",
+            )
+            .map_err(err)?;
+        let big = self
+            .builder
+            .build_select(
+                is_nan,
+                i64_ty.const_zero(),
+                big.into_int_value(),
+                "nan_zero",
+            )
+            .map_err(err)?;
+        Ok(self
+            .builder
+            .build_select(ok, converted, big.into_int_value(), "trunc")
+            .map_err(err)?)
+    }
+
     fn compile_type_cast(
         &self,
         name: &str,
@@ -10220,9 +10289,6 @@ impl<'ctx> CodeGen<'ctx> {
                     | BinOp::Gte
                     | BinOp::In
                     | BinOp::Is => return PascalType::Boolean,
-                    _ if self.expr_is_variant(left) || self.expr_is_variant(right) => {
-                        return PascalType::Variant;
-                    }
                     BinOp::As => {
                         return match right.as_ref() {
                             Expr::Var(class, _) => PascalType::Named(class.clone()),
@@ -10234,6 +10300,9 @@ impl<'ctx> CodeGen<'ctx> {
                 // Each side's type once (a long `a + b + c...` stays linear).
                 let ld = self.infer_declared_type(left);
                 let rd = self.infer_declared_type(right);
+                if !matches!(op, BinOp::As) && (self.is_variant(&ld) || self.is_variant(&rd)) {
+                    return PascalType::Variant;
+                }
                 if self.currency_binop_type(*op, &ld, &rd) {
                     return PascalType::Currency;
                 }
@@ -10305,7 +10374,7 @@ impl<'ctx> CodeGen<'ctx> {
                 {
                     return declared;
                 }
-                let operand = self.resolve_type(&self.infer_expr_type(operand));
+                let operand = self.resolve_type(&self.widen_type(declared));
                 match op {
                     UnaryOp::Neg if operand == PascalType::Real => PascalType::Real,
                     UnaryOp::Neg => PascalType::Integer,

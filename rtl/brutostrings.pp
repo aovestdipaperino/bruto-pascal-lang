@@ -137,9 +137,10 @@ procedure bruto_intf_release(Obj, ITable: Pointer);
   reference itself. }
 function bruto_intf_query(Obj, Desc, Out: Pointer): Boolean;
 { The runtime error a floating point operation Op (1 +, 2 -, 3 *, 4 /,
-  5 Sqrt, 6 Ln, 7 Exp) on A (and B) giving R (an infinity or NaN) is, as
-  FPC reports it: 208 division by zero, 207 invalid operation, 205
-  overflow, or 0 (none, or masked). }
+  5 Sqrt, 6 Ln, 7 Exp, 8 a real converted to an integer) on A (and B)
+  giving R (an infinity or NaN) is, as FPC reports it: 208 division by
+  zero, 207 invalid operation, 205 overflow, or 0 (none, or masked); on
+  64-bit ARM macOS, as FPC there, 216 for all of them. }
 function bruto_float_error(A, B, R: Double; Op: LongInt): LongInt;
 { X as FPC's Str and Write give it: Width (or -1) and FracDigits (or -1,
   for the exponential form), with a Single's 10 digits and 2-digit
@@ -282,7 +283,10 @@ var
   Code, Bit: LongInt;
 begin
   Code := 0;
-  if R <> R then
+  { Op 8: a real converted to an integer, out of range or NaN. }
+  if Op = 8 then
+    Code := 207
+  else if R <> R then
   begin
     { NaN from numbers: an invalid operation. }
     if (A = A) and ((Op >= 5) or (B = B)) then
@@ -303,6 +307,12 @@ begin
   end;
   if ((BrutoFPUMaskFlip xor 50) and Bit) <> 0 then
     Code := 0;
+  {$IFDEF DARWIN}{$IFDEF CPUAARCH64}
+  { FPC on 64-bit ARM macOS reports every floating point trap as runtime
+    error 216 (EAccessViolation). }
+  if Code <> 0 then
+    Code := 216;
+  {$ENDIF}{$ENDIF}
   bruto_float_error := Code;
 end;
 
