@@ -5177,6 +5177,93 @@ end.
     }
 
     #[test]
+    fn generic_routines() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+uses Generics.Collections;
+
+generic function Larger<T>(const A, B: T): T;
+begin
+  if A > B then Result := A else Result := B;
+end;
+
+generic procedure Swap<T>(var A, B: T);
+var Temp: T;
+begin
+  Temp := A; A := B; B := Temp;
+end;
+
+generic function Sum<T>(const Items: array of T): T;
+var Item: T;
+begin
+  Result := Default(T);
+  for Item in Items do Result := Result + Item;
+end;
+
+generic function ToList<T>(const Items: array of T): specialize TList<T>;
+var Item: T;
+begin
+  Result := specialize TList<T>.Create;
+  for Item in Items do Result.Add(Item);
+end;
+
+var
+  X, Y: Integer;
+  S1, S2: string;
+  L: specialize TList<string>;
+begin
+  WriteLn(specialize Larger<Integer>(3, 9), ' ', specialize Larger<string>('pear', 'apple'),
+    ' ', specialize Larger<Double>(1.5, -2.0):0:1);
+  X := 1; Y := 2;
+  specialize Swap<Integer>(X, Y);
+  S1 := 'a'; S2 := 'b';
+  specialize Swap<string>(S1, S2);
+  WriteLn(X, Y, S1, S2);
+  WriteLn(specialize Sum<Integer>([1, 2, 3, 4]), ' ', specialize Sum<string>(['x', 'y', 'z']));
+  L := specialize ToList<string>(['one', 'two']);
+  WriteLn(L.Count, ' ', L[1]);
+  L.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "9 pear 1.5\n21ba\n10 xyz\n2 two\n");
+    }
+
+    #[test]
+    fn generic_routines_delphi_syntax() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode delphi}{$H+}
+type
+  TUtil = class
+  end;
+
+function Larger<T>(const A, B: T): T;
+begin
+  if A > B then Result := A else Result := B;
+end;
+
+procedure Show<T>(const V: T);
+begin
+  WriteLn('value ', V);
+end;
+
+var I: Integer;
+begin
+  I := Larger<Integer>(3, 9);
+  WriteLn(I, ' ', Larger<string>('a', 'b'));
+  Show<Integer>(I * 2);
+  Show<string>('done');
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "9 b\nvalue 18\nvalue done\n");
+    }
+
+    #[test]
     fn class_instances_and_their_strings_are_freed() {
         let (ok, out) = build_and_run_source(
             "program T;

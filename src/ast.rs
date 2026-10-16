@@ -156,6 +156,8 @@ pub struct ProcDecl {
     pub nested_procs: Vec<ProcDecl>,
     pub body: Block,
     pub span: Span,
+    /// A generic routine's type parameters (`generic function Max<T>`).
+    pub type_params: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +196,7 @@ impl ProcDecl {
                 end_span: span,
             },
             span,
+            type_params: Vec::new(),
         }
     }
 }

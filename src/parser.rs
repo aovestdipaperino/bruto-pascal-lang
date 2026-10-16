@@ -1457,7 +1457,8 @@ impl Parser {
             )
         };
         routine(self.peek())
-            || (matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("class"))
+            || (matches!(self.peek(), Tok::Ident(w)
+                if w.eq_ignore_ascii_case("class") || w.eq_ignore_ascii_case("generic"))
                 && self
                     .tokens
                     .get(self.pos + 1)
@@ -1637,7 +1638,9 @@ impl Parser {
     fn parse_routine_heading(&mut self) -> Result<ProcDecl, ParseError> {
         // `class procedure TFoo.Bar`: whether it is a class method comes
         // from the class's declaration.
-        if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("class")) {
+        if matches!(self.peek(), Tok::Ident(w)
+            if w.eq_ignore_ascii_case("class") || w.eq_ignore_ascii_case("generic"))
+        {
             self.advance();
         }
         let span = self.span();
@@ -1668,6 +1671,12 @@ impl Parser {
             (Some(first), method)
         } else {
             (None, first)
+        };
+        // `function Max<T>(...)`: a generic routine.
+        let type_params = if owner.is_none() && *self.peek() == Tok::Lt {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
         };
         let params = if *self.peek() == Tok::LParen {
             self.parse_param_list()?
@@ -1702,6 +1711,7 @@ impl Parser {
         ])?;
         let mut decl = ProcDecl::header(name, kind, params, return_type, span);
         decl.owner = owner;
+        decl.type_params = type_params;
         decl.varargs = mods.iter().any(|m| m == "varargs");
         // `external ['lib'] [name 'sym'];`, then possibly more modifiers.
         if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("external")) {
@@ -1878,6 +1888,12 @@ impl Parser {
     /// Whether `<` at `pos` starts type arguments followed by `.`, as in
     /// `TList<Integer>.Create` (Delphi mode).
     fn type_args_then_dot(&self, pos: usize) -> bool {
+        self.type_args_then(pos, false)
+    }
+
+    /// Whether `<` at `pos` starts type arguments followed by `.` (or with
+    /// `call`, by `(`: `Max<Integer>(1, 2)`).
+    fn type_args_then(&self, pos: usize, call: bool) -> bool {
         let mut depth = 0;
         let mut p = pos;
         while let Some((t, _)) = self.tokens.get(p) {
@@ -1886,7 +1902,11 @@ impl Parser {
                 Tok::Gt => {
                     depth -= 1;
                     if depth == 0 {
-                        return matches!(self.tokens.get(p + 1), Some((Tok::Dot, _)));
+                        return match self.tokens.get(p + 1) {
+                            Some((Tok::Dot, _)) => true,
+                            Some((Tok::LParen, _)) => call,
+                            _ => false,
+                        };
                     }
                 }
                 Tok::Ident(_)
@@ -3259,6 +3279,33 @@ impl Parser {
                 }
             }
             Tok::Ident(_) if self.at_flow_statement() => self.parse_flow_statement(),
+            // `specialize Show<Integer>(X);`, `Show<Integer>(X);`.
+            Tok::Ident(w)
+                if (w.eq_ignore_ascii_case("specialize")
+                    && matches!(self.tokens.get(self.pos + 2), Some((Tok::Lt, _))))
+                    || (matches!(self.tokens.get(self.pos + 1), Some((Tok::Lt, _)))
+                        && self.type_args_then(self.pos + 1, true)) =>
+            {
+                let span = self.span();
+                match self.parse_primary()? {
+                    Expr::Call { name, args, span } => Ok(Statement::ProcCall { name, args, span }),
+                    Expr::MethodCall {
+                        object,
+                        method,
+                        args,
+                        span,
+                    } => Ok(Statement::MethodCall {
+                        object: *object,
+                        method,
+                        args,
+                        span,
+                    }),
+                    _ => Err(ParseError {
+                        message: "expected a call".into(),
+                        span,
+                    }),
+                }
+            }
             Tok::Ident(w) if self.at_word_statement(w, "try") => self.parse_try(),
             Tok::Ident(w) if self.at_word_statement(w, "raise") => self.parse_raise(),
             Tok::KwInherited => {
@@ -4397,7 +4444,7 @@ impl Parser {
                     && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
                     && matches!(self.tokens.get(self.pos + 2), Some((Tok::Lt, _))))
                     || (matches!(self.tokens.get(self.pos + 1), Some((Tok::Lt, _)))
-                        && self.type_args_then_dot(self.pos + 1)) =>
+                        && self.type_args_then(self.pos + 1, true)) =>
             {
                 let span = self.span();
                 if w.eq_ignore_ascii_case("specialize") {
@@ -4406,6 +4453,16 @@ impl Parser {
                 let (name, _) = self.expect_ident()?;
                 let args = self.parse_type_args()?;
                 let alias = self.hidden_specialization(name, args, span);
+                // `specialize Max<Integer>(1, 2)`: a generic routine's call.
+                if *self.peek() == Tok::LParen {
+                    let args = self.parse_call_args()?;
+                    let call = Expr::Call {
+                        name: alias,
+                        args,
+                        span,
+                    };
+                    return self.parse_postfix(call, span);
+                }
                 self.parse_postfix(Expr::Var(alias, span), span)
             }
             Tok::Ident(name) => {

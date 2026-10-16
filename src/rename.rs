@@ -109,6 +109,9 @@ pub(crate) fn rewrite_proc<R: Rename>(p: &mut ProcDecl, n: &R) {
     } else {
         p.name = n.rename(&p.name);
     }
+    for t in &mut p.type_params {
+        *t = n.rename(t);
+    }
     n.enter_routine(p);
     for c in &mut p.consts {
         c.name = n.rename(&c.name);

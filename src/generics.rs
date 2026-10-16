@@ -34,6 +34,8 @@ impl Rename for Substitution {
 
 struct Generics {
     decls: HashMap<String, TypeDecl>,
+    /// Generic routines by name.
+    routines: HashMap<String, ProcDecl>,
     methods: HashMap<String, Vec<ProcDecl>>,
     done: HashSet<String>,
     out: Vec<TypeDecl>,
@@ -199,6 +201,9 @@ impl Generics {
         if self.done.contains(&mangled) {
             return mangled;
         }
+        if let Some(routine) = self.routines.get(name).cloned() {
+            return self.instantiate_routine(routine, mangled, args, span);
+        }
         let Some(generic) = self.decls.get(name).cloned() else {
             self.errors
                 .push((format!("'{name}' is not a generic type"), span));
@@ -278,6 +283,67 @@ fn mentions(ty: &PascalType, params: &HashSet<String>) -> bool {
     }
 }
 
+impl Generics {
+    /// A copy of generic routine `routine` for `args`, named `mangled`.
+    fn instantiate_routine(
+        &mut self,
+        routine: ProcDecl,
+        mangled: String,
+        args: &[PascalType],
+        span: Span,
+    ) -> String {
+        if routine.type_params.len() != args.len() {
+            self.errors.push((
+                format!(
+                    "'{}' takes {} type argument(s), found {}",
+                    routine.name,
+                    routine.type_params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+            return routine.name;
+        }
+        self.done.insert(mangled.clone());
+        let mut names = HashMap::new();
+        names.insert(routine.name.clone(), mangled.clone());
+        for (param, arg) in routine.type_params.iter().zip(args) {
+            let alias = format!("{mangled}${param}");
+            names.insert(param.clone(), alias.clone());
+            self.aliases.insert(alias.clone(), arg.clone());
+            self.out.push(TypeDecl {
+                name: alias,
+                ty: arg.clone(),
+                span: routine.span,
+                type_params: Vec::new(),
+            });
+        }
+        let own_params: HashSet<String> = routine.type_params.iter().cloned().collect();
+        for (hidden, (g2, args2)) in self.templated.clone() {
+            if !args2.iter().any(|a| mentions(a, &own_params)) {
+                continue;
+            }
+            let partial = Substitution {
+                names: names.clone(),
+            };
+            let mut args2 = args2.clone();
+            for a in args2.iter_mut() {
+                rewrite_type(a, &partial);
+                self.walk_type(a, span);
+            }
+            let made = self.instantiate(&g2, &args2, span);
+            names.insert(hidden, made);
+        }
+        let mut copy = routine;
+        rewrite_proc(&mut copy, &Substitution { names });
+        copy.name = mangled.clone();
+        copy.type_params.clear();
+        self.walk_proc(&mut copy);
+        self.procs.push(copy);
+        mangled
+    }
+}
+
 fn has_specialization(ty: &PascalType) -> bool {
     format!("{ty:?}").contains("Specialize")
 }
@@ -299,6 +365,14 @@ pub(crate) fn instantiate_generics(program: &mut Program) -> Result<(), (String,
     let (methods, procs): (Vec<ProcDecl>, Vec<ProcDecl>) = std::mem::take(&mut program.procedures)
         .into_iter()
         .partition(|p| p.owner.as_ref().is_some_and(|o| generic_names.contains(o)));
+    let (generic_routines, procs): (Vec<ProcDecl>, Vec<ProcDecl>) = procs
+        .into_iter()
+        .partition(|p| !p.type_params.is_empty() && !p.is_forward);
+    // A unit's interface header of a generic routine: its body is kept.
+    let procs: Vec<ProcDecl> = procs
+        .into_iter()
+        .filter(|p| p.type_params.is_empty())
+        .collect();
     let mut by_owner: HashMap<String, Vec<ProcDecl>> = HashMap::new();
     for m in methods {
         by_owner
@@ -308,6 +382,10 @@ pub(crate) fn instantiate_generics(program: &mut Program) -> Result<(), (String,
     }
     let mut g = Generics {
         decls: generic.into_iter().map(|t| (t.name.clone(), t)).collect(),
+        routines: generic_routines
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect(),
         methods: by_owner,
         done: HashSet::new(),
         out: Vec::new(),
@@ -322,8 +400,15 @@ pub(crate) fn instantiate_generics(program: &mut Program) -> Result<(), (String,
         .decls
         .values()
         .flat_map(|d| d.type_params.iter().cloned())
+        .chain(
+            g.routines
+                .values()
+                .flat_map(|r| r.type_params.iter().cloned()),
+        )
         .collect();
     let mut kept = Vec::new();
+    // Calls of specialized generic routines: hidden name -> the routine.
+    let mut routine_calls: Vec<(String, String, Vec<PascalType>, Span)> = Vec::new();
     for td in rest {
         match &td.ty {
             PascalType::Specialize { name, args }
@@ -332,6 +417,11 @@ pub(crate) fn instantiate_generics(program: &mut Program) -> Result<(), (String,
             {
                 g.templated
                     .insert(td.name.clone(), (name.clone(), args.clone()));
+            }
+            PascalType::Specialize { name, args }
+                if td.name.starts_with("specialize$") && g.routines.contains_key(name) =>
+            {
+                routine_calls.push((td.name.clone(), name.clone(), args.clone(), td.span));
             }
             _ => kept.push(td),
         }
@@ -355,11 +445,27 @@ pub(crate) fn instantiate_generics(program: &mut Program) -> Result<(), (String,
     for p in &mut procs {
         g.walk_proc(p);
     }
+    // The calls of generic routines name their instantiations.
+    let mut call_names = HashMap::new();
+    for (hidden, name, mut args, span) in routine_calls {
+        for a in args.iter_mut() {
+            g.walk_type(a, span);
+        }
+        let made = g.instantiate(&name, &args, span);
+        call_names.insert(hidden, made);
+    }
     if let Some(e) = g.errors.into_iter().next() {
         return Err(e);
     }
     program.type_decls = g.out;
     procs.extend(g.procs);
+    if !call_names.is_empty() {
+        let rename = Substitution { names: call_names };
+        for p in &mut procs {
+            rewrite_proc(p, &rename);
+        }
+        crate::rename::rewrite_block(&mut program.body, &rename);
+    }
     program.procedures = procs;
     Ok(())
 }
