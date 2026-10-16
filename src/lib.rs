@@ -8244,6 +8244,12 @@ end.
 "#,
         );
         assert!(ok, "program failed: {out}");
+        // On Windows the path delimiter appended is a backslash, as FPC's.
+        let out = if cfg!(windows) {
+            out.replace("/tmp\\ /tmp", "/tmp/ /tmp")
+        } else {
+            out
+        };
         assert_eq!(
             out,
             r#"4
