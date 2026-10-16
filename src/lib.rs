@@ -8318,6 +8318,573 @@ FALSE 0
     }
 
     #[test]
+    fn sysutils_dates_and_times_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program d1;
+{$mode objfpc}{$H+}
+uses SysUtils;
+var D, T: TDateTime; Y, M, Dd, H, Mi, S, Ms: Word;
+begin
+  with DefaultFormatSettings do
+    WriteLn('[', DateSeparator, '][', TimeSeparator, '][', ShortDateFormat, '][', LongDateFormat, '][', ShortTimeFormat, '][', LongTimeFormat, '][', TimeAMString, '][', TimePMString, '][', DecimalSeparator, '][', ThousandSeparator, '][', ListSeparator, '][', ShortMonthNames[1], '][', LongMonthNames[2], '][', ShortDayNames[1], '][', LongDayNames[2], ']');
+  D := EncodeDate(2024, 2, 29) + EncodeTime(13, 5, 7, 250);
+  WriteLn(D:0:6);
+  WriteLn(DateTimeToStr(D));
+  WriteLn(DateToStr(D), ' | ', TimeToStr(D));
+  WriteLn(FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', D));
+  WriteLn(FormatDateTime('dddd d mmmm yyyy, h:n am/pm', D));
+  WriteLn(FormatDateTime('ddd dd mmm yy "at" hh:mm ampm c', D));
+  WriteLn(FormatDateTime('c', EncodeDate(2024, 2, 29)));
+  DecodeDate(D, Y, M, Dd); DecodeTime(D, H, Mi, S, Ms);
+  WriteLn(Y, ' ', M, ' ', Dd, ' ', H, ' ', Mi, ' ', S, ' ', Ms, ' ', DayOfWeek(D), ' ', IsLeapYear(2024), ' ', IsLeapYear(1900));
+  WriteLn(DateToStr(IncMonth(D, 12)), ' ', DateToStr(IncMonth(EncodeDate(2024,1,31), 1)));
+  WriteLn(DateTimeToStr(StrToDate('29-2-2024')), ' ', DateTimeToStr(StrToDateTime('1-3-2024 10:20:30')), ' ', TimeToStr(StrToTime('8:09:10')));
+  WriteLn(EncodeDate(1899, 12, 30):0:1, ' ', EncodeDate(1, 1, 1):0:1, ' ', DateTimeToStr(0), ' ', DateTimeToStr(-1.25));
+  WriteLn(Trunc(Now) > 45000, ' ', Frac(Time) < 1, ' ', Date = Trunc(Now));
+  try EncodeDate(2023, 2, 29); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try StrToDate('x'); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  WriteLn(FormatDateTime('hh:nn', 0.999999999));
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"[-][:][d/m/y][dd" "mmmm" "yyyy][hh:nn][hh:nn:ss][AM][PM][.][,][,][Jan][February][Sun][Monday]
+45351.545223
+29-2-24 13:05:07
+29-2-24 | 13:05:07
+2024-02-29 13:05:07.250
+Thursday 29 February 2024, 1:5 pm
+Thu 29 Feb 24 at 01:05 PM 29-2-24 13:05:07
+29-2-24
+2024 2 29 13 5 7 250 5 TRUE FALSE
+28-2-25 29-2-24
+29-2-24 1-3-24 10:20:30 08:09:10
+0.0 -693593.0 30-12-99 29-12-99 06:00:00
+TRUE TRUE TRUE
+EConvertError: 2023-2-29 is not a valid date specification
+EConvertError: "x" is not a valid date format
+00:00
+"#
+        );
+    }
+
+    #[test]
+    fn dateutils_unit_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program du;
+{$mode objfpc}{$H+}
+uses SysUtils, DateUtils;
+var D, E: TDateTime;
+begin
+  D := EncodeDateTime(2024, 2, 29, 13, 5, 7, 250);
+  E := EncodeDate(2025, 1, 1);
+  WriteLn(YearOf(D), ' ', MonthOf(D), ' ', DayOf(D), ' ', HourOf(D), ' ', MinuteOf(D), ' ', SecondOf(D), ' ', MilliSecondOf(D));
+  WriteLn(DaysBetween(D, E), ' ', HoursBetween(D, E), ' ', MonthsBetween(D, E), ' ', WeeksBetween(D, E), ' ', YearsBetween(D, E));
+  WriteLn(DateTimeToStr(IncDay(D, 3)), ' | ', DateTimeToStr(IncHour(D, -14)), ' | ', DateTimeToStr(IncYear(D)));
+  WriteLn(DaysInMonth(D), ' ', DaysInYear(D), ' ', DayOfTheWeek(D), ' ', DayOfTheYear(D), ' ', WeekOf(D), ' ', IsSameDay(D, Trunc(D) + 0.1));
+  WriteLn(DateTimeToStr(StartOfTheMonth(D)), ' | ', DateTimeToStr(EndOfTheMonth(D)), ' | ', DateTimeToStr(StartOfTheWeek(D)));
+  WriteLn(DateTimeToUnix(D), ' ', DateTimeToStr(UnixToDateTime(0)), ' ', DateToISO8601(D));
+  WriteLn(CompareDate(D, E), ' ', SameDate(D, D + 0.2), ' ', IsValidDate(2023, 2, 29), ' ', DateOf(D):0:1, ' ', TimeOf(D):0:6);
+  WriteLn(IsToday(Now), ' ', Trunc(Yesterday) = Trunc(Today) - 1, ' ', Trunc(Tomorrow) = Trunc(Today) + 1);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"2024 2 29 13 5 7 250
+306 7354 10 43 0
+3-3-24 13:05:07 | 28-2-24 23:05:07 | 28-2-25 13:05:07
+29 366 4 60 9 TRUE
+1-2-24 | 29-2-24 23:59:59 | 26-2-24
+1709211907 1-1-70 2024-02-29T13:05:07.250Z
+-1 TRUE FALSE 45351.0 0.545223
+TRUE TRUE TRUE
+"#
+        );
+    }
+
+    #[test]
+    fn sysutils_pchar_routines_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program p1;
+{$mode objfpc}{$H+}
+uses SysUtils;
+var Buf: array[0..63] of Char; P, Q: PChar;
+begin
+  StrPCopy(Buf, 'Hello'); StrCat(Buf, ', world');
+  WriteLn(StrPas(Buf), ' ', StrLen(Buf));
+  WriteLn(StrComp('abc', 'abd') < 0, ' ', StrIComp('ABC', 'abc'), ' ', StrLComp('abcX', 'abcY', 3));
+  P := StrScan(Buf, 'o'); WriteLn(P);
+  P := StrRScan(Buf, 'o'); WriteLn(P);
+  P := StrPos(Buf, 'wor'); WriteLn(P, ' ', P - PChar(@Buf[0]));
+  StrUpper(Buf); WriteLn(Buf); StrLower(Buf); WriteLn(Buf);
+  Q := StrNew('copy me'); WriteLn(Q, ' ', StrLen(Q)); StrDispose(Q);
+  StrLCopy(Buf, 'truncated text', 9); WriteLn(Buf);
+  P := StrECopy(Buf, 'ab'); StrCopy(P, 'cd'); WriteLn(Buf, ' ', StrEnd(Buf) - PChar(@Buf[0]));
+  WriteLn(CharInSet('x', ['a'..'z']), ' ', CharInSet('1', ['a'..'z']));
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"Hello, world 12
+TRUE 0 0
+o, world
+orld
+world 7
+HELLO, WORLD
+hello, world
+copy me 7
+truncated
+abcd 4
+TRUE FALSE
+"#
+        );
+    }
+
+    #[test]
+    fn variant_dates_lock_and_pinteger_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program vd;
+{$mode objfpc}{$H+}
+uses SysUtils, Variants;
+var V, W: Variant; D: TDateTime; X: Double; P: PInteger; I: Integer; A: Variant; S: string;
+begin
+  D := EncodeDate(2024, 2, 29) + EncodeTime(13, 5, 7, 0);
+  V := D; WriteLn(VarTypeAsText(VarType(V)), ' ', VarToStr(V));
+  X := 2.5; V := X; WriteLn(VarTypeAsText(VarType(V)));
+  V := VarFromDateTime(D); WriteLn(VarTypeAsText(VarType(V)), ' ', DateTimeToStr(VarToDateTime(V)));
+  W := V + 1; WriteLn(VarTypeAsText(VarType(W)), ' ', VarToStr(W));
+  W := V - 1.5; WriteLn(VarTypeAsText(VarType(W)), ' ', VarToStr(W));
+  W := V - VarFromDateTime(EncodeDate(2024, 1, 1)); WriteLn(VarTypeAsText(VarType(W)), ' ', VarToStr(W));
+  W := V * 2; WriteLn(VarTypeAsText(VarType(W)), ' ', VarToStr(W));
+  WriteLn(V > VarFromDateTime(EncodeDate(2024, 1, 1)), ' ', V = D, ' ', VarToStr(VarFromDateTime(EncodeTime(8, 30, 0, 0))));
+  V := '1-3-2024'; W := VarAsType(V, varDate); WriteLn(VarTypeAsText(VarType(W)), ' ', VarToStr(W));
+  D := V; WriteLn(D:0:2);
+  V := VarFromDateTime(D); I := V; X := V; S := V; WriteLn(I, ' ', X:0:2, ' ', S);
+  WriteLn(VarToStr(VarFromDateTime(0)), '|', VarToStr(VarFromDateTime(-1.5)));
+  A := VarArrayCreate([0, 3], varInteger);
+  A[0] := 10; A[3] := 40;
+  P := VarArrayLock(A); WriteLn(P[0], ' ', P[3]); P[1] := 20; VarArrayUnlock(A);
+  WriteLn(A[1], ' ', VarArrayDimCount(A));
+  A := VarArrayCreate([1, 2], varDouble); A[1] := 1.5;
+  WriteLn(PDouble(VarArrayLock(A))[0]:0:1); VarArrayUnlock(A);
+  A := VarArrayOf(['x', 2]);
+  WriteLn(VarTypeAsText(VarType(PVariant(VarArrayLock(A))[0]))); VarArrayUnlock(A);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"Date 29-2-24 13:05:07
+Double
+Date 29-2-24 13:05:07
+Date 1-3-24 13:05:07
+Date 28-2-24 01:05:07
+Double 59.5452199074061
+Double 90703.0904398148
+TRUE TRUE 08:30:00
+Date 1-3-24
+45352.00
+45352 45352.00 1-3-24
+00:00:00|29-12-99 12:00:00
+10 40
+20 1
+1.5
+OleStr
+"#
+        );
+    }
+
+    #[test]
+    fn custom_variant_types_and_late_binding_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program vc;
+{$mode objfpc}{$H+}
+uses SysUtils, Variants;
+type
+  { A complex number as a custom variant. }
+  TComplex = class
+    Re, Im: Double;
+    constructor Create(ARe, AIm: Double);
+  end;
+  TComplexType = class(TInvokeableVariantType)
+  public
+    procedure Clear(var V: TVarData); override;
+    procedure Copy(var Dest: TVarData; const Source: TVarData; const Indirect: Boolean); override;
+    procedure Cast(var Dest: TVarData; const Source: TVarData); override;
+    procedure CastTo(var Dest: TVarData; const Source: TVarData; const AVarType: TVarType); override;
+    procedure BinaryOp(var Left: TVarData; const Right: TVarData; const Operation: TVarOp); override;
+    function CompareOp(const Left, Right: TVarData; const Operation: TVarOp): Boolean; override;
+    function DoFunction(var Dest: TVarData; const V: TVarData; const Name: string; const Arguments: TVarDataArray): Boolean; override;
+    function GetProperty(var Dest: TVarData; const V: TVarData; const Name: string): Boolean; override;
+    function SetProperty(var V: TVarData; const Name: string; const Value: TVarData): Boolean; override;
+  end;
+var
+  ComplexType: TComplexType;
+  Frees: Integer;
+
+constructor TComplex.Create(ARe, AIm: Double); begin Re := ARe; Im := AIm; end;
+
+function C(const V: TVarData): TComplex; begin Result := TComplex(V.VPointer); end;
+
+function VarComplex(ARe, AIm: Double): Variant;
+begin
+  VarClear(Result);
+  TVarData(Result).VType := ComplexType.VarType;
+  TVarData(Result).VPointer := TComplex.Create(ARe, AIm);
+end;
+
+procedure TComplexType.Clear(var V: TVarData);
+begin
+  C(V).Free; Inc(Frees);
+  V.VType := varEmpty; V.VPointer := nil;
+end;
+
+procedure TComplexType.Copy(var Dest: TVarData; const Source: TVarData; const Indirect: Boolean);
+begin
+  Dest.VType := Source.VType;
+  Dest.VPointer := TComplex.Create(C(Source).Re, C(Source).Im);
+end;
+
+procedure TComplexType.Cast(var Dest: TVarData; const Source: TVarData);
+begin
+  Dest.VType := VarType;
+  Dest.VPointer := TComplex.Create(Variant(Source), 0);
+end;
+
+procedure TComplexType.CastTo(var Dest: TVarData; const Source: TVarData; const AVarType: TVarType);
+var S: string;
+begin
+  S := '(' + FloatToStr(C(Source).Re) + ',' + FloatToStr(C(Source).Im) + ')';
+  if AVarType = varString then
+  begin
+    VarDataClear(Dest);
+    Dest.VType := varString; Dest.VString := nil;
+    AnsiString(Dest.VString) := S;
+  end
+  else
+    RaiseCastError;
+end;
+
+procedure TComplexType.BinaryOp(var Left: TVarData; const Right: TVarData; const Operation: TVarOp);
+var L, R: TComplex; Res: TComplex;
+begin
+  L := C(Left);
+  if Right.VType = VarType then R := C(Right) else R := TComplex.Create(Variant(Right), 0);
+  case Operation of
+    opAdd: Res := TComplex.Create(L.Re + R.Re, L.Im + R.Im);
+    opMultiply: Res := TComplex.Create(L.Re * R.Re - L.Im * R.Im, L.Re * R.Im + L.Im * R.Re);
+  else
+    RaiseInvalidOp;
+  end;
+  if Right.VType <> VarType then R.Free;
+  L.Free;
+  Left.VPointer := Res;
+end;
+
+function TComplexType.CompareOp(const Left, Right: TVarData; const Operation: TVarOp): Boolean;
+begin
+  Result := (C(Left).Re = C(Right).Re) and (C(Left).Im = C(Right).Im);
+  if Operation = opCmpNe then Result := not Result;
+end;
+
+function TComplexType.DoFunction(var Dest: TVarData; const V: TVarData; const Name: string; const Arguments: TVarDataArray): Boolean;
+begin
+  WriteLn('DoFunction ', Name, ' ', Length(Arguments));
+  Result := CompareText(Name, 'Scale') = 0;
+  if Result then
+    Variant(Dest) := VarComplex(C(V).Re * Variant(Arguments[0]), C(V).Im * Variant(Arguments[0]));
+end;
+
+function TComplexType.GetProperty(var Dest: TVarData; const V: TVarData; const Name: string): Boolean;
+begin
+  WriteLn('GetProperty ', Name);
+  Result := True;
+  if CompareText(Name, 'Re') = 0 then Variant(Dest) := C(V).Re
+  else if CompareText(Name, 'Im') = 0 then Variant(Dest) := C(V).Im
+  else Result := False;
+end;
+
+function TComplexType.SetProperty(var V: TVarData; const Name: string; const Value: TVarData): Boolean;
+begin
+  WriteLn('SetProperty ', Name);
+  Result := True;
+  if CompareText(Name, 'Re') = 0 then C(V).Re := Variant(Value) else C(V).Im := Variant(Value);
+end;
+
+var A, B, Z: Variant;
+begin
+  ComplexType := TComplexType.Create;
+  WriteLn(ComplexType.VarType >= $10F, ' ', VarTypeAsText(ComplexType.VarType) <> '');
+  A := VarComplex(1, 2);
+  B := VarComplex(3, -1);
+  Z := A + B; WriteLn(VarToStr(Z));
+  Z := A * B; WriteLn(VarToStr(Z));
+  Z := A + 10; WriteLn(VarToStr(Z));
+  WriteLn(A = VarComplex(1, 2), ' ', A <> B);
+  Z := A; Z.Re := 7; WriteLn(VarToStr(A), ' ', VarToStr(Z));
+  WriteLn(Z.Im, ' ', VarToStr(Z.Scale(2)), ' ', VarToStr(Z.scale(3)));
+  Z.Im := Z.Re + 1; WriteLn(VarToStr(Z));
+  try Z.Missing; except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  VarClear(A); VarClear(B); VarClear(Z);
+  WriteLn('frees>0 ', Frees > 0);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"TRUE TRUE
+(4,1)
+(5,5)
+(11,2)
+TRUE TRUE
+SetProperty Re
+(1,2) (7,2)
+GetProperty Im
+2 DoFunction Scale 1
+(14,4) DoFunction scale 1
+(21,6)
+GetProperty Re
+SetProperty Im
+(7,8)
+DoFunction Missing 0
+EVariantDispatchError: No variant method call dispatch
+frees>0 TRUE
+"#
+        );
+    }
+
+    #[test]
+    fn generics_defaults_comparers_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program g2;
+{$mode objfpc}{$H+}
+uses SysUtils, Generics.Defaults;
+type
+  TRec = record A, B: Integer; end;
+  TByLen = class
+    function Cmp(constref L, R: string): Integer;
+  end;
+function TByLen.Cmp(constref L, R: string): Integer; begin Result := Length(L) - Length(R); end;
+function Rev(constref L, R: Integer): Integer; begin Result := R - L; end;
+function EqMod(constref L, R: Integer): Boolean; begin Result := L mod 10 = R mod 10; end;
+function HashMod(constref V: Integer): UInt32; begin Result := V mod 10; end;
+var
+  CI: specialize IComparer<Integer>; CS: specialize IComparer<string>;
+  CR: specialize IComparer<TRec>; E: specialize IEqualityComparer<Integer>;
+  ES: specialize IEqualityComparer<string>; ER: specialize IEqualityComparer<TRec>;
+  X, Y: TRec; B: TByLen;
+begin
+  CI := specialize TComparer<Integer>.Default;
+  WriteLn(CI.Compare(1, 2), ' ', CI.Compare(2, 2), ' ', CI.Compare(3, 2));
+  CS := specialize TComparer<string>.Default;
+  WriteLn(CS.Compare('abc', 'abd') < 0, ' ', CS.Compare('b', 'a') > 0, ' ', CS.Compare('x', 'x'));
+  X.A := 1; X.B := 2; Y := X;
+  CR := specialize TComparer<TRec>.Default;
+  WriteLn(CR.Compare(X, Y)); Y.B := 3; WriteLn(CR.Compare(X, Y) <> 0);
+  CI := specialize TComparer<Integer>.Construct(@Rev);
+  WriteLn(CI.Compare(1, 2), ' ', CI.Compare(5, 2));
+  B := TByLen.Create;
+  CS := specialize TComparer<string>.Construct(@B.Cmp);
+  WriteLn(CS.Compare('aaa', 'b'));
+  E := specialize TEqualityComparer<Integer>.Default;
+  WriteLn(E.Equals(3, 3), ' ', E.Equals(3, 4), ' ', E.GetHashCode(7) = E.GetHashCode(7));
+  ES := specialize TEqualityComparer<string>.Default;
+  WriteLn(ES.Equals('a', 'a'), ' ', ES.GetHashCode('hello') = ES.GetHashCode('hel' + 'lo'));
+  ER := specialize TEqualityComparer<TRec>.Default;
+  WriteLn(ER.Equals(X, X), ' ', ER.Equals(X, Y));
+  E := specialize TEqualityComparer<Integer>.Construct(@EqMod, @HashMod);
+  WriteLn(E.Equals(13, 23), ' ', E.GetHashCode(47));
+  B.Free;
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"-1 0 1
+TRUE TRUE 0
+0
+TRUE
+1 -3
+2
+TRUE FALSE TRUE
+TRUE TRUE
+TRUE FALSE
+TRUE 7
+"#
+        );
+    }
+
+    #[test]
+    fn generics_collections_with_comparers_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program g4;
+{$mode objfpc}{$H+}
+uses SysUtils, Generics.Defaults, Generics.Collections;
+type
+  TPoint2 = record X, Y: Integer; end;
+  TPerson = record Name: string; Age: Integer; end;
+  TSorter = class
+    function ByAge(constref A, B: TPerson): Integer;
+  end;
+function TSorter.ByAge(constref A, B: TPerson): Integer; begin Result := A.Age - B.Age; end;
+function ByName(constref A, B: TPerson): Integer; begin Result := CompareStr(A.Name, B.Name); end;
+function Desc(constref A, B: Integer): Integer; begin Result := B - A; end;
+function CIEq(constref A, B: string): Boolean; begin Result := SameText(A, B); end;
+function CIHash(constref V: string): UInt32; begin Result := Length(V); end;
+function P(const N: string; A: Integer): TPerson; begin Result.Name := N; Result.Age := A; end;
+function Pt(X, Y: Integer): TPoint2; begin Result.X := X; Result.Y := Y; end;
+var
+  L: specialize TList<Integer>; PL: specialize TList<TPerson>;
+  D: specialize TDictionary<string, Integer>; PD: specialize TDictionary<TPoint2, string>;
+  A: array of Integer; I, Idx: SizeInt; S: TSorter; Q: TPerson; R: TBinarySearchResult;
+  Found: Boolean; V: Integer; Str: string;
+begin
+  L := specialize TList<Integer>.Create;
+  L.AddRange([5, 3, 9, 1, 7, 3]);
+  L.Sort; for I := 0 to L.Count - 1 do Write(L[I], ' '); WriteLn;
+  WriteLn(L.BinarySearch(7, Idx), ' ', Idx, ' ', L.BinarySearch(4, Idx), ' ', Idx);
+  L.Sort(specialize TComparer<Integer>.Construct(@Desc));
+  for I := 0 to L.Count - 1 do Write(L[I], ' '); WriteLn;
+  WriteLn(L.IndexOf(9), ' ', L.Contains(4), ' ', L.Remove(3), ' ', L.Count);
+  L.Free;
+  L := specialize TList<Integer>.Create(specialize TComparer<Integer>.Construct(@Desc));
+  L.AddRange([2, 8, 4]); L.Sort; for I := 0 to L.Count - 1 do Write(L[I], ' '); WriteLn;
+  L.Free;
+  S := TSorter.Create;
+  PL := specialize TList<TPerson>.Create(specialize TComparer<TPerson>.Construct(@S.ByAge));
+  PL.Add(P('Ann', 41)); PL.Add(P('Bob', 25)); PL.Add(P('Cid', 33)); PL.Add(P('Dee', 25));
+  PL.Sort; for Q in PL do Write(Q.Name, ':', Q.Age, ' '); WriteLn;
+  PL.Sort(specialize TComparer<TPerson>.Construct(@ByName));
+  for Q in PL do Write(Q.Name, ' '); WriteLn;
+  WriteLn(PL.IndexOf(P('Cid', 33)), ' ', PL.Contains(P('Cid', 34)));
+  PL.Free; S.Free;
+  SetLength(A, 6); A[0] := 4; A[1] := 2; A[2] := 6; A[3] := 1; A[4] := 5; A[5] := 3;
+  specialize TArrayHelper<Integer>.Sort(A);
+  for I := 0 to High(A) do Write(A[I], ' '); WriteLn;
+  Found := specialize TArrayHelper<Integer>.BinarySearch(A, 5, Idx); WriteLn(Found, ' ', Idx);
+  Found := specialize TArrayHelper<Integer>.BinarySearch(A, 7, R);
+  WriteLn(Found, ' ', R.FoundIndex, ' ', R.CandidateIndex, ' ', R.CompareResult);
+  D := specialize TDictionary<string, Integer>.Create(
+    specialize TEqualityComparer<string>.Construct(@CIEq, @CIHash));
+  D.Add('Apple', 1); D.AddOrSetValue('APPLE', 2); D.Add('pear', 3);
+  WriteLn(D.Count, ' ', D['apple'], ' ', D.ContainsKey('PEAR'), ' ', D.TryGetValue('fig', V));
+  D.Free;
+  PD := specialize TDictionary<TPoint2, string>.Create;
+  PD.Add(Pt(1, 2), 'a'); PD.Add(Pt(3, 4), 'b'); PD[Pt(1, 2)] := 'c';
+  WriteLn(PD.Count, ' ', PD[Pt(1, 2)], ' ', PD.ContainsKey(Pt(3, 4)), ' ', PD.ContainsKey(Pt(4, 3)));
+  WriteLn(PD.ContainsValue('b'), ' ', PD.TryGetValue(Pt(9, 9), Str));
+  PD.Free;
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"1 3 3 5 7 9 
+TRUE 4 FALSE -1
+9 7 5 3 3 1 
+0 FALSE 3 5
+8 4 2 
+Dee:25 Bob:25 Cid:33 Ann:41 
+Ann Bob Cid Dee 
+2 FALSE
+1 2 3 4 5 6 
+TRUE 4
+FALSE -1 5 -1
+2 2 TRUE FALSE
+2 c TRUE FALSE
+TRUE FALSE
+"#
+        );
+    }
+
+    #[test]
+    fn stream_date_variants_and_properties_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program s1;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, Variants;
+type
+  TThing = class(TComponent)
+  private
+    FWhen: Variant;
+  published
+    property When: Variant read FWhen write FWhen;
+  end;
+var T, U: TThing; M: TMemoryStream; S: TStringStream; I: Integer; B: PByte;
+begin
+  RegisterClass(TThing);
+  T := TThing.Create(nil); T.Name := 'T1';
+  T.When := VarFromDateTime(EncodeDate(2024, 2, 29) + EncodeTime(13, 5, 7, 0));
+  M := TMemoryStream.Create; M.WriteComponent(T);
+  B := M.Memory; for I := 0 to M.Size - 1 do Write(IntToHex(B[I], 2)); WriteLn;
+  S := TStringStream.Create('');
+  try
+    M.Position := 0; ObjectBinaryToText(M, S); Write(S.DataString);
+  except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  M.Position := 0; U := TThing.Create(nil);
+  M.ReadComponent(U);
+  WriteLn(VarTypeAsText(VarType(U.When)), ' ', VarToStr(U.When));
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"5450463006545468696E67025431045768656E11EE047172F124E6400000
+EReadError: Invalid property type from streamed property: 17
+Date 29-2-24 13:05:07
+"#
+        );
+        let (ok, out) = build_and_run_source(
+            r#"program s2;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes;
+type
+  TThing = class(TComponent)
+  private
+    FWhen: TDateTime; FTime: TTime;
+  published
+    property When: TDateTime read FWhen write FWhen;
+    property At: TTime read FTime write FTime;
+  end;
+var T, U: TThing; M: TMemoryStream; S: TStringStream; I: Integer; B: PByte;
+begin
+  RegisterClass(TThing);
+  T := TThing.Create(nil); T.Name := 'T1';
+  T.When := EncodeDate(2024, 2, 29) + EncodeTime(13, 5, 7, 0); T.At := EncodeTime(8, 30, 0, 0);
+  M := TMemoryStream.Create; M.WriteComponent(T);
+  B := M.Memory; for I := 0 to M.Size - 1 do Write(IntToHex(B[I], 2)); WriteLn;
+  S := TStringStream.Create('');
+  M.Position := 0; ObjectBinaryToText(M, S); Write(S.DataString);
+  M.Position := 0; U := TThing.Create(nil); M.ReadComponent(U);
+  WriteLn(DateTimeToStr(U.When), ' ', TimeToStr(U.At));
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"5450463006545468696E67025431045768656E0500702788938B27B10E400241740500585555555555B5FD3F0000
+object T1: TThing
+  When =  4.5351545219907406E+004
+  At =  3.5416666666666669E-001
+end
+29-2-24 13:05:07 08:30:00
+"#
+        );
+    }
+
+    #[test]
     fn generic_routines_delphi_syntax() {
         let (ok, out) = build_and_run_source(
             "program T;

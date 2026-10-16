@@ -39,6 +39,10 @@ struct Generics {
     methods: HashMap<String, Vec<ProcDecl>>,
     done: HashSet<String>,
     out: Vec<TypeDecl>,
+    /// Specializations made once the one being made (and those it is
+    /// being made for) are out, and how deep that making is.
+    pending: Vec<(String, Vec<PascalType>, Span)>,
+    depth: usize,
     procs: Vec<ProcDecl>,
     errors: Vec<(String, Span)>,
     /// The type parameters' aliases: alias -> the argument it stands for.
@@ -251,8 +255,10 @@ impl Generics {
                 type_params: Vec::new(),
             });
         }
-        // The specializations in its code that use its parameters.
+        // The specializations in its code that use its parameters. Types
+        // are made after this one (a class there may descend from it).
         let own_params: HashSet<String> = generic.type_params.iter().cloned().collect();
+        let mut later: Vec<(String, Vec<PascalType>, String)> = Vec::new();
         for (hidden, (g2, args2)) in self.templated.clone() {
             if !args2.iter().any(|a| mentions(a, &own_params)) {
                 continue;
@@ -265,7 +271,14 @@ impl Generics {
                 rewrite_type(a, &partial);
                 self.walk_type(a, span);
             }
-            let made = self.instantiate(&g2, &args2, span);
+            let made = if self.decls.contains_key(&g2) && !self.routines.contains_key(&g2) {
+                let keys: Vec<String> = args2.iter().map(|a| type_key(a, &self.aliases)).collect();
+                let made = format!("{g2}<{}>", keys.join(","));
+                later.push((g2.clone(), args2, made.clone()));
+                made
+            } else {
+                self.instantiate(&g2, &args2, span)
+            };
             names.insert(hidden, made);
         }
         let subst = Substitution { names };
@@ -273,16 +286,34 @@ impl Generics {
         inst.name = mangled.clone();
         inst.type_params.clear();
         rewrite_type(&mut inst.ty, &subst);
-        // What it uses comes first.
+        // What it uses comes first: the specializations its declaration
+        // names (a parent class, a field's type), then its own.
+        let declared = format!("{:?}", inst.ty);
+        let (before, after): (Vec<_>, Vec<_>) = later
+            .into_iter()
+            .partition(|(_, _, made)| declared.contains(&format!("{made:?}")));
+        self.depth += 1;
+        for (g2, args2, _) in before {
+            self.instantiate(&g2, &args2, span);
+        }
         self.walk_type(&mut inst.ty, span);
+        self.out.extend(aliases);
+        self.out.push(inst);
+        self.pending
+            .extend(after.into_iter().map(|(g2, args2, _)| (g2, args2, span)));
         for mut m in self.methods.get(name).cloned().unwrap_or_default() {
             rewrite_proc(&mut m, &subst);
             m.owner = Some(mangled.clone());
             self.walk_proc(&mut m);
             self.procs.push(m);
         }
-        self.out.extend(aliases);
-        self.out.push(inst);
+        self.depth -= 1;
+        if self.depth == 0 {
+            while !self.pending.is_empty() {
+                let (g2, args2, at) = self.pending.remove(0);
+                self.instantiate(&g2, &args2, at);
+            }
+        }
         mangled
     }
 }
@@ -494,6 +525,8 @@ pub(crate) fn instantiate_generics(
         methods: by_owner,
         done: HashSet::new(),
         out: Vec::new(),
+        pending: Vec::new(),
+        depth: 0,
         procs: Vec::new(),
         errors: Vec::new(),
         aliases: HashMap::new(),

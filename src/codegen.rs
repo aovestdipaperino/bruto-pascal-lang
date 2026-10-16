@@ -25,6 +25,7 @@ use std::path::Path;
 mod arc;
 mod classes;
 mod closures;
+mod compare;
 mod currency;
 mod dynarrays;
 mod exceptions;
@@ -95,6 +96,12 @@ pub struct CodeGen<'ctx> {
     // Symbol table (scope stack — globals are always at index 0)
     variables: HashMap<String, PointerValue<'ctx>>,
     var_types: HashMap<String, PascalType>,
+    /// The named types the locals and parameters were declared with
+    /// (`var_types` holds them resolved), and the globals': a TDateTime
+    /// goes into a Variant as a date, a TVarData as the Variant itself.
+    decl_vars: HashMap<String, PascalType>,
+    decl_globals: HashMap<String, PascalType>,
+    saved_decl_vars: Vec<HashMap<String, PascalType>>,
 
     // Program-level variables and constants. They live in LLVM globals so
     // every procedure can reach them; lookups fall back here after the
@@ -291,6 +298,9 @@ impl<'ctx> CodeGen<'ctx> {
             di_file,
             variables: HashMap::new(),
             var_types: HashMap::new(),
+            decl_vars: HashMap::new(),
+            decl_globals: HashMap::new(),
+            saved_decl_vars: Vec::new(),
             global_vars: HashMap::new(),
             global_types: HashMap::new(),
             display_names: HashMap::new(),
@@ -1292,6 +1302,7 @@ impl<'ctx> CodeGen<'ctx> {
 
             self.variables.insert(name.clone(), alloca);
             self.var_types.insert(name.clone(), resolved_ty.clone());
+            self.note_declared_var(name, &decl.ty);
 
             // Record watch-window metadata for top-level kinds.
             self.record_metadata(name, &resolved_ty);
@@ -1363,6 +1374,32 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Type of a local or, failing that, a program-level global.
+    /// Note the named type the variable `name` was declared with.
+    fn note_declared_var(&mut self, name: &str, ty: &PascalType) {
+        if matches!(ty, PascalType::Named(_)) {
+            self.decl_vars.insert(name.to_string(), ty.clone());
+        } else {
+            self.decl_vars.remove(name);
+        }
+    }
+
+    /// The named type the variable `expr` was declared with, if any.
+    pub(super) fn declared_var_type(&self, expr: &Expr) -> Option<&PascalType> {
+        let Expr::Var(name, _) = expr else {
+            return None;
+        };
+        if self.var_types.contains_key(name) {
+            self.decl_vars.get(name)
+        } else {
+            self.decl_globals.get(name)
+        }
+    }
+
+    /// Whether `expr` is a variable declared TDateTime, TDate or TTime.
+    pub(super) fn is_date_var(&self, expr: &Expr) -> bool {
+        self.declared_var_type(expr).is_some_and(Self::is_date_time)
+    }
+
     fn lookup_var_type(&self, name: &str) -> Option<&PascalType> {
         self.var_types
             .get(name)
@@ -1407,6 +1444,9 @@ impl<'ctx> CodeGen<'ctx> {
         self.global_vars
             .insert(name.to_string(), global.as_pointer_value());
         self.global_types.insert(name.to_string(), resolved.clone());
+        if matches!(ty, PascalType::Named(_)) {
+            self.decl_globals.insert(name.to_string(), ty.clone());
+        }
         self.record_metadata(name, &resolved);
     }
 
@@ -1962,6 +2002,8 @@ impl<'ctx> CodeGen<'ctx> {
         // Save current scope
         let saved_vars = std::mem::take(&mut self.variables);
         let saved_types = std::mem::take(&mut self.var_types);
+        let saved_decls = std::mem::take(&mut self.decl_vars);
+        self.saved_decl_vars.push(saved_decls);
         let saved_fn = self.current_fn;
         let saved_scope = self.current_scope;
         let saved_scope_file = self.scope_file;
@@ -1991,6 +2033,12 @@ impl<'ctx> CodeGen<'ctx> {
                 self.variables
                     .insert(name.clone(), param_val.into_pointer_value());
                 self.var_types.insert(name.clone(), resolved_ty);
+                let declared = proc
+                    .params
+                    .iter()
+                    .find(|g| g.names.contains(name))
+                    .map_or_else(|| ty.clone(), |g| g.ty.clone());
+                self.note_declared_var(name, &declared);
             } else {
                 // value param: copy into alloca
                 let llvm_ty = self.llvm_type_for(&resolved_ty);
@@ -2007,6 +2055,12 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 self.variables.insert(name.clone(), alloca);
                 self.var_types.insert(name.clone(), resolved_ty);
+                let declared = proc
+                    .params
+                    .iter()
+                    .find(|g| g.names.contains(name))
+                    .map_or_else(|| ty.clone(), |g| g.ty.clone());
+                self.note_declared_var(name, &declared);
             }
         }
 
@@ -2451,6 +2505,7 @@ impl<'ctx> CodeGen<'ctx> {
         let (restored_vars, restored_types) = self.saved_scopes.pop().unwrap();
         self.variables = restored_vars;
         self.var_types = restored_types;
+        self.decl_vars = self.saved_decl_vars.pop().unwrap_or_default();
         self.current_fn = saved_fn;
         self.current_scope = saved_scope;
         self.scope_file = saved_scope_file;
@@ -2873,10 +2928,13 @@ impl<'ctx> CodeGen<'ctx> {
         let val = self.convert_for_store(val, ty, span)?;
         // Count the new strings before releasing the old ones: they may
         // be the same.
-        if self.needs_arc(ty) {
-            self.arc_addref_value(val, ty, span)?;
+        let val = if self.needs_arc(ty) {
+            let val = self.arc_addref_value(val, ty, span)?;
             self.arc_release_slot(ptr, ty, span)?;
-        }
+            val
+        } else {
+            val
+        };
         self.builder
             .build_store(ptr, val)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
@@ -2897,9 +2955,11 @@ impl<'ctx> CodeGen<'ctx> {
             return self.store_short_string(ptr, val, max, span);
         }
         let val = self.convert_for_store(val, ty, span)?;
-        if self.needs_arc(ty) {
-            self.arc_addref_value(val, ty, span)?;
-        }
+        let val = if self.needs_arc(ty) {
+            self.arc_addref_value(val, ty, span)?
+        } else {
+            val
+        };
         self.builder
             .build_store(ptr, val)
             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
@@ -3093,7 +3153,14 @@ impl<'ctx> CodeGen<'ctx> {
                     .lookup_var_type(target.as_str())
                     .cloned()
                     .unwrap_or(PascalType::Integer);
-                let val = self.compile_expr_for(expr, &ty)?;
+                // A Variant to a TDateTime variable converts as a date.
+                let date_target = Expr::Var(target.clone(), *span);
+                let val = if self.is_date_var(&date_target) && self.expr_is_variant(expr) {
+                    let v = self.compile_expr(expr)?;
+                    self.variant_to(v, &PascalType::Named("tdatetime".into()), *span)?
+                } else {
+                    self.compile_expr_for(expr, &ty)?
+                };
                 let alloca = *self.lookup_var(target.as_str()).ok_or_else(|| {
                     CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
                 })?;
@@ -3295,6 +3362,15 @@ impl<'ctx> CodeGen<'ctx> {
                 field,
                 expr,
                 span,
+            } if self.expr_is_variant(&Expr::Var(target.clone(), *span)) => {
+                self.set_debug_loc(*span);
+                self.compile_variant_put(&Expr::Var(target.clone(), *span), field, expr, *span)
+            }
+            Statement::FieldAssignment {
+                target,
+                field,
+                expr,
+                span,
             } => {
                 self.set_debug_loc(*span);
                 let place = Expr::FieldAccess {
@@ -3429,6 +3505,10 @@ impl<'ctx> CodeGen<'ctx> {
                 span,
             } => {
                 self.set_debug_loc(*span);
+                if self.expr_is_variant(object) {
+                    self.compile_variant_dispatch(object, method, args, false, *span)?;
+                    return Ok(());
+                }
                 self.compile_method_call(object, method, args, *span)?;
                 Ok(())
             }
@@ -5836,6 +5916,20 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         for arg in &args[start_idx..] {
+            // A zero-based array of Char: up to its #0, as a PChar.
+            let char_array;
+            let arg = if matches!(
+                self.resolve_type(&self.infer_expr_type(&arg.expr)),
+                PascalType::Array { lo: 0, ref elem, .. } if **elem == PascalType::Char
+            ) && self.is_addressable(&arg.expr)
+            {
+                let mut a = arg.clone();
+                a.expr = Expr::AddrOf(Box::new(arg.expr.clone()), arg.expr.span());
+                char_array = a;
+                &char_array
+            } else {
+                arg
+            };
             // A Currency, as FPC formats it.
             if let Some(text) = self.currency_text(arg, span)? {
                 match file_target {
@@ -6634,6 +6728,21 @@ impl<'ctx> CodeGen<'ctx> {
                 "a parenthesised record or array value is only allowed for a typed constant",
                 Some(*span),
             )),
+            Expr::FieldAccess {
+                record: object,
+                field: method,
+                span,
+            } if self.expr_is_variant(object) => {
+                self.compile_variant_dispatch(object, method, &[], true, *span)
+            }
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                span,
+            } if self.expr_is_variant(object) => {
+                self.compile_variant_dispatch(object, method, args, true, *span)
+            }
             Expr::MethodCall {
                 object,
                 method,
@@ -7552,6 +7661,18 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_int_sub(iv, iv.get_type().const_int(1, false), "pred")
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                     return Ok(r.into());
+                }
+                // FPC's default comparison of two values (Generics.Defaults).
+                if name == "brutohash" && args.len() == 1 {
+                    return self.compile_default_hash(&args[0], *span);
+                }
+                if matches!(name.as_str(), "brutocompare" | "brutoequals") && args.len() == 2 {
+                    return self.compile_default_compare(
+                        &args[0],
+                        &args[1],
+                        name == "brutoequals",
+                        *span,
+                    );
                 }
                 // Default(T): T's zero value (nil, 0, '', a zeroed record).
                 if name == "default"
@@ -10232,6 +10353,12 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Var(name, span) if name.starts_with("system.") => {
                 self.infer_declared_type(&Expr::Var(name["system.".len()..].to_string(), *span))
             }
+            // `V.Name`, `V.Name(Args)`: late bound, a Variant.
+            Expr::FieldAccess { record: object, .. } | Expr::MethodCall { object, .. }
+                if self.expr_is_variant(object) =>
+            {
+                PascalType::Variant
+            }
             Expr::IndirectCall { callee, .. } => {
                 match self.resolve_type(&self.infer_declared_type(callee)) {
                     PascalType::Proc {
@@ -10508,7 +10635,12 @@ impl<'ctx> CodeGen<'ctx> {
                         };
                         self.type_of_name(n).unwrap()
                     }
-                    "low" | "high" | "sizeof" => PascalType::Integer,
+                    "low" | "high" | "sizeof" | "brutocompare" => PascalType::Integer,
+                    "brutoequals" => PascalType::Boolean,
+                    "brutohash" => PascalType::SizedInt {
+                        bits: 64,
+                        signed: false,
+                    },
                     "sqrt" | "sin" | "cos" | "arctan" | "exp" | "ln" | "frac" => PascalType::Real,
                     "int" if args.len() == 1 => PascalType::Real,
                     _ => self
@@ -10655,6 +10787,17 @@ impl<'ctx> CodeGen<'ctx> {
                     total += 2;
                     continue;
                 }
+                // `@Routine` fits a procedural type, `@Obj.Method` a
+                // method pointer (`of object`) better.
+                if let (PascalType::Proc { of_object, .. }, Expr::AddrOf(inner, _)) = (&param, arg)
+                {
+                    let plain = matches!(inner.as_ref(), Expr::Var(n, _)
+                        if self.lookup_var(n).is_none()
+                            && (self.module.get_function(n).is_some()
+                                || self.overloads.contains_key(n)));
+                    total += if *of_object != plain { 2 } else { 1 };
+                    continue;
+                }
                 match (&param, &arg_ty) {
                     (
                         PascalType::Integer | PascalType::SizedInt { .. },
@@ -10670,6 +10813,21 @@ impl<'ctx> CodeGen<'ctx> {
                         PascalType::String | PascalType::ShortString { .. },
                     ) => 2,
                     (PascalType::Pointer(_) | PascalType::Proc { .. }, PascalType::Pointer(_)) => 1,
+                    // An array for an open array parameter: of its type
+                    // best, `[...]` too.
+                    (
+                        PascalType::OpenArray(want),
+                        PascalType::DynArray(have)
+                        | PascalType::OpenArray(have)
+                        | PascalType::Array { elem: have, .. },
+                    ) => {
+                        if self.resolve_type(want) == self.resolve_type(have) {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    (PascalType::OpenArray(_), PascalType::Set { .. }) => 1,
                     (PascalType::Char, PascalType::String) => 1,
                     (
                         PascalType::Enum { .. } | PascalType::Subrange { .. },

@@ -1374,6 +1374,10 @@ impl Parser {
                 Tok::Ident(w) if lexer.int32 && w.eq_ignore_ascii_case("maxint") => {
                     Tok::IntLit(i32::MAX as i64)
                 }
+                // `PInteger` is `^Integer`: a `PLongInt` there.
+                Tok::Ident(w) if lexer.int32 && w.eq_ignore_ascii_case("pinteger") => {
+                    Tok::Ident("PLongInt".to_string())
+                }
                 other => other,
             };
             tokens.push((tok, span));

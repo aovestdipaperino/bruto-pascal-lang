@@ -389,6 +389,7 @@ type
     procedure WriteWideString(const Value: UnicodeString);
     procedure WriteSingle(const Value: Single);
     procedure WriteCurrency(const Value: Currency);
+    procedure WriteDate(const Value: TDateTime);
     procedure WriteUInt64(Value: QWord);
     procedure WriteVariant(const VarValue: Variant);
     procedure WriteMethodName(const Name: string);
@@ -428,6 +429,7 @@ type
     function ReadFloat: Double;
     function ReadSingle: Single;
     function ReadCurrency: Currency;
+    function ReadDate: TDateTime;
     function ReadWideString: UnicodeString;
     function ReadVariant: Variant;
     function ReadChar: Char;
@@ -2826,6 +2828,13 @@ begin
   FStream.WriteBuffer(Value, 8);
 end;
 
+{ A date: vaDate and the TDateTime's 8 bytes, as FPC writes it. }
+procedure TWriter.WriteDate(const Value: TDateTime);
+begin
+  WriteValue(vaDate);
+  FStream.WriteBuffer(Value, 8);
+end;
+
 procedure TWriter.WriteUInt64(Value: QWord);
 begin
   if Value <= $7FFFFFFF then
@@ -2856,6 +2865,7 @@ begin
     varSingle: WriteSingle(D^.VSingle);
     varDouble: WriteFloat(D^.VDouble);
     varCurrency: WriteCurrency(D^.VCurrency);
+    varDate: WriteDate(D^.VDate);
     varOleStr: WriteWideString(UnicodeString(D^.VOleStr));
     varString: WriteWideString(UnicodeString(AnsiString(D^.VString)));
   else
@@ -3085,6 +3095,17 @@ begin
   end;
 end;
 
+function TReader.ReadDate: TDateTime;
+begin
+  if NextValue = vaDate then
+  begin
+    ReadValue;
+    FStream.ReadBuffer(Result, 8);
+  end
+  else
+    Result := ReadFloat;
+end;
+
 function TReader.ReadCurrency: Currency;
 begin
   if NextValue = vaCurrency then
@@ -3177,6 +3198,11 @@ begin
       begin
         D^.VType := varCurrency;
         D^.VCurrency := ReadCurrency;
+      end;
+    vaDate:
+      begin
+        D^.VType := varDate;
+        D^.VDate := ReadDate;
       end;
     vaWString, vaUTF8String, vaUString:
       begin

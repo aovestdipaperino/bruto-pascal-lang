@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::ast::Span;
+
 /// The file id of the program being compiled.
 pub const MAIN_FILE: u32 = 0;
 
@@ -76,4 +78,33 @@ pub fn describe(line: u32, column: u32, file: u32) -> String {
         }
         None => format!("line {line}:{column}"),
     }
+}
+
+/// The spellings of member names (`V.Name`), by the span of their
+/// expression and the lower-cased name: a late-bound call on a Variant
+/// passes the name as written, as FPC does.
+static MEMBER_SPELLINGS: Mutex<Option<std::collections::HashMap<(Span, String), String>>> =
+    Mutex::new(None);
+
+/// Note the spelling of the member `name` used at `span`.
+pub fn note_member(span: Span, name: &str) {
+    let lower = name.to_ascii_lowercase();
+    if lower == name {
+        return;
+    }
+    MEMBER_SPELLINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((span, lower), name.to_string());
+}
+
+/// The spelling of the (lower-cased) member `name` used at `span`.
+pub fn member_spelling(span: Span, name: &str) -> String {
+    MEMBER_SPELLINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&(span, name.to_string())).cloned())
+        .unwrap_or_else(|| name.to_string())
 }

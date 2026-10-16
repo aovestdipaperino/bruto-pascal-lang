@@ -54,46 +54,45 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Count the strings in `val` (of type `ty`), about to be stored.
+    /// Count the strings in `val` (of type `ty`), about to be stored: the
+    /// value to store. (A custom variant is copied by its handler, so a
+    /// Variant, or an aggregate holding one, comes back as the copy.)
     pub(super) fn arc_addref_value(
         &mut self,
         val: BasicValueEnum<'ctx>,
         ty: &PascalType,
         span: Span,
-    ) -> Result<(), CodeGenError> {
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         match self.resolve_type(ty) {
             PascalType::String | PascalType::DynArray(_) if val.is_pointer_value() => {
-                self.arc_call("bruto_astr_addref", val.into_pointer_value(), span)
+                self.arc_call("bruto_astr_addref", val.into_pointer_value(), span)?;
+                Ok(val)
             }
-            PascalType::String | PascalType::DynArray(_) => Ok(()),
+            PascalType::String | PascalType::DynArray(_) => Ok(val),
             PascalType::UnicodeString if self.is_ustr(val) => {
                 let p = self.ustr_ptr(val, span)?;
-                self.arc_call("bruto_astr_addref", p, span)
+                self.arc_call("bruto_astr_addref", p, span)?;
+                Ok(val)
             }
-            PascalType::UnicodeString => Ok(()),
-            PascalType::Variant => {
-                let temp = self
-                    .entry_alloca(self.variant_type(), "var_tmp")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                self.builder
-                    .build_store(temp, val)
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                self.arc_call("bruto_var_addref", temp, span)
-            }
+            PascalType::UnicodeString => Ok(val),
             PascalType::Interface(_) => {
                 let (obj, itable) = self.interface_parts(val, span)?;
                 self.call_ustr_runtime("bruto_intf_addref", &[obj.into(), itable.into()], span)?;
-                Ok(())
+                Ok(val)
             }
             resolved => {
-                // An aggregate: from a temporary copy.
-                let temp = self
-                    .entry_alloca(val.get_type(), "arc_tmp")
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                // A Variant or an aggregate: in a temporary copy, read back.
+                let temp = self.entry_alloca(val.get_type(), "arc_tmp").map_err(err)?;
+                self.builder.build_store(temp, val).map_err(err)?;
+                if resolved == PascalType::Variant {
+                    self.arc_call("bruto_var_addref", temp, span)?;
+                } else {
+                    self.arc_walk(temp, &resolved, "bruto_astr_addref", span)?;
+                }
                 self.builder
-                    .build_store(temp, val)
-                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
-                self.arc_walk(temp, &resolved, "bruto_astr_addref", span)
+                    .build_load(val.get_type(), temp, "arc_copy")
+                    .map_err(err)
             }
         }
     }

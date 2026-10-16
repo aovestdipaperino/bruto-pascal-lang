@@ -4,7 +4,7 @@
 /// Source location (1-based line and column), plus the file it is in:
 /// 0 for the program being compiled, otherwise an id from
 /// [`crate::source_map`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Span {
     pub line: u32,
     pub column: u32,

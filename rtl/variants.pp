@@ -46,6 +46,84 @@ type
     opShiftLeft, opShiftRight, opAnd, opOr, opXor, opCompare, opNegate,
     opNot, opCmpEq, opCmpNe, opCmpLt, opCmpLe, opCmpGt, opCmpGe, opPower);
 
+  TVarCompareResult = (crLessThan, crEqual, crGreaterThan);
+  TVarDataArray = array of TVarData;
+
+  { A custom variant type: variants whose VType is the handler's VarType
+    are copied, cleared, converted and operated on by it (FPC's). }
+  TCustomVariantType = class(TObject)
+  private
+    FVarType: TVarType;
+  protected
+    procedure RaiseInvalidOp;
+    procedure RaiseCastError;
+    procedure RaiseDispError;
+    function LeftPromotion(const V: TVarData; const Operation: TVarOp;
+      out RequiredVarType: TVarType): Boolean; virtual;
+    function RightPromotion(const V: TVarData; const Operation: TVarOp;
+      out RequiredVarType: TVarType): Boolean; virtual;
+    procedure VarDataInit(var Dest: TVarData);
+    procedure VarDataClear(var Dest: TVarData);
+    procedure VarDataCopy(var Dest: TVarData; const Source: TVarData);
+    procedure VarDataCopyNoInd(var Dest: TVarData; const Source: TVarData);
+    procedure VarDataCast(var Dest: TVarData; const Source: TVarData);
+    procedure VarDataCastTo(var Dest: TVarData; const Source: TVarData;
+      const AVarType: TVarType); overload;
+    procedure VarDataCastTo(var Dest: TVarData; const AVarType: TVarType); overload;
+    procedure VarDataCastToOleStr(var Dest: TVarData);
+    procedure VarDataFromStr(var V: TVarData; const Value: string);
+    procedure VarDataFromOleStr(var V: TVarData; const Value: UnicodeString);
+    function VarDataToStr(const V: TVarData): string;
+    function VarDataIsEmptyParam(const V: TVarData): Boolean;
+    function VarDataIsByRef(const V: TVarData): Boolean;
+    function VarDataIsArray(const V: TVarData): Boolean;
+    function VarDataIsOrdinal(const V: TVarData): Boolean;
+    function VarDataIsFloat(const V: TVarData): Boolean;
+    function VarDataIsNumeric(const V: TVarData): Boolean;
+    function VarDataIsStr(const V: TVarData): Boolean;
+  public
+    constructor Create; overload;
+    constructor Create(RequestedVarType: TVarType); overload;
+    destructor Destroy; override;
+    function IsClear(const V: TVarData): Boolean; virtual;
+    procedure Cast(var Dest: TVarData; const Source: TVarData); virtual;
+    procedure CastTo(var Dest: TVarData; const Source: TVarData;
+      const AVarType: TVarType); virtual;
+    procedure Clear(var V: TVarData); virtual; abstract;
+    procedure Copy(var Dest: TVarData; const Source: TVarData;
+      const Indirect: Boolean); virtual; abstract;
+    procedure BinaryOp(var Left: TVarData; const Right: TVarData;
+      const Operation: TVarOp); virtual;
+    procedure UnaryOp(var Right: TVarData; const Operation: TVarOp); virtual;
+    function CompareOp(const Left, Right: TVarData;
+      const Operation: TVarOp): Boolean; virtual;
+    procedure Compare(const Left, Right: TVarData;
+      var Relationship: TVarCompareResult); virtual;
+    property VarType: TVarType read FVarType;
+  end;
+  TCustomVariantTypeClass = class of TCustomVariantType;
+
+  { A custom variant type whose values have methods and properties:
+    V.Name, V.Name(Args) and V.Name := X call these (late binding). }
+  TInvokeableVariantType = class(TCustomVariantType)
+  public
+    function DoFunction(var Dest: TVarData; const V: TVarData; const Name: string;
+      const Arguments: TVarDataArray): Boolean; virtual;
+    function DoProcedure(const V: TVarData; const Name: string;
+      const Arguments: TVarDataArray): Boolean; virtual;
+    function GetProperty(var Dest: TVarData; const V: TVarData;
+      const Name: string): Boolean; virtual;
+    function SetProperty(var V: TVarData; const Name: string;
+      const Value: TVarData): Boolean; virtual;
+  end;
+
+const
+  CMaxNumberOfCustomVarTypes = $06FF;
+  CMinVarType = $0100;
+  CMaxVarType = CMinVarType + CMaxNumberOfCustomVarTypes;
+  CIncVarType = $000F;
+  CFirstUserType = CMinVarType + CIncVarType;
+
 var
   NullEqualityRule: TNullCompareRule = ncrLoose;
   NullMagnitudeRule: TNullCompareRule = ncrLoose;
@@ -85,6 +163,23 @@ procedure VarArrayRedim(var A: Variant; HighBound: SizeInt);
 function Unassigned: Variant;
 function Null: Variant;
 
+function FindCustomVariantType(const AVarType: TVarType;
+  out CustomVariantType: TCustomVariantType): Boolean; overload;
+function FindCustomVariantType(const TypeName: string;
+  out CustomVariantType: TCustomVariantType): Boolean; overload;
+{ Dates in variants (varDate). }
+function VarFromDateTime(const DateTime: TDateTime): Variant;
+function VarToDateTime(const V: Variant): TDateTime;
+function VarIsCustom(const V: Variant): Boolean;
+{ A variant referring to array A's data (varByRef). }
+function VarArrayRef(const A: Variant): Variant;
+{ The array's elements, to read or write directly until VarArrayUnlock:
+  TVarData elements for an array of variants, else the element type's
+  own values. }
+function VarArrayLock(const A: Variant): Pointer;
+procedure VarArrayUnlock(const A: Variant);
+procedure VarDispInvokeError;
+
 procedure VarCastError;
 procedure VarCastError(const ASourceType, ADestType: TVarType);
 procedure VarInvalidOp;
@@ -109,6 +204,7 @@ procedure bruto_var_from_ustr(Res: Pointer; S: Pointer);
 procedure bruto_var_from_bool(Res: Pointer; B: Int64);
 function bruto_var_to_int(P: Pointer): Int64;
 function bruto_var_to_double(P: Pointer): Double;
+function bruto_var_to_date(P: Pointer): Double;
 function bruto_var_to_curr(P: Pointer): Int64;
 function bruto_var_to_bool(P: Pointer): Int64;
 function bruto_var_to_str(P: Pointer): AnsiString;
@@ -118,6 +214,10 @@ function bruto_var_cmp(L, R: Pointer; Op: Int64): Int64;
 procedure bruto_var_unary(Res, P: Pointer; Op: Int64);
 procedure bruto_var_array_get(Res, A, Indices: Pointer; Count: Int64);
 procedure bruto_var_array_put(A, Indices: Pointer; Count: Int64; V: Pointer);
+procedure bruto_var_from_date(Res: Pointer; V: Double);
+{ V.Name(Args) (Kind 1; Res nil without a result) or V.Name := Args[0]
+  (Kind 4), on a custom invokeable variant. }
+procedure bruto_var_dispatch(Res, V: Pointer; Name: PChar; Args: Pointer; Count, Kind: Int64);
 
 implementation
 
@@ -245,11 +345,14 @@ end;
 procedure ClearData(var D: TVarData);
 begin
   if (D.VType = varString) or (D.VType = varOleStr) or (D.VType = varUString)
-    or ((D.VType and varArray) <> 0) then
+    or ((D.VType and (varArray or varByRef)) = varArray) then
   begin
     bruto_var_release(@D);
     D.VString := nil;
-  end;
+  end
+  else if (D.VType >= CFirstUserType) and (D.VType <= CMaxVarType) then
+    { A custom variant: its handler clears it. }
+    bruto_var_release(@D);
   D.VType := varEmpty;
 end;
 
@@ -314,6 +417,118 @@ begin
   D.VBoolean := V;
 end;
 
+{ ── Custom variant types ───────────────────────────────────── }
+
+var
+  CustomTypes: array of TCustomVariantType;
+  { Slots of handlers that were freed: not reused. }
+  CustomFreed: array of Boolean;
+  NextCustomType: Integer = CFirstUserType - 1;
+
+function FindCustomVariantType(const AVarType: TVarType;
+  out CustomVariantType: TCustomVariantType): Boolean;
+var
+  I: Integer;
+begin
+  CustomVariantType := nil;
+  I := Integer(AVarType and varTypeMask) - CMinVarType;
+  Result := (AVarType and (varArray or varByRef)) = 0;
+  if Result then
+    Result := (I >= 0) and (I < Length(CustomTypes)) and (CustomTypes[I] <> nil)
+      and not CustomFreed[I];
+  if Result then
+    CustomVariantType := CustomTypes[I];
+end;
+
+function FindCustomVariantType(const TypeName: string;
+  out CustomVariantType: TCustomVariantType): Boolean;
+var
+  I: Integer;
+begin
+  CustomVariantType := nil;
+  for I := 0 to High(CustomTypes) do
+    if (CustomTypes[I] <> nil) and not CustomFreed[I]
+      and (CompareText(CustomTypes[I].ClassName, TypeName) = 0) then
+    begin
+      CustomVariantType := CustomTypes[I];
+      Exit(True);
+    end;
+  Result := False;
+end;
+
+{ The handler of D's type, or nil. }
+function CustomOf(const D: TVarData): TCustomVariantType;
+begin
+  if not FindCustomVariantType(D.VType, Result) then
+    Result := nil;
+end;
+
+{ Copies (Op 1) or clears (Op 2) the custom variant at P, for the
+  compiler's reference counting: assigning one copies it, as in FPC. }
+procedure CustomVariantHook(P: Pointer; Op: LongInt);
+var
+  H: TCustomVariantType;
+  T: TVarData;
+begin
+  H := CustomOf(PVarData(P)^);
+  if H = nil then
+    Exit;
+  if Op = 1 then
+  begin
+    FillChar(T, SizeOf(T), 0);
+    H.Copy(T, PVarData(P)^, False);
+    Move(T, P^, SizeOf(TVarData));
+  end
+  else
+    H.Clear(PVarData(P)^);
+end;
+
+{ The value a varByRef variant D refers to (its bits, not a copy). }
+function Deref(const D: TVarData): TVarData;
+var
+  T: TVarType;
+  Size: Integer;
+begin
+  T := D.VType and not varByRef;
+  FillChar(Result, SizeOf(Result), 0);
+  if D.VPointer = nil then
+    VarInvalidArgError;
+  if T = varVariant then
+  begin
+    Move(D.VPointer^, Result, SizeOf(TVarData));
+    if (Result.VType and varByRef) <> 0 then
+      Result := Deref(Result);
+    Exit;
+  end;
+  Result.VType := T;
+  if (T and varArray) <> 0 then
+    Size := SizeOf(Pointer)
+  else
+    case T of
+      varShortInt, varByte: Size := 1;
+      varSmallInt, varWord, varBoolean: Size := 2;
+      varInteger, varLongWord, varSingle: Size := 4;
+    else
+      Size := 8;
+    end;
+  Move(D.VPointer^, Result.VInt64, Size);
+  if T = varBoolean then
+    Result.VInt64 := Ord(Result.VWord <> 0);
+end;
+
+function IsRef(const D: TVarData): Boolean;
+begin
+  Result := (D.VType and varByRef) <> 0;
+end;
+
+{ D converted by its handler to AType, into T (which the caller clears). }
+procedure CustomCastTo(H: TCustomVariantType; const D: TVarData; AType: TVarType;
+  out T: TVarData);
+begin
+  FillChar(T, SizeOf(T), 0);
+  H.CastTo(T, D, AType);
+end;
+
 { ── Variant arrays ─────────────────────────────────────────── }
 
 { A variant array's data is a dynamic array of TVarData: first a header
@@ -325,8 +540,8 @@ end;
   releasing and counting the block's entries passes over them. }
 
 type
-  TVarDataArray = array[0..$FFFFFF] of TVarData;
-  PVarDataArray = ^TVarDataArray;
+  TVarElements = array[0..$FFFFFF] of TVarData;
+  PVarElements = ^TVarElements;
   TInt64Array = array[0..$FFFF] of Int64;
   PInt64Array = ^TInt64Array;
 
@@ -337,7 +552,7 @@ begin
   I := 0;
   while I < Count do
   begin
-    bruto_var_release(@PVarDataArray(P)^[I]);
+    bruto_var_release(@PVarElements(P)^[I]);
     I := I + 1;
   end;
 end;
@@ -349,24 +564,24 @@ begin
   I := 0;
   while I < Count do
   begin
-    bruto_var_addref(@PVarDataArray(P)^[I]);
+    bruto_var_addref(@PVarElements(P)^[I]);
     I := I + 1;
   end;
 end;
 
 function DimsOf(Data: Pointer): Int64;
 begin
-  Result := PVarDataArray(Data)^[0].VInt64;
+  Result := PVarElements(Data)^[0].VInt64;
 end;
 
 function DimLow(Data: Pointer; Dim: Int64): Int64;
 begin
-  Result := PLongInt(@PVarDataArray(Data)^[Dim].Reserved2)^;
+  Result := PLongInt(@PVarElements(Data)^[Dim].Reserved2)^;
 end;
 
 function DimCount(Data: Pointer; Dim: Int64): Int64;
 begin
-  Result := PVarDataArray(Data)^[Dim].VInt64;
+  Result := PVarElements(Data)^[Dim].VInt64;
 end;
 
 { The number of elements of array data Data. }
@@ -392,15 +607,15 @@ begin
     Total := Total * Counts[I];
   Result := bruto_dynarr_owned(1 + Dims + Total, SizeOf(TVarData), @ReleaseElements,
     @AddrefElements);
-  PVarDataArray(Result)^[0].VInt64 := Dims;
+  PVarElements(Result)^[0].VInt64 := Dims;
   for I := 0 to Dims - 1 do
   begin
-    PLongInt(@PVarDataArray(Result)^[I + 1].Reserved2)^ := Lows[I];
-    PVarDataArray(Result)^[I + 1].VInt64 := Counts[I];
+    PLongInt(@PVarElements(Result)^[I + 1].Reserved2)^ := Lows[I];
+    PVarElements(Result)^[I + 1].VInt64 := Counts[I];
   end;
   if ElemType <> varVariant then
     for I := 1 + Dims to Dims + Total do
-      PVarDataArray(Result)^[I].VType := ElemType;
+      PVarElements(Result)^[I].VType := ElemType;
 end;
 
 { A copy of array data Data (of elements of type ElemType), its last
@@ -425,9 +640,9 @@ begin
   I := 0;
   while (I < OldTotal) and (I < NewTotal) do
   begin
-    Move(PVarDataArray(Data)^[1 + Dims + I], PVarDataArray(Result)^[1 + Dims + I],
+    Move(PVarElements(Data)^[1 + Dims + I], PVarElements(Result)^[1 + Dims + I],
       SizeOf(TVarData));
-    bruto_var_addref(@PVarDataArray(Result)^[1 + Dims + I]);
+    bruto_var_addref(@PVarElements(Result)^[1 + Dims + I]);
     I := I + 1;
   end;
 end;
@@ -455,7 +670,7 @@ begin
     Flat := Flat + K * Stride;
     Stride := Stride * DimCount(Data, I);
   end;
-  Result := @PVarDataArray(Data)^[1 + Dims + Flat];
+  Result := @PVarElements(Data)^[1 + Dims + Flat];
 end;
 
 { Make the array in D its own (copied when it is shared). }
@@ -519,7 +734,21 @@ begin
 end;
 
 function VariantToInt64(const D: TVarData): Int64;
+var
+  T: TVarData;
 begin
+  if IsRef(D) then
+    Exit(VariantToInt64(Deref(D)));
+  if CustomOf(D) <> nil then
+  begin
+    CustomCastTo(CustomOf(D), D, varInt64, T);
+    try
+      Result := VariantToInt64(T);
+    finally
+      ClearData(T);
+    end;
+    Exit;
+  end;
   case D.VType of
     varEmpty: Result := 0;
     varSmallInt: Result := D.VSmallInt;
@@ -542,7 +771,21 @@ begin
 end;
 
 function VariantToDouble(const D: TVarData): Double;
+var
+  T: TVarData;
 begin
+  if IsRef(D) then
+    Exit(VariantToDouble(Deref(D)));
+  if CustomOf(D) <> nil then
+  begin
+    CustomCastTo(CustomOf(D), D, varDouble, T);
+    try
+      Result := VariantToDouble(T);
+    finally
+      ClearData(T);
+    end;
+    Exit;
+  end;
   case D.VType of
     varEmpty: Result := 0;
     varSmallInt: Result := D.VSmallInt;
@@ -565,7 +808,21 @@ begin
 end;
 
 function VariantToCurrency(const D: TVarData): Currency;
+var
+  T: TVarData;
 begin
+  if IsRef(D) then
+    Exit(VariantToCurrency(Deref(D)));
+  if CustomOf(D) <> nil then
+  begin
+    CustomCastTo(CustomOf(D), D, varCurrency, T);
+    try
+      Result := VariantToCurrency(T);
+    finally
+      ClearData(T);
+    end;
+    Exit;
+  end;
   case D.VType of
     varCurrency: PInt64(@Result)^ := D.VInt64;
     varSingle, varDouble, varDate, varOleStr, varUString, varString:
@@ -575,8 +832,47 @@ begin
   end;
 end;
 
-function VariantToBoolean(const D: TVarData): Boolean;
+{ D as a date: a string is read with StrToDateTime, as in FPC. }
+function VariantToDate(const D: TVarData): TDateTime;
+var
+  T: TVarData;
 begin
+  if IsRef(D) then
+    Exit(VariantToDate(Deref(D)));
+  if CustomOf(D) <> nil then
+  begin
+    CustomCastTo(CustomOf(D), D, varDate, T);
+    try
+      Result := VariantToDate(T);
+    finally
+      ClearData(T);
+    end;
+    Exit;
+  end;
+  case D.VType of
+    varOleStr, varUString: Result := StrToDateTime(AnsiString(UnicodeString(D.VOleStr)));
+    varString: Result := StrToDateTime(AnsiString(D.VString));
+  else
+    Result := VariantToDouble(D);
+  end;
+end;
+
+function VariantToBoolean(const D: TVarData): Boolean;
+var
+  T: TVarData;
+begin
+  if IsRef(D) then
+    Exit(VariantToBoolean(Deref(D)));
+  if CustomOf(D) <> nil then
+  begin
+    CustomCastTo(CustomOf(D), D, varBoolean, T);
+    try
+      Result := VariantToBoolean(T);
+    finally
+      ClearData(T);
+    end;
+    Exit;
+  end;
   case D.VType of
     varEmpty: Result := False;
     varSmallInt: Result := D.VSmallInt <> 0;
@@ -603,14 +899,34 @@ begin
 end;
 
 function VariantToAnsiString(const D: TVarData): AnsiString;
+var
+  T: TVarData;
 begin
+  if IsRef(D) then
+    Exit(VariantToAnsiString(Deref(D)));
+  if CustomOf(D) <> nil then
+  begin
+    CustomCastTo(CustomOf(D), D, varString, T);
+    try
+      Result := VariantToAnsiString(T);
+    finally
+      ClearData(T);
+    end;
+    Exit;
+  end;
   case D.VType of
     varEmpty: Result := '';
     varSmallInt: Result := IntToStr(D.VSmallInt);
     varShortInt: Result := IntToStr(D.VShortInt);
     varInteger: Result := IntToStr(D.VInteger);
     varSingle: Result := FloatToStr(D.VSingle);
-    varDouble, varDate: Result := FloatToStr(D.VDouble);
+    varDouble: Result := FloatToStr(D.VDouble);
+    { As FPC's VarDateToString: a time alone when there's no day. }
+    varDate:
+      if Trunc(D.VDate) = 0 then
+        Result := TimeToStr(D.VDate)
+      else
+        Result := DateTimeToStr(D.VDate);
     varCurrency: Result := CurrToStr(D.VCurrency);
     varBoolean: Result := BoolToStr(D.VBoolean, True);
     varByte: Result := IntToStr(D.VByte);
@@ -627,6 +943,8 @@ end;
 
 function VariantToUnicodeString(const D: TVarData): UnicodeString;
 begin
+  if IsRef(D) then
+    Exit(VariantToUnicodeString(Deref(D)));
   if (D.VType = varOleStr) or (D.VType = varUString) then
     Result := UnicodeString(D.VOleStr)
   else
@@ -637,7 +955,13 @@ end;
 procedure CastData(var R: TVarData; const D: TVarData; AType: TVarType);
 var
   I: Int64;
+  H: TCustomVariantType;
 begin
+  if IsRef(D) then
+  begin
+    CastData(R, Deref(D), AType);
+    Exit;
+  end;
   if D.VType = AType then
   begin
     CopyData(R, D);
@@ -651,6 +975,18 @@ begin
   end;
   if (D.VType and varArray) <> 0 then
     VarCastError(D.VType, AType);
+  { Into or out of a custom type: by its handler. }
+  if FindCustomVariantType(AType, H) then
+  begin
+    H.Cast(R, D);
+    Exit;
+  end;
+  H := CustomOf(D);
+  if H <> nil then
+  begin
+    H.CastTo(R, D, AType);
+    Exit;
+  end;
   case AType of
     varEmpty: R.VType := varEmpty;
     varNull: R.VType := varNull;
@@ -677,10 +1013,15 @@ begin
         R.VInt64 := 0;
         R.VSingle := VariantToDouble(D);
       end;
-    varDouble, varDate:
+    varDouble:
       begin
-        R.VType := AType;
+        R.VType := varDouble;
         R.VDouble := VariantToDouble(D);
+      end;
+    varDate:
+      begin
+        R.VType := varDate;
+        R.VDate := VariantToDate(D);
       end;
     varCurrency:
       begin
@@ -693,6 +1034,268 @@ begin
   else
     VarCastError(D.VType, AType);
   end;
+end;
+
+constructor TCustomVariantType.Create;
+begin
+  inherited Create;
+  repeat
+    Inc(NextCustomType);
+    if NextCustomType >= CMaxVarType then
+      raise EVariantError.Create('Too many custom variant types have been registered');
+  until (NextCustomType - CMinVarType >= Length(CustomTypes))
+    or (CustomTypes[NextCustomType - CMinVarType] = nil);
+  Create(TVarType(NextCustomType));
+end;
+
+constructor TCustomVariantType.Create(RequestedVarType: TVarType);
+var
+  I: Integer;
+begin
+  inherited Create;
+  if (RequestedVarType < CFirstUserType) or (RequestedVarType > CMaxVarType) then
+    raise EVariantError.Create('Custom variant type ($' + IntToHex(RequestedVarType, 4)
+      + ') is out of range');
+  I := RequestedVarType - CMinVarType;
+  if I >= Length(CustomTypes) then
+  begin
+    SetLength(CustomTypes, I + 1);
+    SetLength(CustomFreed, I + 1);
+  end;
+  if CustomFreed[I] then
+    raise EVariantError.Create('Custom variant type ($' + IntToHex(RequestedVarType, 4)
+      + ') is not usable');
+  if CustomTypes[I] <> nil then
+    raise EVariantError.Create('Custom variant type ($' + IntToHex(RequestedVarType, 4)
+      + ') already used by ' + CustomTypes[I].ClassName);
+  CustomTypes[I] := Self;
+  FVarType := RequestedVarType;
+end;
+
+destructor TCustomVariantType.Destroy;
+begin
+  if FVarType <> 0 then
+    CustomFreed[FVarType - CMinVarType] := True;
+  inherited Destroy;
+end;
+
+procedure TCustomVariantType.RaiseInvalidOp;
+begin
+  VarInvalidOp;
+end;
+
+procedure TCustomVariantType.RaiseCastError;
+begin
+  VarCastError;
+end;
+
+procedure TCustomVariantType.RaiseDispError;
+begin
+  VarDispInvokeError;
+end;
+
+function TCustomVariantType.LeftPromotion(const V: TVarData; const Operation: TVarOp;
+  out RequiredVarType: TVarType): Boolean;
+begin
+  RequiredVarType := FVarType;
+  Result := True;
+end;
+
+function TCustomVariantType.RightPromotion(const V: TVarData; const Operation: TVarOp;
+  out RequiredVarType: TVarType): Boolean;
+begin
+  RequiredVarType := FVarType;
+  Result := True;
+end;
+
+procedure TCustomVariantType.VarDataInit(var Dest: TVarData);
+begin
+  FillChar(Dest, SizeOf(Dest), 0);
+end;
+
+procedure TCustomVariantType.VarDataClear(var Dest: TVarData);
+begin
+  ClearData(Dest);
+end;
+
+procedure TCustomVariantType.VarDataCopy(var Dest: TVarData; const Source: TVarData);
+begin
+  if @Dest = @Source then
+    Exit;
+  ClearData(Dest);
+  CopyData(Dest, Source);
+end;
+
+procedure TCustomVariantType.VarDataCopyNoInd(var Dest: TVarData; const Source: TVarData);
+begin
+  VarDataCopy(Dest, Source);
+end;
+
+procedure TCustomVariantType.VarDataCast(var Dest: TVarData; const Source: TVarData);
+begin
+  VarDataCastTo(Dest, Source, FVarType);
+end;
+
+procedure TCustomVariantType.VarDataCastTo(var Dest: TVarData; const Source: TVarData;
+  const AVarType: TVarType);
+var
+  T: TVarData;
+begin
+  FillChar(T, SizeOf(T), 0);
+  CastData(T, Source, AVarType);
+  ClearData(Dest);
+  Move(T, Dest, SizeOf(TVarData));
+end;
+
+procedure TCustomVariantType.VarDataCastTo(var Dest: TVarData; const AVarType: TVarType);
+begin
+  VarDataCastTo(Dest, Dest, AVarType);
+end;
+
+procedure TCustomVariantType.VarDataCastToOleStr(var Dest: TVarData);
+begin
+  VarDataCastTo(Dest, Dest, varOleStr);
+end;
+
+procedure TCustomVariantType.VarDataFromStr(var V: TVarData; const Value: string);
+begin
+  SetStr(V, Value);
+end;
+
+procedure TCustomVariantType.VarDataFromOleStr(var V: TVarData; const Value: UnicodeString);
+begin
+  SetUStr(V, Value);
+end;
+
+function TCustomVariantType.VarDataToStr(const V: TVarData): string;
+begin
+  Result := VariantToAnsiString(V);
+end;
+
+function TCustomVariantType.VarDataIsEmptyParam(const V: TVarData): Boolean;
+begin
+  Result := (V.VType = varError) and (V.VInteger = LongInt($80020004));
+end;
+
+function TCustomVariantType.VarDataIsByRef(const V: TVarData): Boolean;
+begin
+  Result := (V.VType and varByRef) <> 0;
+end;
+
+function TCustomVariantType.VarDataIsArray(const V: TVarData): Boolean;
+begin
+  Result := (V.VType and varArray) <> 0;
+end;
+
+function TCustomVariantType.VarDataIsOrdinal(const V: TVarData): Boolean;
+begin
+  case V.VType and varTypeMask of
+    varSmallInt, varInteger, varBoolean, varShortInt, varByte, varWord,
+    varLongWord, varInt64, varQWord: Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function TCustomVariantType.VarDataIsFloat(const V: TVarData): Boolean;
+begin
+  case V.VType and varTypeMask of
+    varSingle, varDouble, varCurrency, varDecimal: Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function TCustomVariantType.VarDataIsNumeric(const V: TVarData): Boolean;
+begin
+  Result := VarDataIsOrdinal(V) or VarDataIsFloat(V);
+end;
+
+function TCustomVariantType.VarDataIsStr(const V: TVarData): Boolean;
+begin
+  Result := ((V.VType and varTypeMask) = varOleStr) or ((V.VType and varTypeMask) = varString);
+end;
+
+function TCustomVariantType.IsClear(const V: TVarData): Boolean;
+begin
+  Result := False;
+end;
+
+procedure TCustomVariantType.Cast(var Dest: TVarData; const Source: TVarData);
+begin
+  RaiseCastError;
+end;
+
+procedure TCustomVariantType.CastTo(var Dest: TVarData; const Source: TVarData;
+  const AVarType: TVarType);
+begin
+  RaiseCastError;
+end;
+
+procedure TCustomVariantType.BinaryOp(var Left: TVarData; const Right: TVarData;
+  const Operation: TVarOp);
+begin
+  RaiseInvalidOp;
+end;
+
+procedure TCustomVariantType.UnaryOp(var Right: TVarData; const Operation: TVarOp);
+begin
+  RaiseInvalidOp;
+end;
+
+function TCustomVariantType.CompareOp(const Left, Right: TVarData;
+  const Operation: TVarOp): Boolean;
+var
+  R: TVarCompareResult;
+begin
+  R := crEqual;
+  Compare(Left, Right, R);
+  case Operation of
+    opCmpEq: Result := R = crEqual;
+    opCmpNe: Result := R <> crEqual;
+    opCmpLt: Result := R = crLessThan;
+    opCmpLe: Result := R <> crGreaterThan;
+    opCmpGt: Result := R = crGreaterThan;
+    opCmpGe: Result := R <> crLessThan;
+  else
+    Result := False;
+    RaiseInvalidOp;
+  end;
+end;
+
+procedure TCustomVariantType.Compare(const Left, Right: TVarData;
+  var Relationship: TVarCompareResult);
+begin
+  RaiseInvalidOp;
+end;
+
+function TInvokeableVariantType.DoFunction(var Dest: TVarData; const V: TVarData;
+  const Name: string; const Arguments: TVarDataArray): Boolean;
+begin
+  Result := False;
+end;
+
+function TInvokeableVariantType.DoProcedure(const V: TVarData; const Name: string;
+  const Arguments: TVarDataArray): Boolean;
+begin
+  Result := False;
+end;
+
+function TInvokeableVariantType.GetProperty(var Dest: TVarData; const V: TVarData;
+  const Name: string): Boolean;
+begin
+  Result := False;
+end;
+
+function TInvokeableVariantType.SetProperty(var V: TVarData; const Name: string;
+  const Value: TVarData): Boolean;
+begin
+  Result := False;
+end;
+
+procedure VarDispInvokeError;
+begin
+  raise EVariantDispatchError.Create('No variant method call dispatch');
 end;
 
 { ── Public routines ────────────────────────────────────────── }
@@ -710,9 +1313,12 @@ const
     'Word', 'DWord', 'Int64', 'QWord');
 var
   T: TVarType;
+  H: TCustomVariantType;
 begin
   T := AType and varTypeMask;
-  if T <= 21 then
+  if FindCustomVariantType(T, H) then
+    Result := H.ClassName
+  else if T <= 21 then
     Result := Names[T]
   else if T = varString then
     Result := 'String'
@@ -926,6 +1532,153 @@ begin
   bruto_astr_release(Old);
 end;
 
+function VarFromDateTime(const DateTime: TDateTime): Variant;
+begin
+  bruto_var_from_date(@Result, DateTime);
+end;
+
+function VarToDateTime(const V: Variant): TDateTime;
+begin
+  if VarType(V) = varNull then
+    VarCastError(varNull, varDate);
+  Result := VariantToDate(PVarData(@V)^);
+end;
+
+function VarIsCustom(const V: Variant): Boolean;
+begin
+  Result := CustomOf(PVarData(@V)^) <> nil;
+end;
+
+function VarArrayRef(const A: Variant): Variant;
+var
+  D: PVarData;
+begin
+  if not VarIsArray(A) then
+    VarInvalidArgError;
+  D := PVarData(@Result);
+  D^.VType := PVarData(@A)^.VType or varByRef;
+  D^.VPointer := @PVarData(@A)^.VArray;
+end;
+
+{ ── Locked arrays ───────────────────────────────────────────── }
+
+type
+  TLockedArray = record
+    Data: Pointer;
+    Buffer: Pointer;
+    ElemType: TVarType;
+    Locks: Integer;
+  end;
+
+var
+  LockedArrays: array of TLockedArray;
+
+{ The size of an element of type T in a locked array's buffer. }
+function LockedElemSize(T: TVarType): Integer;
+begin
+  case T of
+    varShortInt, varByte: Result := 1;
+    varSmallInt, varWord, varBoolean: Result := 2;
+    varInteger, varLongWord, varSingle: Result := 4;
+  else
+    Result := 8;
+  end;
+end;
+
+function VarArrayLock(const A: Variant): Pointer;
+var
+  D: TVarData;
+  Data, Buf: Pointer;
+  T: TVarType;
+  I, N, Size, K: Int64;
+  E: PVarData;
+begin
+  D := PVarData(@A)^;
+  if IsRef(D) then
+    D := Deref(D);
+  if (D.VType and varArray) = 0 then
+    VarInvalidArgError;
+  Data := D.VArray;
+  T := D.VType and varTypeMask;
+  N := ElementCount(Data);
+  { An array of variants: its own TVarData elements. }
+  if T = varVariant then
+    Exit(@PVarElements(Data)^[1 + DimsOf(Data)]);
+  for K := 0 to High(LockedArrays) do
+    if LockedArrays[K].Data = Data then
+    begin
+      Inc(LockedArrays[K].Locks);
+      Exit(LockedArrays[K].Buffer);
+    end;
+  Size := LockedElemSize(T);
+  GetMem(Buf, N * Size + 1);
+  FillChar(Buf^, N * Size + 1, 0);
+  for I := 0 to N - 1 do
+  begin
+    E := @PVarElements(Data)^[1 + DimsOf(Data) + I];
+    if T = varBoolean then
+    begin
+      if E^.VBoolean then
+        PWord(Buf + I * 2)^ := $FFFF;
+    end
+    else
+      Move(E^.VInt64, (Buf + I * Size)^, Size);
+  end;
+  K := Length(LockedArrays);
+  SetLength(LockedArrays, K + 1);
+  LockedArrays[K].Data := Data;
+  LockedArrays[K].Buffer := Buf;
+  LockedArrays[K].ElemType := T;
+  LockedArrays[K].Locks := 1;
+  Result := Buf;
+end;
+
+procedure VarArrayUnlock(const A: Variant);
+var
+  D: TVarData;
+  Data, Buf: Pointer;
+  I, N, Size, K, J: Int64;
+  E: PVarData;
+  T: TVarType;
+begin
+  D := PVarData(@A)^;
+  if IsRef(D) then
+    D := Deref(D);
+  if (D.VType and varArray) = 0 then
+    VarInvalidArgError;
+  Data := D.VArray;
+  if (D.VType and varTypeMask) = varVariant then
+    Exit;
+  for K := 0 to High(LockedArrays) do
+    if LockedArrays[K].Data = Data then
+    begin
+      Dec(LockedArrays[K].Locks);
+      if LockedArrays[K].Locks > 0 then
+        Exit;
+      { The buffer's values back into the elements. }
+      Buf := LockedArrays[K].Buffer;
+      T := LockedArrays[K].ElemType;
+      Size := LockedElemSize(T);
+      N := ElementCount(Data);
+      for I := 0 to N - 1 do
+      begin
+        E := @PVarElements(Data)^[1 + DimsOf(Data) + I];
+        if T = varOleStr then
+          SetUStr(E^, UnicodeString(PPointer(Buf + I * Size)^))
+        else if T = varBoolean then
+          E^.VBoolean := PWord(Buf + I * 2)^ <> 0
+        else
+          Move((Buf + I * Size)^, E^.VInt64, Size);
+      end;
+      FreeMem(Buf);
+      for J := K to High(LockedArrays) - 1 do
+        LockedArrays[J] := LockedArrays[J + 1];
+      SetLength(LockedArrays, Length(LockedArrays) - 1);
+      Exit;
+    end;
+  raise EVariantArrayLockedError.Create('Variant array is not locked');
+end;
+
 { ── Operators ──────────────────────────────────────────────── }
 
 function CommonType(const D: TVarData): Integer;
@@ -1115,10 +1868,54 @@ begin
   R.VCurrency := C;
 end;
 
+{ date + n, date - n (a date), date - date (a Double), as FPC's. }
+procedure OpDate(var R: TVarData; const L, Rt: TVarData; Op: TVarOp; LCT, RCT: Integer);
+var
+  A: TDateTime;
+begin
+  case Op of
+    opAdd: A := VariantToDate(L) + VariantToDate(Rt);
+    opSubtract: A := VariantToDate(L) - VariantToDate(Rt);
+  else
+    begin
+      OpFloat(R, L, Rt, Op);
+      Exit;
+    end;
+  end;
+  ClearData(R);
+  if (Op = opSubtract) and (LCT = RCT) then
+    R.VType := varDouble
+  else
+    R.VType := varDate;
+  R.VDate := A;
+end;
+
 procedure DoVarOp(var R: TVarData; const L, Rt: TVarData; Op: TVarOp);
 var
   LCT, RCT: Integer;
+  H: TCustomVariantType;
 begin
+  if IsRef(L) then
+  begin
+    DoVarOp(R, Deref(L), Rt, Op);
+    Exit;
+  end;
+  if IsRef(Rt) then
+  begin
+    DoVarOp(R, L, Deref(Rt), Op);
+    Exit;
+  end;
+  { A custom variant on either side: its handler's BinaryOp, on a copy of
+    the left operand. }
+  H := CustomOf(L);
+  if H = nil then
+    H := CustomOf(Rt);
+  if H <> nil then
+  begin
+    CopyData(R, L);
+    H.BinaryOp(R, Rt, Op);
+    Exit;
+  end;
   LCT := CommonType(L);
   RCT := CommonType(Rt);
   case FindOpCommonType[LCT, RCT] of
@@ -1134,11 +1931,18 @@ begin
       else
         OpLongInt(R, L, Rt, Op);
       end;
-    ctFloat, ctDate:
+    ctFloat:
       if Op in [opAdd, opSubtract, opMultiply, opDivide] then
         OpFloat(R, L, Rt, Op)
       else
         OpInt64To32(R, L, Rt, Op);
+    ctDate:
+      case Op of
+        opAdd, opSubtract: OpDate(R, L, Rt, Op, LCT, RCT);
+        opMultiply, opDivide: OpFloat(R, L, Rt, Op);
+      else
+        OpInt64To32(R, L, Rt, Op);
+      end;
     ctCurrency:
       if Op in [opAdd, opSubtract, opMultiply, opDivide, opPower] then
         OpCurr(R, L, Rt, Op, LCT, RCT)
@@ -1262,10 +2066,56 @@ begin
     Result := 0;
 end;
 
+{ A comparison with a custom variant: its handler's CompareOp (Null
+  compared without it), as FPC's DoVarCmpComplex. }
+function CmpComplex(const L, R: TVarData; Op: TVarOp; H: TCustomVariantType): Integer;
+var
+  Res: Boolean;
+begin
+  if (L.VType = varNull) or (R.VType = varNull) then
+  begin
+    if (Op = opCmpEq) or (Op = opCmpNe) then
+    begin
+      if (L.VType = R.VType) xor (Op = opCmpNe) then
+        Result := 0
+      else
+        Result := -1;
+    end
+    else if L.VType = varNull then
+    begin
+      if R.VType = varNull then
+        Result := 0
+      else
+        Result := -1;
+    end
+    else
+      Result := 1;
+    Exit;
+  end;
+  Res := H.CompareOp(L, R, Op);
+  case Op of
+    opCmpEq: if Res then Result := 0 else Result := 1;
+    opCmpNe: if Res then Result := 1 else Result := 0;
+    opCmpLt, opCmpLe: if Res then Result := -1 else Result := 1;
+  else
+    if Res then Result := 1 else Result := -1;
+  end;
+end;
+
 function DoVarCmp(const L, R: TVarData; Op: TVarOp): Integer;
 var
   LCT, RCT: Integer;
+  H: TCustomVariantType;
 begin
+  if IsRef(L) then
+    Exit(DoVarCmp(Deref(L), R, Op));
+  if IsRef(R) then
+    Exit(DoVarCmp(L, Deref(R), Op));
+  H := CustomOf(L);
+  if H = nil then
+    H := CustomOf(R);
+  if H <> nil then
+    Exit(CmpComplex(L, R, Op, H));
   LCT := CommonType(L);
   RCT := CommonType(R);
   case FindCmpCommonType[LCT, RCT] of
@@ -1405,6 +2255,18 @@ begin
     Result := VariantToInt64(PVarData(P)^);
 end;
 
+function bruto_var_to_date(P: Pointer): Double;
+begin
+  if PVarData(P)^.VType = varNull then
+  begin
+    if NullStrictConvert then
+      VarCastError(varNull, varDate);
+    Result := 0;
+  end
+  else
+    Result := VariantToDate(PVarData(P)^);
+end;
+
 function bruto_var_to_double(P: Pointer): Double;
 begin
   if PVarData(P)^.VType = varNull then
@@ -1479,7 +2341,22 @@ procedure bruto_var_unary(Res, P: Pointer; Op: Int64);
 var
   D, R: PVarData;
   I: Int64;
+  T: TVarData;
+  H: TCustomVariantType;
 begin
+  if IsRef(PVarData(P)^) then
+  begin
+    T := Deref(PVarData(P)^);
+    bruto_var_unary(Res, @T, Op);
+    Exit;
+  end;
+  H := CustomOf(PVarData(P)^);
+  if H <> nil then
+  begin
+    CopyData(PVarData(Res)^, PVarData(P)^);
+    H.UnaryOp(PVarData(Res)^, TVarOp(Op));
+    Exit;
+  end;
   D := PVarData(P);
   R := PVarData(Res);
   if TVarOp(Op) = opNegate then
@@ -1546,6 +2423,12 @@ var
   Dims: Int64;
   T: TVarData;
 begin
+  if IsRef(PVarData(A)^) then
+  begin
+    T := Deref(PVarData(A)^);
+    bruto_var_array_get(Res, @T, Indices, Count);
+    Exit;
+  end;
   E := ElementAt(PVarData(A)^, PInt64Array(Indices), Count);
   Dims := DimsOf(PVarData(A)^.VArray);
   if Count > Dims then
@@ -1569,6 +2452,14 @@ var
   Dims: Int64;
   T: TVarData;
 begin
+  { Through a reference (VarArrayRef): into the array it refers to. }
+  if IsRef(PVarData(A)^) and ((PVarData(A)^.VType and varArray) <> 0) then
+  begin
+    T := Deref(PVarData(A)^);
+    bruto_var_array_put(@T, Indices, Count, V);
+    PPointer(PVarData(A)^.VPointer)^ := T.VArray;
+    Exit;
+  end;
   D := PVarData(A);
   if (D^.VType and varArray) = 0 then
     VarInvalidArgError;
@@ -1593,6 +2484,64 @@ begin
     CastData(T, PVarData(V)^, D^.VType and varTypeMask);
   ClearData(E^);
   Move(T, E^, SizeOf(TVarData));
+end;
+
+procedure bruto_var_from_date(Res: Pointer; V: Double);
+begin
+  PVarData(Res)^.VType := varDate;
+  PVarData(Res)^.VDate := V;
+end;
+
+procedure bruto_var_dispatch(Res, V: Pointer; Name: PChar; Args: Pointer; Count, Kind: Int64);
+var
+  H: TCustomVariantType;
+  I: TInvokeableVariantType;
+  A: TVarDataArray;
+  N: string;
+  Dummy: TVarData;
+  K: Integer;
+begin
+  { Through a reference: on the variant referred to. }
+  while (PVarData(V)^.VType = varByRef or varVariant) and (PVarData(V)^.VPointer <> nil) do
+    V := PVarData(V)^.VPointer;
+  H := CustomOf(PVarData(V)^);
+  if (H = nil) or not (H is TInvokeableVariantType) then
+    VarDispInvokeError;
+  I := TInvokeableVariantType(H);
+  N := StrPas(Name);
+  SetLength(A, Count);
+  for K := 0 to Count - 1 do
+    Move(PVarElements(Args)^[K], A[K], SizeOf(TVarData));
+  case Kind of
+    1:
+      if Res <> nil then
+      begin
+        if Count = 0 then
+        begin
+          { No arguments: a property first, then a function. }
+          if not (I.GetProperty(PVarData(Res)^, PVarData(V)^, N)
+            or I.DoFunction(PVarData(Res)^, PVarData(V)^, N, A)) then
+            VarDispInvokeError;
+        end
+        else if not I.DoFunction(PVarData(Res)^, PVarData(V)^, N, A) then
+          VarDispInvokeError;
+      end
+      else if not I.DoProcedure(PVarData(V)^, N, A) then
+      begin
+        FillChar(Dummy, SizeOf(Dummy), 0);
+        try
+          if not I.DoFunction(Dummy, PVarData(V)^, N, A) then
+            VarDispInvokeError;
+        finally
+          ClearData(Dummy);
+        end;
+      end;
+    4:
+      if (Count <> 1) or not I.SetProperty(PVarData(V)^, N, A[0]) then
+        VarDispInvokeError;
+  else
+    VarDispInvokeError;
+  end;
 end;
 
 { ── Properties ─────────────────────────────────────────────── }
@@ -1677,4 +2626,6 @@ begin
   end;
 end;
 
+initialization
+  BrutoVarCustomHook := @CustomVariantHook;
 end.

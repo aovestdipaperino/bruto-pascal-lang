@@ -349,7 +349,11 @@ impl<'ctx> CodeGen<'ctx> {
             let resolved = chain
                 .iter()
                 .find_map(|i| declarer_info.resolutions.get(&(i.clone(), key.clone())));
-            let key = resolved.unwrap_or(key);
+            let key = match resolved {
+                Some(k) => k.clone(),
+                None => self.matching_overload(declarer, intf, key),
+            };
+            let key = &key;
             let found = declarer_info.methods.get(key).ok_or_else(|| {
                 CodeGenError::new(
                     format!(
@@ -380,6 +384,46 @@ impl<'ctx> CodeGen<'ctx> {
         g.set_constant(true);
         g.set_initializer(&init);
         Ok(g.as_pointer_value())
+    }
+
+    /// The method of `class` implementing `intf`'s method `key`: `key`
+    /// itself, or of its overloads (`key$2`...) the one whose parameters
+    /// have the interface method's types (`Equals(A, B)` beside
+    /// TObject's `Equals(Obj)`).
+    fn matching_overload(&self, class: &str, intf: &str, key: &str) -> String {
+        let info = &self.objects[class];
+        let prefix = format!("{key}$");
+        let candidates: Vec<&String> = info
+            .methods
+            .keys()
+            .filter(|k| *k == key || k.starts_with(&prefix))
+            .collect();
+        let wanted = self
+            .interface_chain(intf)
+            .iter()
+            .find_map(|i| self.objects.get(i).and_then(|o| o.methods.get(key)))
+            .map(|m| self.param_types(&m.params));
+        if candidates.len() < 2 || wanted.is_none() {
+            return key.to_string();
+        }
+        let wanted = wanted.unwrap();
+        candidates
+            .into_iter()
+            .find(|k| self.param_types(&info.methods[*k].params) == wanted)
+            .cloned()
+            .unwrap_or_else(|| key.to_string())
+    }
+
+    /// The resolved types of a method's parameters, one per name.
+    fn param_types(&self, params: &[ParamGroup]) -> Vec<(ParamMode, PascalType)> {
+        params
+            .iter()
+            .flat_map(|g| {
+                g.names
+                    .iter()
+                    .map(move |_| (g.mode, self.resolve_type(&g.ty)))
+            })
+            .collect()
     }
 
     /// The table of interfaces class `class` implements, for its VMT:

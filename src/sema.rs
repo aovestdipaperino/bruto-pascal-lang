@@ -494,6 +494,8 @@ impl Rename for UnitQualifiers {
     }
 }
 
+use crate::source_map::note_member;
+
 #[derive(Default)]
 struct CaseFolder {
     first_spelling: RefCell<HashMap<String, String>>,
@@ -507,6 +509,29 @@ impl Rename for CaseFolder {
             .entry(lower.clone())
             .or_insert_with(|| name.to_string());
         lower
+    }
+
+    fn rewrite_expr_node(&self, expr: &mut Expr) {
+        match expr {
+            Expr::FieldAccess { field, span, .. } => note_member(*span, field),
+            Expr::MethodCall { method, span, .. } => note_member(*span, method),
+            _ => {}
+        }
+    }
+
+    fn rewrite_stmt_node(&self, stmt: &mut Statement) {
+        match stmt {
+            Statement::MethodCall { method, span, .. } => note_member(*span, method),
+            Statement::FieldAssignment { field, span, .. } => note_member(*span, field),
+            Statement::ChainedAssignment { chain, span, .. } => {
+                for access in chain.iter() {
+                    if let LValueAccess::Field(field) = access {
+                        note_member(*span, field);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

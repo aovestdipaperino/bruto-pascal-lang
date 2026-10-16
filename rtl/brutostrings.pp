@@ -123,6 +123,12 @@ procedure bruto_pool_drain(Mark: Int64);
 procedure bruto_var_addref(P: Pointer);
 procedure bruto_var_release(P: Pointer);
 procedure bruto_var_return(P: Pointer);
+type
+  { Copies (Op 1) or clears (Op 2) the custom variant at P: set by the
+    Variants unit, which knows the custom variant types' handlers. }
+  TBrutoVarCustomHook = procedure(P: Pointer; Op: LongInt);
+var
+  BrutoVarCustomHook: TBrutoVarCustomHook;
 { A dynamic array block holding its own reference (see bruto_dynarr_block):
   what a variant array's data is made of. }
 function bruto_dynarr_owned(Count, ElemSize: Int64; Cleanup, Addref: Pointer): Pointer;
@@ -433,16 +439,29 @@ begin
     or ((VType and $2000) <> 0);
 end;
 
+{ Whether the variant at P is of a custom variant type (a handler's). }
+function bruto_var_custom(P: Pointer): Boolean;
+var
+  VType: Word;
+begin
+  VType := PWord(P)^;
+  bruto_var_custom := (VType >= $10F) and (VType < $1000) and (BrutoVarCustomHook <> nil);
+end;
+
 procedure bruto_var_addref(P: Pointer);
 begin
   if bruto_var_counted(P) then
-    bruto_astr_addref(PPointer(P + 8)^);
+    bruto_astr_addref(PPointer(P + 8)^)
+  else if bruto_var_custom(P) then
+    BrutoVarCustomHook(P, 1);
 end;
 
 procedure bruto_var_release(P: Pointer);
 begin
   if bruto_var_counted(P) then
-    bruto_astr_release(PPointer(P + 8)^);
+    bruto_astr_release(PPointer(P + 8)^)
+  else if bruto_var_custom(P) then
+    BrutoVarCustomHook(P, 2);
 end;
 
 procedure bruto_var_return(P: Pointer);

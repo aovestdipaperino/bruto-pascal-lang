@@ -192,13 +192,43 @@ impl<'ctx> CodeGen<'ctx> {
         expr: &Expr,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let span = expr.span();
-        let ty = self.resolve_type(&self.infer_declared_type(expr));
+        let declared = self.infer_declared_type(expr);
+        let ty = self.resolve_type(&declared);
         if ty == PascalType::Variant {
             return self.compile_expr(expr);
         }
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        // A TVarData seen as a Variant (`Variant(Data)`): the same bits.
+        if self.is_var_data(&declared)
+            || self
+                .declared_var_type(expr)
+                .is_some_and(|t| self.is_var_data(t))
+        {
+            if self.is_addressable(expr) {
+                let (slot, _) = self.resolve_array_base(expr, span)?;
+                return self
+                    .builder
+                    .build_load(self.variant_type(), slot, "var_data")
+                    .map_err(err);
+            }
+            let v = self.compile_expr(expr)?;
+            let temp = self.entry_alloca(v.get_type(), "var_data").map_err(err)?;
+            self.builder.build_store(temp, v).map_err(err)?;
+            return self
+                .builder
+                .build_load(self.variant_type(), temp, "var_data")
+                .map_err(err);
+        }
         let i64_ty = self.context.i64_type();
         let slot = self.variant_slot(span)?;
+        // A TDateTime (TDate, TTime) is a date (varDate), as in FPC.
+        if (Self::is_date_time(&declared) || self.is_date_var(expr))
+            && matches!(ty, PascalType::Real)
+        {
+            let v = self.compile_expr(expr)?;
+            self.call_var_runtime("bruto_var_from_date", &[slot.into(), v.into()], span)?;
+            return self.variant_result(slot, span);
+        }
         match &ty {
             PascalType::Boolean => {
                 let v = self.compile_expr(expr)?.into_int_value();
@@ -274,6 +304,28 @@ impl<'ctx> CodeGen<'ctx> {
         self.variant_result(slot, span)
     }
 
+    /// Whether `ty` names TDateTime, TDate or TTime (FPC's distinct date
+    /// types, which a Variant holds as varDate).
+    pub(super) fn is_date_time(ty: &PascalType) -> bool {
+        matches!(ty, PascalType::Named(n) if matches!(n.as_str(), "tdatetime" | "tdate" | "ttime"))
+    }
+
+    /// Whether `ty` is TVarData (a Variant's record), which casts to and
+    /// from a Variant by its bits.
+    pub(super) fn is_var_data(&self, ty: &PascalType) -> bool {
+        let mut ty = ty.clone();
+        loop {
+            match ty {
+                PascalType::Named(ref n) if n == "tvardata" => return true,
+                PascalType::Named(ref n) => match self.type_defs.get(n) {
+                    Some(next) => ty = next.clone(),
+                    None => return false,
+                },
+                _ => return false,
+            }
+        }
+    }
+
     /// Whether a Variant converts to a value of type `ty`.
     pub(super) fn variant_converts_to(&self, ty: &PascalType) -> bool {
         matches!(
@@ -302,6 +354,11 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let p = self.variant_in_memory(val, span)?;
+        if Self::is_date_time(target) {
+            return Ok(self
+                .call_var_runtime("bruto_var_to_date", &[p.into()], span)?
+                .unwrap());
+        }
         let name = match self.resolve_type(target) {
             PascalType::Boolean => {
                 let v = self
@@ -528,5 +585,123 @@ impl<'ctx> CodeGen<'ctx> {
             span,
         )?;
         Ok(())
+    }
+
+    /// The Variant `object` in memory: the variable itself when it has an
+    /// address (a late-bound call can change it), else a temporary.
+    fn variant_place(
+        &mut self,
+        object: &Expr,
+        span: Span,
+    ) -> Result<PointerValue<'ctx>, CodeGenError> {
+        if self.is_addressable(object) {
+            return Ok(self.resolve_array_base(object, span)?.0);
+        }
+        let v = self.compile_expr(object)?;
+        self.variant_in_memory(v, span)
+    }
+
+    /// `args` as Variants in an array in memory.
+    fn variant_args(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<PointerValue<'ctx>, CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let i64_ty = self.context.i64_type();
+        let array_ty = self.variant_type().array_type(args.len().max(1) as u32);
+        let buffer = self.entry_alloca(array_ty, "var_args").map_err(err)?;
+        for (n, arg) in args.iter().enumerate() {
+            let v = self.compile_as_variant(arg)?;
+            let at = unsafe {
+                self.builder
+                    .build_in_bounds_gep(
+                        array_ty,
+                        buffer,
+                        &[i64_ty.const_zero(), i64_ty.const_int(n as u64, false)],
+                        "var_arg",
+                    )
+                    .map_err(err)?
+            };
+            self.builder.build_store(at, v).map_err(err)?;
+        }
+        Ok(buffer)
+    }
+
+    /// Call `bruto_var_dispatch` for member `name` of the Variant at `v`.
+    fn variant_dispatch_call(
+        &mut self,
+        res: PointerValue<'ctx>,
+        v: PointerValue<'ctx>,
+        name: &str,
+        args: PointerValue<'ctx>,
+        count: usize,
+        kind: u64,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        let spelling = crate::source_map::member_spelling(span, name);
+        let name = self
+            .builder
+            .build_global_string_ptr(&spelling, "var_member")
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+            .as_pointer_value();
+        let i64_ty = self.context.i64_type();
+        self.call_var_runtime(
+            "bruto_var_dispatch",
+            &[
+                res.into(),
+                v.into(),
+                name.into(),
+                args.into(),
+                i64_ty.const_int(count as u64, false).into(),
+                i64_ty.const_int(kind, false).into(),
+            ],
+            span,
+        )?;
+        Ok(())
+    }
+
+    /// `V.Name(Args)` on a Variant, bound late by its custom variant
+    /// type: the result when `want_result`, else a statement call.
+    pub(super) fn compile_variant_dispatch(
+        &mut self,
+        object: &Expr,
+        name: &str,
+        args: &[Expr],
+        want_result: bool,
+        span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let v = self.variant_place(object, span)?;
+        let buffer = self.variant_args(args, span)?;
+        let res = if want_result {
+            self.variant_slot(span)?
+        } else {
+            self.context
+                .ptr_type(inkwell::AddressSpace::default())
+                .const_null()
+        };
+        self.variant_dispatch_call(res, v, name, buffer, args.len(), 1, span)?;
+        if want_result {
+            self.variant_result(res, span)
+        } else {
+            Ok(self.context.i64_type().const_zero().into())
+        }
+    }
+
+    /// `V.Name := X` on a Variant: the custom type's SetProperty.
+    pub(super) fn compile_variant_put(
+        &mut self,
+        object: &Expr,
+        name: &str,
+        expr: &Expr,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        let v = self.variant_place(object, span)?;
+        let buffer = self.variant_args(std::slice::from_ref(expr), span)?;
+        let null = self
+            .context
+            .ptr_type(inkwell::AddressSpace::default())
+            .const_null();
+        self.variant_dispatch_call(null, v, name, buffer, 1, 4, span)
     }
 }

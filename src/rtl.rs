@@ -42,10 +42,16 @@ const UNITS: &[(&str, &str)] = &[
     ("math.pp", include_str!("../rtl/math.pp")),
     ("typinfo.pp", include_str!("../rtl/typinfo.pp")),
     ("variants.pp", include_str!("../rtl/variants.pp")),
+    ("sysconst.pp", include_str!("../rtl/sysconst.pp")),
+    ("dateutils.pp", include_str!("../rtl/dateutils.pp")),
     ("fgl.pp", include_str!("../rtl/fgl.pp")),
     (
         "generics.collections.pp",
         include_str!("../rtl/generics.collections.pp"),
+    ),
+    (
+        "generics.defaults.pp",
+        include_str!("../rtl/generics.defaults.pp"),
     ),
     ("openssl.pp", include_str!("../rtl/openssl.pp")),
     ("ssockets.pp", include_str!("../rtl/ssockets.pp")),
