@@ -5970,14 +5970,15 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let value = self.compile_expr_inner(expr)?;
-        // An interface a function returned is held until the routine ends.
-        if matches!(
-            expr,
-            Expr::Call { .. }
-                | Expr::MethodCall { .. }
-                | Expr::IndirectCall { .. }
-                | Expr::Inherited { .. }
-        ) && value.is_struct_value()
+        // An interface a function returned is held until the routine ends
+        // (not one a type cast made: that reference isn't counted).
+        let returned = match expr {
+            Expr::Call { name, .. } => self.cast_target(name).is_none(),
+            Expr::MethodCall { .. } | Expr::IndirectCall { .. } | Expr::Inherited { .. } => true,
+            _ => false,
+        };
+        if returned
+            && value.is_struct_value()
             && self.interface_of(&self.infer_declared_type(expr)).is_some()
         {
             self.hold_interface_temp(value, true, expr.span())?;
