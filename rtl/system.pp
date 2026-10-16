@@ -20,6 +20,20 @@ function GetFPCHeapStatus: TFPCHeapStatus;
 procedure SetCodePage(var S: RawByteString; CodePage: TSystemCodePage; Convert: Boolean);
 function StringCodePage(const S: RawByteString): TSystemCodePage;
 
+{ The ratio of a circle's circumference to its diameter. }
+function Pi: Double;
+
+var
+  { The random generator's seed: setting it restarts the sequence. }
+  RandSeed: LongWord;
+
+{ FPC 3.2's generator (MT19937), giving the same numbers for a seed:
+  Random(L) (0 <= it < L) and Random (0 <= it < 1) call these. }
+function BrutoRandomInt(L: LongInt): LongInt;
+function BrutoRandomFloat: Double;
+{ A seed from the clock. }
+procedure Randomize;
+
 { S with ASCII letters in lower case, as FPC's System.LowerCase. }
 function LowerCase(const S: AnsiString): AnsiString;
 { Compare Len bytes: negative, zero or positive, as FPC. }
@@ -28,6 +42,88 @@ function CompareByte(const Buf1, Buf2; Len: SizeInt): SizeInt;
 function IndexByte(const Buf; Len: SizeInt; B: Byte): SizeInt;
 
 implementation
+
+function Pi: Double;
+begin
+  Pi := 3.141592653589793238;
+end;
+
+const
+  BrutoMTN = 624;
+  BrutoMTM = 397;
+
+var
+  BrutoMT: array[0..BrutoMTN - 1] of Int64;
+  BrutoMTI: LongInt;
+  BrutoOldRandSeed: LongWord;
+  BrutoMTStarted: Boolean;
+
+procedure BrutoMTSeed(Seed: LongWord);
+var
+  I: LongInt;
+  Prev: Int64;
+begin
+  BrutoMT[0] := Seed;
+  for I := 1 to BrutoMTN - 1 do
+  begin
+    Prev := BrutoMT[I - 1];
+    BrutoMT[I] := (1812433253 * (Prev xor (Prev shr 30)) + I) and $FFFFFFFF;
+  end;
+  BrutoMTI := BrutoMTN;
+end;
+
+function BrutoMTNext: LongWord;
+var
+  Y: Int64;
+  K: LongInt;
+begin
+  { A new seed (or the first call) starts the sequence again. }
+  if (not BrutoMTStarted) or (RandSeed <> BrutoOldRandSeed) then
+  begin
+    BrutoMTSeed(RandSeed);
+    RandSeed := not RandSeed;
+    BrutoOldRandSeed := RandSeed;
+    BrutoMTStarted := True;
+  end;
+  if BrutoMTI >= BrutoMTN then
+  begin
+    for K := 0 to BrutoMTN - 1 do
+    begin
+      Y := (BrutoMT[K] and $80000000) or (BrutoMT[(K + 1) mod BrutoMTN] and $7FFFFFFF);
+      BrutoMT[K] := BrutoMT[(K + BrutoMTM) mod BrutoMTN] xor (Y shr 1);
+      if (Y and 1) <> 0 then
+        BrutoMT[K] := BrutoMT[K] xor $9908B0DF;
+    end;
+    BrutoMTI := 0;
+  end;
+  Y := BrutoMT[BrutoMTI];
+  BrutoMTI := BrutoMTI + 1;
+  Y := Y xor (Y shr 11);
+  Y := Y xor ((Y shl 7) and $9D2C5680);
+  Y := Y xor ((Y shl 15) and $EFC60000);
+  Y := Y xor (Y shr 18);
+  BrutoMTNext := Y and $FFFFFFFF;
+end;
+
+function BrutoRandomInt(L: LongInt): LongInt;
+begin
+  if L < 0 then
+    L := L + 1;
+  BrutoRandomInt := (Int64(BrutoMTNext) * L) div 4294967296;
+end;
+
+function BrutoRandomFloat: Double;
+begin
+  BrutoRandomFloat := BrutoMTNext * (1.0 / 4294967296.0);
+end;
+
+function bruto_time(T: Pointer): Int64; cdecl; external 'c' name 'time';
+function bruto_clock: Int64; cdecl; external 'c' name 'clock';
+
+procedure Randomize;
+begin
+  RandSeed := (bruto_time(nil) * 1000 + bruto_clock) and $FFFFFFFF;
+end;
 
 {$ifdef DARWIN}
 type

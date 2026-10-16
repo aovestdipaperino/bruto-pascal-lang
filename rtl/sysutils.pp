@@ -110,7 +110,9 @@ procedure Abort;
 { The exception being handled, in an exception handler. }
 function ExceptObject: TObject;
 
-function IntToStr(Value: Int64): string;
+function IntToStr(Value: Int64): string; overload;
+function IntToStr(Value: QWord): string; overload;
+function UIntToStr(Value: QWord): string;
 function IntToHex(Value: Int64; Digits: Integer): string;
 function StrToInt(const S: string): Int64;
 function StrToIntDef(const S: string; Default: Int64): Int64;
@@ -145,12 +147,28 @@ function c_opendir(Path: PChar): Pointer; cdecl; external 'c' name 'opendir';
 function c_closedir(Dir: Pointer): cint; cdecl; external 'c' name 'closedir';
 {$endif}
 
-function IntToStr(Value: Int64): string;
+function IntToStr(Value: Int64): string; overload;
 var
   S: string;
 begin
   Str(Value, S);
   IntToStr := S;
+end;
+
+function IntToStr(Value: QWord): string; overload;
+var
+  S: string;
+begin
+  Str(Value, S);
+  IntToStr := S;
+end;
+
+function UIntToStr(Value: QWord): string;
+var
+  S: string;
+begin
+  Str(Value, S);
+  UIntToStr := S;
 end;
 
 function IntToHex(Value: Int64; Digits: Integer): string;
@@ -1001,7 +1019,9 @@ begin
     203: raise EOutOfMemory.Create('Out of memory');
     204: raise EInvalidPointer.Create('Invalid pointer operation');
     205: raise EOverflow.Create('Floating point overflow');
+    206: raise EUnderflow.Create('Floating point underflow');
     207: raise EInvalidOp.Create('Invalid floating point operation');
+    208: raise EZeroDivide.Create('Floating point division by zero');
     210: raise EAbstractError.Create('Abstract method called');
     211: raise EAbstractError.Create('Abstract method called');
     215: raise EIntOverflow.Create('Arithmetic overflow');

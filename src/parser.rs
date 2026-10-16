@@ -1478,7 +1478,11 @@ impl Parser {
                     decls.consts.extend(self.parse_const_section()?)
                 }
                 Tok::KwType => decls.type_decls.extend(self.parse_type_section()?),
-                Tok::Var => decls.vars.extend(self.parse_var_section()?),
+                Tok::Var => {
+                    let (vars, initialized) = self.parse_var_section()?;
+                    decls.vars.extend(vars);
+                    decls.consts.extend(initialized);
+                }
                 _ if self.at_routine() => {
                     let routine = if headers_only {
                         self.parse_proc_header()?
@@ -2059,21 +2063,37 @@ impl Parser {
 
     // ── var section ──────────────────────────────────────
 
-    fn parse_var_section(&mut self) -> Result<Vec<VarDecl>, ParseError> {
+    /// A `var` section: its variables, and those it initializes (`X:
+    /// Integer = 5;`), which are typed constants (writable, as FPC's are).
+    fn parse_var_section(&mut self) -> Result<(Vec<VarDecl>, Vec<ConstDecl>), ParseError> {
         self.expect(&Tok::Var)?;
         let mut decls = Vec::new();
+        let mut initialized = Vec::new();
         // Parse var declarations until we see 'begin' or another section keyword
         while self.at_decl_name() {
-            decls.push(self.parse_var_decl()?);
+            let decl = self.parse_var_decl()?;
+            if *self.peek() == Tok::Eq && decl.names.len() == 1 && decl.absolute.is_none() {
+                self.advance();
+                let value = self.parse_initializer()?;
+                self.skip_hint_directives();
+                initialized.push(ConstDecl {
+                    name: decl.names[0].clone(),
+                    ty: Some(decl.ty),
+                    value,
+                    span: decl.span,
+                });
+            } else {
+                decls.push(decl);
+            }
             self.expect(&Tok::Semi)?;
         }
-        if decls.is_empty() {
+        if decls.is_empty() && initialized.is_empty() {
             return Err(ParseError {
                 message: "expected at least one variable declaration after 'var'".into(),
                 span: self.span(),
             });
         }
-        Ok(decls)
+        Ok((decls, initialized))
     }
 
     fn parse_var_decl(&mut self) -> Result<VarDecl, ParseError> {

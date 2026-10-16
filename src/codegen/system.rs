@@ -535,6 +535,125 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// FPC's floating point exceptions: when `result`, of operation `op`
+    /// (see `bruto_float_error`) on `a` and `b`, is an infinity or NaN that
+    /// the operation made, runtime error 208, 207 or 205 (EZeroDivide,
+    /// EInvalidOp, EOverflow with SysUtils), unless masked.
+    pub(super) fn check_float(
+        &mut self,
+        a: inkwell::values::FloatValue<'ctx>,
+        b: Option<inkwell::values::FloatValue<'ctx>>,
+        result: inkwell::values::FloatValue<'ctx>,
+        op: u64,
+        span: Span,
+    ) -> Result<(), CodeGenError> {
+        if self.in_runtime || self.current_fn.is_none() {
+            return Ok(());
+        }
+        let Some(classify) = self.module.get_function("bruto_float_error") else {
+            return Ok(());
+        };
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let f64_ty = self.context.f64_type();
+        let wide = |cg: &Self, v: inkwell::values::FloatValue<'ctx>| {
+            if v.get_type() == f64_ty {
+                Ok(v)
+            } else {
+                cg.builder.build_float_ext(v, f64_ty, "fwide").map_err(err)
+            }
+        };
+        let a = wide(self, a)?;
+        let b = match b {
+            Some(b) => wide(self, b)?,
+            None => f64_ty.const_zero(),
+        };
+        let result = wide(self, result)?;
+        let fabs = self.get_or_declare_f64_intrinsic("llvm.fabs.f64");
+        let magnitude = self
+            .builder
+            .build_call(fabs, &[result.into()], "fmag")
+            .map_err(err)?
+            .try_as_basic_value()
+            .basic()
+            .unwrap()
+            .into_float_value();
+        // Infinite or NaN (unordered compares true for NaN).
+        let bad = self
+            .builder
+            .build_float_compare(
+                inkwell::FloatPredicate::UEQ,
+                magnitude,
+                f64_ty.const_float(f64::INFINITY),
+                "fbad",
+            )
+            .map_err(err)?;
+        let func = self.current_fn.unwrap();
+        let check_bb = self.context.append_basic_block(func, "fcheck");
+        let fail_bb = self.context.append_basic_block(func, "ferror");
+        let ok_bb = self.context.append_basic_block(func, "fok");
+        self.builder
+            .build_conditional_branch(bad, check_bb, ok_bb)
+            .map_err(err)?;
+        self.builder.position_at_end(check_bb);
+        let i32_ty = self.context.i32_type();
+        let code = self
+            .builder
+            .build_call(
+                classify,
+                &[
+                    a.into(),
+                    b.into(),
+                    result.into(),
+                    i32_ty.const_int(op, false).into(),
+                ],
+                "fcode",
+            )
+            .map_err(err)?
+            .try_as_basic_value()
+            .basic()
+            .unwrap()
+            .into_int_value();
+        let failed = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                code,
+                code.get_type().const_zero(),
+                "ffailed",
+            )
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(failed, fail_bb, ok_bb)
+            .map_err(err)?;
+        self.builder.position_at_end(fail_bb);
+        let here = func.as_global_value().as_pointer_value();
+        let report = self
+            .module
+            .get_function("bruto_runtime_error")
+            .ok_or_else(|| CodeGenError::new("the runtime error routine is missing", Some(span)))?;
+        let code32 = if code.get_type().get_bit_width() == 32 {
+            code
+        } else {
+            self.builder
+                .build_int_truncate(code, i32_ty, "code32")
+                .map_err(err)?
+        };
+        self.builder
+            .build_call(
+                report,
+                &[
+                    code32.into(),
+                    here.into(),
+                    self.context.bool_type().const_int(1, false).into(),
+                ],
+                "",
+            )
+            .map_err(err)?;
+        self.builder.build_unreachable().map_err(err)?;
+        self.builder.position_at_end(ok_bb);
+        Ok(())
+    }
+
     /// A System function call, if `name` is one and isn't the program's
     /// own.
     pub(super) fn compile_system_func(

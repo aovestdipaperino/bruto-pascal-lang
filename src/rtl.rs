@@ -39,6 +39,7 @@ const UNITS: &[(&str, &str)] = &[
     ("netdb.pp", include_str!("../rtl/netdb.pp")),
     ("netobjects.pp", include_str!("../rtl/netobjects.pp")),
     ("classes.pp", include_str!("../rtl/classes.pp")),
+    ("math.pp", include_str!("../rtl/math.pp")),
     ("fgl.pp", include_str!("../rtl/fgl.pp")),
     (
         "generics.collections.pp",

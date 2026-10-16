@@ -288,6 +288,7 @@ pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
         | PascalType::ShortString { .. }
         | PascalType::SizedInt { .. }
         | PascalType::Real
+        | PascalType::Single
         | PascalType::String
         | PascalType::Boolean
         | PascalType::Char

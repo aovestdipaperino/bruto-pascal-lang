@@ -55,6 +55,11 @@ type
 
 var
   BrutoRunErrorHook: TBrutoRunErrorHook;
+  { The floating point exceptions that don't stop the program, as Math's
+    TFPUExceptionMask bits (invalid operation 1, denormal 2, division by
+    zero 4, overflow 8, underflow 16, precision 32), xor-ed with FPC's
+    default (denormal, underflow and precision masked). }
+  BrutoFPUMaskFlip: LongInt;
   { Strings made by the statement being run and not yet stored anywhere
     (reference count 0): freed when it ends, unless stored by then. }
   BrutoPool: PBrutoPointers;
@@ -117,6 +122,17 @@ procedure bruto_intf_addref(Obj, ITable: Pointer);
 procedure bruto_intf_release(Obj, ITable: Pointer);
 { The itable of the interface described by Desc in Obj's class, or nil. }
 function bruto_intf_find(Obj, Desc: Pointer): Pointer;
+{ The runtime error a floating point operation Op (1 +, 2 -, 3 *, 4 /,
+  5 Sqrt, 6 Ln, 7 Exp) on A (and B) giving R (an infinity or NaN) is, as
+  FPC reports it: 208 division by zero, 207 invalid operation, 205
+  overflow, or 0 (none, or masked). }
+function bruto_float_error(A, B, R: Double; Op: LongInt): LongInt;
+{ X as FPC's Str and Write give it: Width (or -1) and FracDigits (or -1,
+  for the exponential form), with a Single's 10 digits and 2-digit
+  exponent, or a Double's 17 and 3. }
+function bruto_real_str(X: Double; Width, FracDigits: LongInt; IsSingle: Boolean): Pointer;
+{ The QWord Q (held in an Int64) in decimal. }
+function bruto_qword_str(Q: Int64): Pointer;
 { Write S to the console (and the IDE's capture), #0 characters included. }
 procedure bruto_astr_write(S: Pointer);
 
@@ -236,6 +252,40 @@ begin
     Exit;
   F := TBrutoIntfCount(PBrutoPointers(ITable)^[2]);
   F(Obj);
+end;
+
+function bruto_float_finite(X: Double): Boolean;
+begin
+  bruto_float_finite := X - X = 0;
+end;
+
+function bruto_float_error(A, B, R: Double; Op: LongInt): LongInt;
+var
+  Code, Bit: LongInt;
+begin
+  Code := 0;
+  if R <> R then
+  begin
+    { NaN from numbers: an invalid operation. }
+    if (A = A) and ((Op >= 5) or (B = B)) then
+      Code := 207;
+  end
+  else if (Op = 4) and (B = 0) and bruto_float_finite(A) then
+    Code := 208
+  else if (Op = 6) and (A = 0) then
+    Code := 208
+  else if bruto_float_finite(A) and ((Op >= 5) or bruto_float_finite(B)) then
+    Code := 205;
+  case Code of
+    207: Bit := 1;
+    208: Bit := 4;
+    205: Bit := 8;
+  else
+    Bit := 0;
+  end;
+  if ((BrutoFPUMaskFlip xor 50) and Bit) <> 0 then
+    Code := 0;
+  bruto_float_error := Code;
 end;
 
 function bruto_intf_find(Obj, Desc: Pointer): Pointer;
@@ -541,6 +591,588 @@ begin
     Code, PtrUInt(Address), PtrUInt(Address));
   bruto_rt_write(2, @Buf, N);
   bruto_rt_exit(Code);
+end;
+
+function bruto_qword_str(Q: Int64): Pointer;
+var
+  Buf: array[0..31] of Char;
+  N: LongInt;
+  R: Pointer;
+begin
+  N := bruto_rt_snprintf(@Buf, SizeOf(Buf), '%llu', Q);
+  R := bruto_astr_alloc(N);
+  Move(Buf, R^, N);
+  bruto_qword_str := R;
+end;
+
+{ ── Reals as text, as FPC's str_real (flt_core.inc) makes them ── }
+
+type
+  TBrutoDigits = array[0..47] of Byte;
+  TBrutoRealText = array[0..299] of Char;
+
+{ Round the NCur digits in Buf to NMax: half to even, or (Even false) half
+  up, also rounding ...4999..98 up as FPC does. The result is 1 when the
+  first digit carried out (the decimal point moves). }
+function bruto_round_digits(var Buf: TBrutoDigits; var NCur: LongInt; NMax: LongInt;
+  Even: Boolean): LongInt;
+var
+  N, I: LongInt;
+  Rd, Sticky: Byte;
+begin
+  bruto_round_digits := 0;
+  N := NCur;
+  NCur := NMax;
+  Rd := Buf[NMax];
+  if (not Even) and (Rd = 4) and (NMax < N - 3) and (Buf[N - 2] >= 8) then
+  begin
+    I := N - 2;
+    repeat
+      I := I - 1;
+    until (I = NMax) or (Buf[I] <> 9);
+    if I = NMax then
+      Rd := 9;
+  end;
+  if Rd < 5 then
+    Exit;
+  if (Rd = 5) and Even and ((NMax = 0) or ((Buf[NMax - 1] and 1) = 0)) then
+  begin
+    Sticky := 0;
+    while (N > NMax + 1) and (Sticky = 0) do
+    begin
+      N := N - 1;
+      Sticky := Buf[N];
+    end;
+    if Sticky = 0 then
+      Exit;
+  end;
+  while NMax > 0 do
+  begin
+    NMax := NMax - 1;
+    Buf[NMax] := Buf[NMax] + 1;
+    if Buf[NMax] < 10 then
+    begin
+      NCur := NMax + 1;
+      Exit;
+    end;
+  end;
+  Buf[0] := 1;
+  NCur := 1;
+  bruto_round_digits := 1;
+end;
+
+procedure bruto_text_add(var T: TBrutoRealText; var Len: LongInt; C: Char; Count: LongInt);
+begin
+  while (Count > 0) and (Len < 299) do
+  begin
+    T[Len] := C;
+    Len := Len + 1;
+    Count := Count - 1;
+  end;
+end;
+
+{ The fixed point form; False if it would pass 255 characters. }
+function bruto_real_fixed(var T: TBrutoRealText; var Len: LongInt; Minus: Boolean;
+  const Digits: TBrutoDigits; NHave, DotPos, MinWidth, FracDigits: LongInt): Boolean;
+var
+  R: TBrutoDigits;
+  CutAt, NBefore, NBefore0, NAfter0, NAfter, NTail0, Total, Spaces, J: LongInt;
+begin
+  bruto_real_fixed := False;
+  R := Digits;
+  CutAt := DotPos + FracDigits;
+  if CutAt < 0 then
+    NHave := 0
+  else if CutAt < NHave then
+    DotPos := DotPos + bruto_round_digits(R, NHave, CutAt, False);
+  if (DotPos <= 0) or (NHave = 0) then
+  begin
+    NBefore := 0;
+    NBefore0 := 1;
+  end
+  else if DotPos > NHave then
+  begin
+    NBefore := NHave;
+    NBefore0 := DotPos - NHave;
+  end
+  else
+  begin
+    NBefore := DotPos;
+    NBefore0 := 0;
+  end;
+  if DotPos < 0 then
+    NAfter0 := -DotPos
+  else
+    NAfter0 := 0;
+  if NAfter0 > FracDigits then
+    NAfter0 := FracDigits;
+  NAfter := NHave - NBefore;
+  NTail0 := FracDigits - NAfter - NAfter0;
+  Total := Ord(Minus) + NBefore + NBefore0;
+  if FracDigits > 0 then
+    Total := Total + NAfter0 + NAfter + NTail0 + 1;
+  if Total > 255 then
+    Exit;
+  Spaces := MinWidth - Total;
+  if Spaces > 255 - Total then
+    Spaces := 255 - Total;
+  Len := 0;
+  bruto_text_add(T, Len, ' ', Spaces);
+  if Minus then
+    bruto_text_add(T, Len, '-', 1);
+  J := 0;
+  while NBefore > 0 do
+  begin
+    bruto_text_add(T, Len, Chr(R[J] + 48), 1);
+    J := J + 1;
+    NBefore := NBefore - 1;
+  end;
+  bruto_text_add(T, Len, '0', NBefore0);
+  if FracDigits <> 0 then
+  begin
+    bruto_text_add(T, Len, '.', 1);
+    bruto_text_add(T, Len, '0', NAfter0);
+    while NAfter > 0 do
+    begin
+      bruto_text_add(T, Len, Chr(R[J] + 48), 1);
+      J := J + 1;
+      NAfter := NAfter - 1;
+    end;
+    bruto_text_add(T, Len, '0', NTail0);
+  end;
+  bruto_real_fixed := True;
+end;
+
+procedure bruto_real_exponential(var T: TBrutoRealText; var Len: LongInt; Minus: Boolean;
+  const Digits: TBrutoDigits; NHave, NReq, DExp, NDigExp, MinWidth: LongInt);
+var
+  EMinus: Boolean;
+  ExpText: array[0..15] of Char;
+  NExp, Total, Spaces, J: LongInt;
+begin
+  EMinus := DExp < 0;
+  if EMinus then
+    DExp := -DExp;
+  NExp := 0;
+  repeat
+    ExpText[NExp] := Chr(DExp mod 10 + 48);
+    DExp := DExp div 10;
+    NExp := NExp + 1;
+  until DExp = 0;
+  if NExp <= NDigExp then
+    Total := NDigExp
+  else
+    Total := NExp;
+  Total := Total + 1 + NReq + 2;
+  if NReq > 1 then
+    Total := Total + 1;
+  Spaces := MinWidth - Total;
+  if Spaces > 255 - Total then
+    Spaces := 255 - Total;
+  Len := 0;
+  bruto_text_add(T, Len, ' ', Spaces);
+  if Minus then
+    bruto_text_add(T, Len, '-', 1)
+  else
+    bruto_text_add(T, Len, ' ', 1);
+  if NHave > 0 then
+    bruto_text_add(T, Len, Chr(Digits[0] + 48), 1)
+  else
+    bruto_text_add(T, Len, '0', 1);
+  if NReq > 1 then
+    bruto_text_add(T, Len, '.', 1);
+  J := 1;
+  while (J < NHave) and (J < NReq) do
+  begin
+    bruto_text_add(T, Len, Chr(Digits[J] + 48), 1);
+    J := J + 1;
+  end;
+  bruto_text_add(T, Len, '0', NReq - J);
+  bruto_text_add(T, Len, 'E', 1);
+  if EMinus then
+    bruto_text_add(T, Len, '-', 1)
+  else
+    bruto_text_add(T, Len, '+', 1);
+  bruto_text_add(T, Len, '0', NDigExp - NExp);
+  while NExp > 0 do
+  begin
+    NExp := NExp - 1;
+    bruto_text_add(T, Len, ExpText[NExp], 1);
+  end;
+end;
+
+{ ── FPC's Grisu1 digit generation (flt_core.inc, 64-bit), so the digits
+  are FPC's to the last one. Unsigned 64-bit values are kept in Int64. }
+
+type
+  TBrutoDiyFp = record
+    F: Int64;
+    E: LongInt;
+  end;
+  TBrutoPow10 = record
+    F: Int64;
+    E: LongInt;
+    E10: LongInt;
+  end;
+
+function bruto_ult(A, B: Int64): Boolean;
+begin
+  bruto_ult := (A xor (Int64(1) shl 63)) < (B xor (Int64(1) shl 63));
+end;
+
+{ X div D, X unsigned, 0 < D < 2^62. }
+function bruto_udiv(X, D: Int64): Int64;
+var
+  Q, R: Int64;
+begin
+  if X >= 0 then
+  begin
+    bruto_udiv := X div D;
+    Exit;
+  end;
+  Q := ((X shr 1) div D) shl 1;
+  R := X - Q * D;
+  while not bruto_ult(R, D) do
+  begin
+    Q := Q + 1;
+    R := R - D;
+  end;
+  bruto_udiv := Q;
+end;
+
+function bruto_diy_multiply(const X: TBrutoDiyFp; YF: Int64; YE: LongInt;
+  Normalize: Boolean): TBrutoDiyFp;
+var
+  A, B, C, D, AC, BC, AD, BD, T1: Int64;
+  R: TBrutoDiyFp;
+begin
+  A := X.F shr 32;
+  B := X.F and $FFFFFFFF;
+  C := YF shr 32;
+  D := YF and $FFFFFFFF;
+  AC := A * C;
+  BC := B * C;
+  AD := A * D;
+  BD := B * D;
+  T1 := (Int64(1) shl 31) + (BD shr 32) + (BC and $FFFFFFFF) + (AD and $FFFFFFFF);
+  R.F := AC + (AD shr 32) + (BC shr 32) + (T1 shr 32);
+  R.E := X.E + YE + 64;
+  if Normalize and ((R.F shr 63) = 0) then
+  begin
+    R.F := R.F + R.F;
+    R.E := R.E - 1;
+  end;
+  bruto_diy_multiply := R;
+end;
+
+procedure bruto_pow10_entry(var P: TBrutoPow10; Index: LongInt);
+begin
+  case Index of
+    { base }
+    0: begin P.F := Int64($825ECC24C8737830); P.E := -362; P.E10 := -90; end;
+    1: begin P.F := Int64($E2280B6C20DD5232); P.E := -303; P.E10 := -72; end;
+    2: begin P.F := Int64($C428D05AA4751E4D); P.E := -243; P.E10 := -54; end;
+    3: begin P.F := Int64($AA242499697392D3); P.E := -183; P.E10 := -36; end;
+    4: begin P.F := Int64($9392EE8E921D5D07); P.E := -123; P.E10 := -18; end;
+    5: begin P.F := Int64($8000000000000000); P.E := -63; P.E10 := 0; end;
+    6: begin P.F := Int64($DE0B6B3A76400000); P.E := -4; P.E10 := 18; end;
+    7: begin P.F := Int64($C097CE7BC90715B3); P.E := 56; P.E10 := 36; end;
+    8: begin P.F := Int64($A70C3C40A64E6C52); P.E := 116; P.E10 := 54; end;
+    9: begin P.F := Int64($90E40FBEEA1D3A4B); P.E := 176; P.E10 := 72; end;
+    { factor_plus }
+    10: begin P.F := Int64($F6C69A72A3989F5C); P.E := 534; P.E10 := 180; end;
+    11: begin P.F := Int64($EDE24AE798EC8284); P.E := 1132; P.E10 := 360; end;
+    { factor_minus }
+    12: begin P.F := Int64($84C8D4DFD2C63F3B); P.E := -661; P.E10 := -180; end;
+    13: begin P.F := Int64($89BF722840327F82); P.E := -1259; P.E10 := -360; end;
+  end;
+end;
+
+function bruto_pow10_corrector(I: LongInt): LongInt;
+begin
+  case I of
+    4, 8, 11, 12, 13, 17, 44: bruto_pow10_corrector := 1;
+    9, 14, 19, 30, 33, 39, 48: bruto_pow10_corrector := -1;
+  else
+    bruto_pow10_corrector := 0;
+  end;
+end;
+
+procedure bruto_cached_power10(Exp10: LongInt; var Factor: TBrutoPow10);
+var
+  I, XMul, INod, Min10: LongInt;
+  A, M: TBrutoPow10;
+  X, R: TBrutoDiyFp;
+begin
+  Min10 := -90 + -360;
+  if Exp10 <= Min10 then
+    I := 0
+  else
+  begin
+    I := (Exp10 - Min10) div 18;
+    if I * 18 + Min10 <> Exp10 then
+      I := I + 1;
+    if I > 49 then
+      I := 49;
+  end;
+  INod := I mod 10;
+  XMul := (I div 10) - 2;
+  bruto_pow10_entry(A, INod);
+  if XMul = 0 then
+  begin
+    Factor := A;
+    Exit;
+  end;
+  if XMul > 0 then
+    bruto_pow10_entry(M, 10 + XMul - 1)
+  else
+    bruto_pow10_entry(M, 12 - (XMul + 1));
+  Factor.E10 := A.E10 + M.E10;
+  if A.E10 = 0 then
+  begin
+    Factor.F := M.F;
+    Factor.E := M.E;
+    Exit;
+  end;
+  X.F := A.F;
+  X.E := A.E;
+  R := bruto_diy_multiply(X, M.F, M.E, True);
+  Factor.F := R.F + bruto_pow10_corrector(I);
+  Factor.E := R.E;
+end;
+
+function bruto_gen_digits_32(var Buf: TBrutoDigits; Pos: LongInt; X: Int64; Pad9: Boolean): LongInt;
+var
+  N: LongInt;
+  M, Z: Int64;
+begin
+  N := 0;
+  M := X;
+  while M <> 0 do
+  begin
+    N := N + 1;
+    M := M div 10;
+  end;
+  if Pad9 and (N < 9) then
+    N := 9;
+  bruto_gen_digits_32 := N;
+  M := X;
+  while N > 0 do
+  begin
+    N := N - 1;
+    Z := M div 10;
+    Buf[Pos + N] := M - Z * 10;
+    M := Z;
+  end;
+end;
+
+function bruto_gen_digits_64(var Buf: TBrutoDigits; Pos: LongInt; X: Int64): LongInt;
+var
+  N: LongInt;
+  Temp, SplitL, SplitM, SplitH: Int64;
+begin
+  if bruto_ult(X, 1000000000) then
+  begin
+    SplitH := 0;
+    SplitM := 0;
+    SplitL := X;
+  end
+  else
+  begin
+    Temp := bruto_udiv(X, 1000000000);
+    SplitL := X - Temp * 1000000000;
+    if Temp < 1000000000 then
+    begin
+      SplitH := 0;
+      SplitM := Temp;
+    end
+    else
+    begin
+      SplitH := Temp div 1000000000;
+      SplitM := Temp - SplitH * 1000000000;
+    end;
+  end;
+  N := bruto_gen_digits_32(Buf, Pos, SplitH, False);
+  N := N + bruto_gen_digits_32(Buf, Pos + N, SplitM, N <> 0);
+  N := N + bruto_gen_digits_32(Buf, Pos + N, SplitL, N <> 0);
+  bruto_gen_digits_64 := N;
+end;
+
+{ The decimal digits of the non-zero, finite X (as FPC's str_real makes
+  them): NeedDig digits rounded half to even, at most; DotPos is where the
+  decimal point goes. }
+procedure bruto_real_digits(X: Double; NeedDig: LongInt; var Digits: TBrutoDigits;
+  var N, DotPos: LongInt);
+var
+  Bits, OneMask, Fl: Int64;
+  W, D: TBrutoDiyFp;
+  CMk: TBrutoPow10;
+  Shift, Mk, OneE, K: LongInt;
+  DExp: Double;
+  Sticky: Boolean;
+begin
+  Bits := PBrutoLength(@X)^;
+  W.E := (Bits shr 52) and $7FF;
+  W.F := Bits and $000FFFFFFFFFFFFF;
+  if W.E <> 0 then
+  begin
+    W.F := W.F or (Int64(1) shl 52);
+    Shift := 11;
+  end
+  else
+  begin
+    { A denormal: normalize it. }
+    Shift := 0;
+    while ((W.F shl Shift) shr 63) = 0 do
+      Shift := Shift + 1;
+    W.E := W.E + 1;
+  end;
+  W.F := W.F shl Shift;
+  W.E := W.E - (1023 + Shift + 52);
+  if (-61 <= W.E) and (W.E <= 0) then
+  begin
+    D := W;
+    CMk.E10 := 0;
+  end
+  else
+  begin
+    { k_comp: ceiling((alpha - e) * log10(2)) }
+    K := -61 - W.E;
+    DExp := K * 0.301029995663981195213738894724493027;
+    Mk := Trunc(DExp);
+    if (K > 0) and (DExp <> Mk) then
+      Mk := Mk + 1;
+    bruto_cached_power10(Mk, CMk);
+    if CMk.E10 = 0 then
+      D := W
+    else
+      D := bruto_diy_multiply(W, CMk.F, CMk.E, False);
+  end;
+  N := bruto_gen_digits_64(Digits, 0, D.F shr (-D.E));
+  DotPos := N;
+  Sticky := False;
+  if D.E < 0 then
+  begin
+    OneE := D.E;
+    OneMask := (Int64(1) shl (-D.E)) - 1;
+    Fl := D.F and OneMask;
+    while (OneE < -29) and (N < NeedDig + 1) and (Fl <> 0) do
+    begin
+      Fl := Fl + (Fl shl 2);
+      OneMask := OneMask shr 1;
+      OneE := OneE + 1;
+      Digits[N] := Fl shr (-OneE);
+      Fl := Fl and OneMask;
+      N := N + 1;
+    end;
+    if N >= NeedDig + 1 then
+      Sticky := Fl <> 0
+    else
+    begin
+      while (N < NeedDig + 1) and (Fl <> 0) do
+      begin
+        Fl := Fl + (Fl shl 2);
+        OneMask := OneMask shr 1;
+        OneE := OneE + 1;
+        Digits[N] := Fl shr (-OneE);
+        Fl := Fl and OneMask;
+        N := N + 1;
+      end;
+      Sticky := Fl <> 0;
+    end;
+  end;
+  if Sticky and (N >= NeedDig + 1) then
+  begin
+    N := NeedDig + 2;
+    Digits[NeedDig + 1] := 1;
+  end;
+  if N > NeedDig then
+    DotPos := DotPos + bruto_round_digits(Digits, N, NeedDig, True);
+  DotPos := DotPos - CMk.E10;
+end;
+
+function bruto_real_str(X: Double; Width, FracDigits: LongInt; IsSingle: Boolean): Pointer;
+var
+  T: TBrutoRealText;
+  Spec: array[0..3] of Char;
+  Digits: TBrutoDigits;
+  Len, NeedDig, ExpDig, SciDig, MinWidth, N, I, DotPos, SpecLen: LongInt;
+  Minus: Boolean;
+  R: Pointer;
+begin
+  if FracDigits > 216 then
+    FracDigits := 216;
+  if Width > 255 then
+    Width := 255;
+  MinWidth := Width;
+  if IsSingle then
+  begin
+    NeedDig := 10;
+    ExpDig := 2;
+  end
+  else
+  begin
+    NeedDig := 17;
+    ExpDig := 3;
+  end;
+  if MinWidth < 0 then
+    SciDig := NeedDig
+  else
+  begin
+    SciDig := MinWidth - 4 - ExpDig;
+    if SciDig < 2 then
+      SciDig := 2;
+    if SciDig > NeedDig then
+      SciDig := NeedDig;
+  end;
+  Minus := PBrutoLength(@X)^ < 0;
+  Len := 0;
+  if X - X <> 0 then
+  begin
+    { Infinity (signed) or NaN (signless). }
+    if MinWidth < 0 then
+      MinWidth := NeedDig + ExpDig + 4;
+    if X = X then
+    begin
+      if Minus then
+        Spec[0] := '-'
+      else
+        Spec[0] := '+';
+      Spec[1] := 'I';
+      Spec[2] := 'n';
+      Spec[3] := 'f';
+      SpecLen := 4;
+    end
+    else
+    begin
+      Spec[0] := 'N';
+      Spec[1] := 'a';
+      Spec[2] := 'n';
+      SpecLen := 3;
+    end;
+    bruto_text_add(T, Len, ' ', MinWidth - SpecLen);
+    for I := 0 to SpecLen - 1 do
+      bruto_text_add(T, Len, Spec[I], 1);
+  end
+  else if X = 0 then
+  begin
+    if (FracDigits < 0) or not bruto_real_fixed(T, Len, Minus, Digits, 0, 1, MinWidth, FracDigits) then
+      bruto_real_exponential(T, Len, Minus, Digits, 0, SciDig, 0, ExpDig, MinWidth);
+  end
+  else
+  begin
+    bruto_real_digits(X, NeedDig, Digits, N, DotPos);
+    if (FracDigits < 0) or not bruto_real_fixed(T, Len, Minus, Digits, N, DotPos, MinWidth, FracDigits) then
+    begin
+      if N > SciDig then
+        DotPos := DotPos + bruto_round_digits(Digits, N, SciDig, False);
+      bruto_real_exponential(T, Len, Minus, Digits, N, SciDig, DotPos - 1, ExpDig, MinWidth);
+    end;
+  end;
+  R := bruto_astr_alloc(Len);
+  if Len > 0 then
+    Move(T, R^, Len);
+  bruto_real_str := R;
 end;
 
 { SIGSEGV / SIGBUS. The signal is unblocked first: a handler raising an

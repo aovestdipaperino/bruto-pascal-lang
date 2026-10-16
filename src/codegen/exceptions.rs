@@ -23,6 +23,7 @@ use inkwell::AddressSpace;
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::types::StructType;
 use inkwell::values::{FunctionValue, PointerValue};
+use std::collections::HashMap;
 
 /// Words in a frame's `jmp_buf`: more than any supported system needs.
 const JMP_BUF_WORDS: u32 = 64;
@@ -675,5 +676,106 @@ impl<'ctx> CodeGen<'ctx> {
         }
         self.builder.position_at_end(body_bb);
         Ok(Some(frame))
+    }
+}
+
+/// As FPC, reject a `goto` into or out of a `try` block (its `except` and
+/// `finally` parts included): it would leave the exception frames wrong.
+pub(super) fn check_goto_targets(body: &Block) -> Result<(), CodeGenError> {
+    let mut walk = GotoWalk::default();
+    walk.block(body, &mut Vec::new());
+    for (label, path, span) in &walk.gotos {
+        if let Some(target) = walk.labels.get(label)
+            && target != path
+        {
+            return Err(CodeGenError::new(
+                "jump in or outside of an exception block",
+                Some(*span),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where each label and `goto` is: the `try` parts enclosing it.
+#[derive(Default)]
+struct GotoWalk {
+    next_part: usize,
+    labels: HashMap<i64, Vec<usize>>,
+    gotos: Vec<(i64, Vec<usize>, Span)>,
+}
+
+impl GotoWalk {
+    fn block(&mut self, block: &Block, path: &mut Vec<usize>) {
+        self.list(&block.statements, path);
+    }
+
+    fn list(&mut self, stmts: &[Statement], path: &mut Vec<usize>) {
+        for s in stmts {
+            self.stmt(s, path);
+        }
+    }
+
+    /// Walk `block` as a new `try` part.
+    fn part(&mut self, block: &Block, path: &mut Vec<usize>) {
+        self.next_part += 1;
+        path.push(self.next_part);
+        self.block(block, path);
+        path.pop();
+    }
+
+    fn stmt(&mut self, stmt: &Statement, path: &mut Vec<usize>) {
+        match stmt {
+            Statement::Label { label, .. } => {
+                self.labels.insert(*label, path.clone());
+            }
+            Statement::Goto { label, span } => self.gotos.push((*label, path.clone(), *span)),
+            Statement::Block(b) => self.block(b, path),
+            Statement::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.block(then_branch, path);
+                if let Some(e) = else_branch {
+                    self.block(e, path);
+                }
+            }
+            Statement::While { body, .. }
+            | Statement::For { body, .. }
+            | Statement::ForIn { body, .. }
+            | Statement::With { body, .. } => self.block(body, path),
+            Statement::RepeatUntil { body, .. } => self.list(body, path),
+            Statement::Case {
+                branches,
+                else_branch,
+                ..
+            } => {
+                for b in branches {
+                    self.list(&b.body, path);
+                }
+                if let Some(e) = else_branch {
+                    self.list(e, path);
+                }
+            }
+            Statement::Try { body, handler, .. } => {
+                self.part(body, path);
+                match handler {
+                    TryHandler::Except {
+                        handlers,
+                        otherwise,
+                    } => {
+                        for h in handlers {
+                            self.part(&h.body, path);
+                        }
+                        if let Some(o) = otherwise {
+                            self.part(o, path);
+                        }
+                    }
+                    TryHandler::Finally(b) => self.part(b, path),
+                }
+            }
+            _ => {}
+        }
     }
 }

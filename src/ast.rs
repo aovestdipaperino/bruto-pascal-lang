@@ -234,6 +234,9 @@ pub enum PascalType {
         signed: bool,
     },
     Real,
+    /// `Single`: a 32-bit float in memory, widened to `Real` as soon as
+    /// it is loaded into an expression.
+    Single,
     String,
     Boolean,
     Char,

@@ -407,6 +407,7 @@ impl Drop for PascalBuildJob {
 /// in dependency order. Detects cycles and missing files.
 pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Result<(), String> {
     if program.uses.is_empty() {
+        rtl::add_system_prelude(program)?;
         return rtl::add_string_runtime(program);
     }
 
@@ -2685,7 +2686,8 @@ end.
         assert!(ok);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "42");
-        assert!(lines[1].starts_with("3.14"), "got {:?}", lines[1]);
+        // As FPC writes a Double.
+        assert_eq!(lines[1], " 3.1400000000000001E+000");
     }
 
     #[test]
@@ -5684,6 +5686,290 @@ end.
         );
         assert!(ok, "program failed: {out}");
         assert_eq!(out, "3 1\nTRUE 2\nFALSE 5\n5 3\n5 5\n42\n1\n");
+    }
+
+    #[test]
+    fn math_unit_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program mt;
+{$mode objfpc}{$H+}
+uses Math;
+var M: TFPUExceptionMask; D: array[0..3] of Double = (1.5, 2.5, -3, 4);
+begin
+  WriteLn(Max(3, 7), ' ', Min(2.5, 1.5):0:2, ' ', Max(Int64(5), 9));
+  WriteLn(Power(2, 10):0:0, ' ', Power(2, 0.5):0:6, ' ', IntPower(3, -2):0:6);
+  WriteLn(Floor(-2.5), ' ', Ceil(-2.5), ' ', Floor(2.5), ' ', Ceil(2.1));
+  WriteLn(Log10(1000):0:3, ' ', Log2(8):0:3, ' ', LogN(3, 81):0:3);
+  WriteLn(Tan(Pi/4):0:6, ' ', ArcSin(1):0:6, ' ', ArcTan2(1, 1):0:6, ' ', Hypot(3, 4):0:1);
+  WriteLn(DegToRad(180):0:6, ' ', RadToDeg(Pi):0:1);
+  WriteLn(Sum(D):0:2, ' ', Mean(D):0:3, ' ', MaxValue(D):0:1, ' ', MinValue(D):0:1, ' ', StdDev(D):0:4);
+  WriteLn(RoundTo(1234.5678, 2):0:2, ' ', RoundTo(1.2345, -2):0:4, ' ', SimpleRoundTo(1.235):0:2);
+  WriteLn(Sign(-3.5), ' ', Sign(0), ' ', CompareValue(1.0, 2.0), ' ', InRange(5, 1, 10), ' ', EnsureRange(15, 1, 10));
+  WriteLn(IsZero(1e-13), ' ', SameValue(1.0, 1.0 + 1e-14), ' ', IsNan(NaN), ' ', IsInfinite(Infinity));
+  M := GetExceptionMask;
+  WriteLn(exZeroDivide in M, ' ', exPrecision in M, ' ', exUnderflow in M);
+  SetExceptionMask([exInvalidOp, exZeroDivide, exOverflow]);
+  WriteLn(exZeroDivide in GetExceptionMask, ' ', 1 / (D[0] - 1.5) > 0);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "7 1.50 9\n1024 1.414214 0.111111\n-3 -2 2 3\n3.000 3.000 4.000\n1.000000 1.570796 0.785398 5.0\n3.141593 180.0\n5.00 1.250 4.0 -3.0 3.0139\n1200.00 1.2300 1.24\n-1 0 -1 TRUE 10\nTRUE TRUE TRUE TRUE\nFALSE TRUE TRUE\nTRUE TRUE\n"
+        );
+    }
+
+    #[test]
+    fn random_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program rnd;
+var I: Integer;
+begin
+  for I := 1 to 5 do Write(Random(100), ' ');
+  WriteLn;
+  RandSeed := 42;
+  for I := 1 to 5 do Write(Random(1000), ' ');
+  WriteLn(Random:0:8);
+  for I := 1 to 700 do Random(10);
+  WriteLn(Random(1000000), ' ', RandSeed);
+  RandSeed := 42;
+  WriteLn(Random(1000));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "54 59 71 84 60 \n374 796 950 183 731 0.77969100\n162934 4294967253\n374\n"
+        );
+    }
+
+    #[test]
+    fn real_output_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program rf;
+var S: Single; D: Double;
+begin
+  WriteLn(0.125:0:2, ' ', 0.375:0:2, ' ', 2.5:0:0, ' ', 3.5:0:0, ' ', 0.5:0:0, ' ', 1.005:0:2, ' ', 2.675:0:2);
+  WriteLn(1.25:8, '|', 1.25:9, '|', 1.25:20, '|', 1.25:30, '|', -1.25:3);
+  S := 0.1; D := 0.1;
+  WriteLn(S, '|', D, '|', S:0:10, '|', D:0:20, '|', S:12);
+  WriteLn(123456789012345678.0:0:1, ' ', 1e20:0:2, ' ', 0.000001234:0:8);
+  WriteLn(-0.0:0:2, ' ', -0.0, ' ', 1e-320, ' ', 5e-324:0:2);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "0.13 0.38 3 4 1 1.01 2.68\n 1.3E+00| 1.25E+00|     1.250000000E+00|               1.250000000E+00|-1.3E+00\n 1.000000015E-01| 1.0000000000000001E-001|0.1000000015|0.10000000000000001000| 1.00000E-01\n123456789012345680.0 100000000000000000000.00 0.00000123\n-0.00 -0.000000000E+00  9.9998886718268301E-321 0.00\n"
+        );
+    }
+
+    #[test]
+    fn real_specials_and_widths_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program wf;
+{$mode objfpc}
+uses Math;
+var Z, N, X: Double; S: Single;
+begin
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+  Z := 0; X := 1.5; S := 2.25;
+  WriteLn(Z);
+  WriteLn(X);
+  WriteLn(-X);
+  WriteLn(S);
+  WriteLn(1 / Z);
+  WriteLn(-1 / Z);
+  N := Z / Z;
+  WriteLn(N);
+  WriteLn(1 / Z:10:2, '|', N:8:3, '|', X:12, '|', Z:0:2);
+  WriteLn(1e300 * 10, ' ', 123456789.125:0:3, ' ', 1e-5);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            " 0.0000000000000000E+000\n 1.5000000000000000E+000\n-1.5000000000000000E+000\n 2.250000000E+00\n                    +Inf\n                    -Inf\n                     Nan\n      +Inf|     Nan| 1.5000E+000|0.00\n 1.0000000000000001E+301 123456789.125  1.0000000000000001E-005\n"
+        );
+    }
+
+    #[test]
+    fn qword_arithmetic_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program qw;
+{$mode objfpc}
+uses SysUtils;
+var Q, R: QWord; I: Int64; S: string; B: Byte;
+begin
+  Q := QWord($FFFFFFFFFFFFFFFF);
+  R := 10;
+  WriteLn(Q shr 60, ' ', Q div R, ' ', Q mod R, ' ', Q > R, ' ', Q);
+  WriteLn(Q div 3, ' ', Q mod 7, ' ', Q > 5, ' ', (Q - 1) div 2);
+  Str(Q, S);
+  WriteLn(S, ' ', IntToStr(Q), ' ', IntToStr(-5), ' ', IntToStr(Int64(42)), ' ', UIntToStr(Q));
+  Q := QWord(1) shl 63;
+  B := 200;
+  WriteLn(Q, ' ', Q > B, ' ', Q:25, '|');
+  I := -1;
+  WriteLn(I < 0, ' ', I div 2);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "15 1844674407370955161 5 TRUE 18446744073709551615\n6148914691236517205 1 TRUE 9223372036854775807\n18446744073709551615 18446744073709551615 -5 42 18446744073709551615\n9223372036854775808 TRUE       9223372036854775808|\nTRUE 0\n"
+        );
+    }
+
+    #[test]
+    fn initialized_variables() {
+        let (ok, out) = build_and_run_source(
+            "program iv;
+type TPt = record X, Y: Integer; end;
+var
+  Count: Integer = 5;
+  Name: string = 'bruto';
+  Pt: TPt = (X: 1; Y: 2);
+  Primes: array[1..4] of Integer = (2, 3, 5, 7);
+procedure Bump;
+var Calls: Integer = 10;
+begin
+  Inc(Calls);
+  WriteLn('calls ', Calls);
+end;
+begin
+  WriteLn(Count, ' ', Name, ' ', Pt.X + Pt.Y, ' ', Primes[4]);
+  Count := Count * 2;
+  Name := Name + '!';
+  Primes[1] := 11;
+  WriteLn(Count, ' ', Name, ' ', Primes[1]);
+  Bump;
+  Bump;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "5 bruto 3 7\n10 bruto! 11\ncalls 11\ncalls 11\n");
+    }
+
+    #[test]
+    fn float_errors_raise_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program fz3;
+{$mode objfpc}{$H+}
+uses SysUtils, Math;
+var A, B, C: Double; S: Single; I: Integer;
+procedure Try1(const What: string; X: Double);
+begin
+  WriteLn(What, ' ', X:0:3);
+end;
+begin
+  A := 1; B := 0;
+  try C := A / B; WriteLn(C); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try C := B / B; WriteLn(C); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try C := Sqrt(B - 1); WriteLn(C); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try C := Ln(B); WriteLn(C); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try C := Exp(1000); WriteLn(C); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try C := 1e300 * 1e300; WriteLn(C); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try I := 0; I := 10 div I; except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  C := 1e-300 * 1e-300;
+  WriteLn('underflow masked ', C);
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+  C := A / B;
+  WriteLn('masked ', C, ' ', IsInfinite(C), ' ', IsNan(B / B));
+  SetExceptionMask([exDenormalized, exUnderflow, exPrecision]);
+  C := Infinity + 1;
+  WriteLn('inf arithmetic ok ', C > 0);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "EZeroDivide: Floating point division by zero\nEInvalidOp: Invalid floating point operation\nEInvalidOp: Invalid floating point operation\nEZeroDivide: Floating point division by zero\nEOverflow: Floating point overflow\nEOverflow: Floating point overflow\nEDivByZero: Division by zero\nunderflow masked  0.0000000000000000E+000\nmasked                     +Inf TRUE TRUE\ninf arithmetic ok TRUE\n"
+        );
+    }
+
+    #[test]
+    fn goto_into_or_out_of_try_is_an_error() {
+        let Err(e) = MiniPascal.build(
+            "program gt;
+{$mode objfpc}{$H+}
+uses SysUtils;
+label 10, 20, 30;
+var I: Integer; S: string;
+begin
+  I := 0;
+  try
+    try
+      WriteLn('inner');
+      Inc(I);
+      if I = 1 then goto 10;
+      WriteLn('not here');
+    finally
+      WriteLn('finally inner');
+    end;
+  finally
+    WriteLn('finally outer');
+  end;
+10:
+  WriteLn('at 10');
+  try
+    S := 'x';
+    try
+      goto 20;
+    finally
+      WriteLn('finally A');
+    end;
+20:
+    WriteLn('at 20, still in try');
+    goto 30;
+  except
+    WriteLn('no');
+  end;
+30:
+  WriteLn('at 30');
+  try
+    raise Exception.Create('e');
+  except
+    on E: Exception do
+    begin
+      WriteLn('handler');
+    end;
+  end;
+  WriteLn('done ', I);
+end.
+",
+        ) else {
+            panic!("should not compile");
+        };
+        assert!(
+            format!("{e:?}").contains("jump in or outside of an exception block"),
+            "{e:?}"
+        );
+        // Within one part of a `try`, a goto is fine.
+        let (ok, out) = build_and_run_source(
+            "program T;
+label 1;
+var I: Integer;
+begin
+  try
+    I := 0;
+1:  I := I + 1;
+    if I < 3 then goto 1;
+  finally
+    WriteLn(I);
+  end;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "3\n");
     }
 
     #[test]

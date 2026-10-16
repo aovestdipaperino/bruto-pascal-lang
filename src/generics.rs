@@ -60,6 +60,7 @@ fn type_key(ty: &PascalType, aliases: &HashMap<String, PascalType>) -> String {
         },
         PascalType::Integer => "integer".into(),
         PascalType::Real => "real".into(),
+        PascalType::Single => "single".into(),
         PascalType::String => "string".into(),
         PascalType::UnicodeString => "unicodestring".into(),
         PascalType::Boolean => "boolean".into(),

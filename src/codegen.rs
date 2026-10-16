@@ -763,6 +763,7 @@ impl<'ctx> CodeGen<'ctx> {
         // Compile body (compile_block emits a synthetic alloca on the `end.`
         // line so users can drop a breakpoint there).
         self.begin_exit_block(main_fn);
+        exceptions::check_goto_targets(&program.body)?;
         self.compile_block(&program.body)?;
         self.enter_exit_block(program.body.end_span)?;
         self.release_interface_temps(program.body.end_span)?;
@@ -1182,9 +1183,9 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_store(alloca, self.context.i64_type().const_int(0, false))
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
-                PascalType::Real => {
+                PascalType::Real | PascalType::Single => {
                     self.builder
-                        .build_store(alloca, self.context.f64_type().const_float(0.0))
+                        .build_store(alloca, llvm_ty.const_zero())
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::Boolean => {
@@ -2314,6 +2315,7 @@ impl<'ctx> CodeGen<'ctx> {
             _ => None,
         };
         let cleanup_record = self.push_cleanup_record(&string_slots, proc.span)?;
+        exceptions::check_goto_targets(&proc.body)?;
         self.compile_block(&proc.body)?;
         self.enter_exit_block(proc.body.end_span)?;
         if let Some(rec) = cleanup_record {
@@ -2460,6 +2462,17 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return self.short_to_c_string(temp, span);
         }
+        // A Single becomes a Double.
+        if resolved == PascalType::Single
+            && let BasicValueEnum::FloatValue(fv) = val
+            && fv.get_type() == self.context.f32_type()
+        {
+            return Ok(self
+                .builder
+                .build_float_ext(fv, self.context.f64_type(), "fext")
+                .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                .into());
+        }
         let PascalType::SizedInt { bits, signed } = resolved else {
             return Ok(val);
         };
@@ -2516,6 +2529,27 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::String | PascalType::ShortString { .. }
         ) {
             return self.as_string_value(val, span);
+        }
+        // A Double stored as a Single, or the other way round.
+        if let (BasicValueEnum::FloatValue(fv), inkwell::types::BasicTypeEnum::FloatType(ft)) =
+            (val, target)
+        {
+            let (from, to) = (fv.get_type(), ft);
+            if from == to {
+                return Ok(val);
+            }
+            let f32_ty = self.context.f32_type();
+            return Ok(if to == f32_ty {
+                self.builder
+                    .build_float_trunc(fv, ft, "ftrunc")
+                    .map_err(err)?
+                    .into()
+            } else {
+                self.builder
+                    .build_float_ext(fv, ft, "fext")
+                    .map_err(err)?
+                    .into()
+            });
         }
         let BasicValueEnum::IntValue(iv) = val else {
             return Ok(val);
@@ -2640,6 +2674,33 @@ impl<'ctx> CodeGen<'ctx> {
             return self.compile_expr_for(expr, &ty);
         }
         self.compile_expr(expr)
+    }
+
+    /// Whether `expr` is a QWord (or an expression of QWords).
+    fn is_qword(&self, expr: &Expr) -> bool {
+        matches!(
+            self.resolve_type(&self.infer_declared_type(expr)),
+            PascalType::SizedInt {
+                bits: 64,
+                signed: false
+            }
+        )
+    }
+
+    /// Whether `left op right` is QWord arithmetic, as FPC does it: a
+    /// QWord with another QWord, a smaller unsigned value or a
+    /// non-negative literal (unsigned division, remainder and ordering).
+    fn is_qword_arith(&self, left: &Expr, right: &Expr) -> bool {
+        let unsigned = |e: &Expr| {
+            matches!(e, Expr::IntLit(v, _) if *v >= 0)
+                || matches!(
+                    self.resolve_type(&self.infer_declared_type(e)),
+                    PascalType::SizedInt { signed: false, .. }
+                        | PascalType::Char
+                        | PascalType::Boolean
+                )
+        };
+        (self.is_qword(left) || self.is_qword(right)) && unsigned(left) && unsigned(right)
     }
 
     /// `val` as a string: a char becomes a one-character string, anything
@@ -3250,6 +3311,15 @@ impl<'ctx> CodeGen<'ctx> {
                 self.compile_proc_call(name, args, *span)
             }
             Statement::ProcCall { name, args, span } => {
+                // `Random(N);`: a function called for its effect.
+                if name == "random" && args.len() <= 1 && !self.is_user_routine(name) {
+                    self.compile_expr(&Expr::Call {
+                        name: name.clone(),
+                        args: args.clone(),
+                        span: *span,
+                    })?;
+                    return Ok(());
+                }
                 if name == "inc" && (args.len() == 1 || args.len() == 2) {
                     return self.compile_inc_dec(args, true, *span);
                 }
@@ -3875,6 +3945,7 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::SizedInt { bits, .. } => (*bits / 8) as u64,
             PascalType::Untyped => 1,
             PascalType::Real => 8,
+            PascalType::Single => 4,
             PascalType::Boolean => 1,
             PascalType::Char => 1,
             PascalType::WideChar => 2,
@@ -4585,6 +4656,16 @@ impl<'ctx> CodeGen<'ctx> {
         self.set_debug_loc(span);
         let (slot, target_ty) = self.resolve_array_base(target, span)?;
         let val = self.compile_expr(&value.expr)?;
+        if let Some(text) = self.real_text(value, val, span)? {
+            return self.store_value(slot, text, &target_ty, span);
+        }
+        if value.width.is_none() && val.is_int_value() && self.is_qword(&value.expr) {
+            let wide = self.to_i64(val, span)?;
+            let text = self
+                .call_ustr_runtime("bruto_qword_str", &[wide.into()], span)?
+                .unwrap();
+            return self.store_value(slot, text, &target_ty, span);
+        }
         let ptr = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
         let i64_ty = self.context.i64_type();
@@ -4691,6 +4772,77 @@ impl<'ctx> CodeGen<'ctx> {
         self.store_value(slot, text, &target_ty, span)
     }
 
+    /// A real written as `X`, `X:W` or `X:W:P`, as FPC writes it (a
+    /// Single with its own digits): an AnsiString. `None` if `val` isn't a
+    /// real.
+    fn real_text(
+        &mut self,
+        arg: &WriteArg,
+        val: BasicValueEnum<'ctx>,
+        span: Span,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
+        if !val.is_float_value() || self.in_runtime {
+            return Ok(None);
+        }
+        let Some(format) = self.module.get_function("bruto_real_str") else {
+            return Ok(None);
+        };
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let i32_ty = self.context.i32_type();
+        let int_arg = |cg: &mut Self, e: &Option<Expr>| -> Result<_, CodeGenError> {
+            Ok(match e {
+                Some(e) => {
+                    let v = cg.compile_expr(e)?;
+                    let v = cg.to_i64(v, span)?;
+                    cg.builder
+                        .build_int_truncate(v, i32_ty, "fmt")
+                        .map_err(err)?
+                }
+                None => i32_ty.const_all_ones(),
+            })
+        };
+        let width = int_arg(self, &arg.width)?;
+        let precision = int_arg(self, &arg.precision)?;
+        // A Single (or a literal a Single holds exactly, as FPC types it).
+        let single = self.resolve_type(&self.infer_declared_type(&arg.expr)) == PascalType::Single
+            || Self::single_literal(&arg.expr);
+        let real = self.promote_to_f64(val, span)?;
+        let text = self
+            .builder
+            .build_call(
+                format,
+                &[
+                    real.into(),
+                    width.into(),
+                    precision.into(),
+                    self.context
+                        .bool_type()
+                        .const_int(u64::from(single), false)
+                        .into(),
+                ],
+                "real_text",
+            )
+            .map_err(err)?
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        Ok(Some(text))
+    }
+
+    /// Whether `expr` is a real literal (perhaps negated) that a Single
+    /// holds exactly.
+    fn single_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::RealLit(v, _) => (*v as f32) as f64 == *v,
+            Expr::UnaryOp {
+                op: UnaryOp::Neg,
+                operand,
+                ..
+            } => Self::single_literal(operand),
+            _ => false,
+        }
+    }
+
     /// `Val(S, X, Code)`: X is an integer or a real, `Code` the position
     /// of the first character that isn't part of the number (0 if none).
     fn compile_val(&mut self, args: &[Expr], span: Span) -> Result<(), CodeGenError> {
@@ -4714,7 +4866,10 @@ impl<'ctx> CodeGen<'ctx> {
         let (target, target_ty) = self.resolve_array_base(&args[1], span)?;
         let i64_ty = self.context.i64_type();
         let code_slot = self.entry_alloca(i64_ty, "val_code").map_err(err)?;
-        let helper = if self.resolve_type(&target_ty) == PascalType::Real {
+        let helper = if matches!(
+            self.resolve_type(&target_ty),
+            PascalType::Real | PascalType::Single
+        ) {
             "bruto_val_real"
         } else {
             "bruto_val_int"
@@ -5336,7 +5491,31 @@ impl<'ctx> CodeGen<'ctx> {
 
         for arg in &args[start_idx..] {
             let val = self.compile_expr(&arg.expr)?;
+            // A real, as FPC formats it.
+            if let Some(text) = self.real_text(arg, val, span)? {
+                match file_target {
+                    Some(fp) => {
+                        let f = self.module.get_function("bruto_file_write_str").unwrap();
+                        self.builder
+                            .build_call(f, &[fp.into(), text.into()], "")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    }
+                    None => {
+                        self.call_ustr_runtime("bruto_astr_write", &[text.into()], span)?;
+                    }
+                }
+                continue;
+            }
             let mut arg_type = self.resolve_type(&self.infer_expr_type(&arg.expr));
+            // A QWord, unsigned.
+            let val = if val.is_int_value() && self.is_qword(&arg.expr) && !self.in_runtime {
+                arg_type = PascalType::String;
+                let wide = self.to_i64(val, span)?;
+                self.call_ustr_runtime("bruto_qword_str", &[wide.into()], span)?
+                    .unwrap()
+            } else {
+                val
+            };
             // UnicodeStrings and WideChars are written in UTF-8.
             let val = if self.is_ustr(val) || Self::is_wide_char(val) {
                 arg_type = PascalType::String;
@@ -6166,6 +6345,17 @@ impl<'ctx> CodeGen<'ctx> {
                         .const_int(ordinal as u64, true)
                         .into());
                 }
+                // `Random`: the System prelude's generator.
+                if name == "random"
+                    && self.lookup_var(name).is_none()
+                    && !self.is_user_routine(name)
+                {
+                    return self.compile_expr(&Expr::Call {
+                        name: "brutorandomfloat".into(),
+                        args: Vec::new(),
+                        span: *span,
+                    });
+                }
                 // Pascal allows calling no-arg functions by bare name.
                 if name == "ioresult" {
                     return self.compile_expr(&Expr::Call {
@@ -6588,6 +6778,19 @@ impl<'ctx> CodeGen<'ctx> {
                 {
                     return Ok(found);
                 }
+                // `Random(N)` and `Random()`: the System prelude's generator.
+                if name == "random" && args.len() <= 1 && !self.is_user_routine(name) {
+                    let target = if args.is_empty() {
+                        "brutorandomfloat"
+                    } else {
+                        "brutorandomint"
+                    };
+                    return self.compile_expr(&Expr::Call {
+                        name: target.into(),
+                        args: args.clone(),
+                        span: *span,
+                    });
+                }
                 if name == "assigned" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let val = self.code_part(val, *span)?;
@@ -6734,6 +6937,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .try_as_basic_value()
                         .basic()
                         .unwrap();
+                    self.check_float(fval, None, r.into_float_value(), 5, *span)?;
                     return Ok(r);
                 }
                 if name == "sin" && args.len() == 1 {
@@ -6773,6 +6977,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .try_as_basic_value()
                         .basic()
                         .unwrap();
+                    self.check_float(fval, None, r.into_float_value(), 7, *span)?;
                     return Ok(r);
                 }
                 if name == "ln" && args.len() == 1 {
@@ -6786,6 +6991,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .try_as_basic_value()
                         .basic()
                         .unwrap();
+                    self.check_float(fval, None, r.into_float_value(), 6, *span)?;
                     return Ok(r);
                 }
                 if name == "arctan" && args.len() == 1 {
@@ -6806,6 +7012,28 @@ impl<'ctx> CodeGen<'ctx> {
                         .basic()
                         .unwrap();
                     return Ok(r);
+                }
+                // `Int(X)`: X without its fraction; `Frac(X)`: the fraction.
+                if (name == "int" || name == "frac") && args.len() == 1 {
+                    let val = self.compile_expr(&args[0])?;
+                    let fval = self.promote_to_f64(val, *span)?;
+                    let intrinsic = self.get_or_declare_f64_intrinsic("llvm.trunc.f64");
+                    let whole = self
+                        .builder
+                        .build_call(intrinsic, &[fval.into()], "int")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap()
+                        .into_float_value();
+                    if name == "int" {
+                        return Ok(whole.into());
+                    }
+                    return Ok(self
+                        .builder
+                        .build_float_sub(fval, whole, "frac")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
+                        .into());
                 }
                 if name == "trunc" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
@@ -7892,6 +8120,7 @@ impl<'ctx> CodeGen<'ctx> {
             | PascalType::SubrangeExpr { .. }
             | PascalType::ArrayExpr { .. } => self.context.i64_type().as_basic_type_enum(),
             PascalType::Real => self.context.f64_type().as_basic_type_enum(),
+            PascalType::Single => self.context.f32_type().as_basic_type_enum(),
             PascalType::Boolean => self.context.bool_type().as_basic_type_enum(),
             PascalType::Char => self.context.i8_type().as_basic_type_enum(),
             PascalType::WideChar => self.context.i16_type().as_basic_type_enum(),
@@ -8425,6 +8654,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .builder
                 .build_float_div(l, r, "rdiv")
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+            self.check_float(l, Some(r), result, 4, span)?;
             return Ok(result.into());
         }
 
@@ -8448,8 +8678,10 @@ impl<'ctx> CodeGen<'ctx> {
                 (l, r)
             };
             // Values narrower than 64 bits are chars, WideChars and
-            // booleans, all unsigned (#$82 is above #32).
-            let narrow = l.get_type().get_bit_width() < 64;
+            // booleans, all unsigned (#$82 is above #32); so is QWord
+            // arithmetic, as in FPC.
+            let unsigned64 = self.is_qword_arith(left, right);
+            let narrow = l.get_type().get_bit_width() < 64 || unsigned64;
             let ordering = |signed, unsigned| if narrow { unsigned } else { signed };
 
             let result = match op {
@@ -8479,6 +8711,18 @@ impl<'ctx> CodeGen<'ctx> {
                             .build_int_mul(l, r, "mul")
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     }
+                }
+                BinOp::Div if unsigned64 => {
+                    self.check_divisor(r, span)?;
+                    self.builder
+                        .build_int_unsigned_div(l, r, "udiv")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
+                }
+                BinOp::Mod if unsigned64 => {
+                    self.check_divisor(r, span)?;
+                    self.builder
+                        .build_int_unsigned_rem(l, r, "umod")
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 }
                 BinOp::Div => {
                     self.check_divisor(r, span)?;
@@ -8610,7 +8854,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .into(),
                 BinOp::Neq => self
                     .builder
-                    .build_float_compare(inkwell::FloatPredicate::ONE, l, r, "fne")
+                    .build_float_compare(inkwell::FloatPredicate::UNE, l, r, "fne")
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                     .into(),
                 BinOp::Lt => self
@@ -8640,6 +8884,16 @@ impl<'ctx> CodeGen<'ctx> {
                     ));
                 }
             };
+            let op_code = match op {
+                BinOp::Add => 1,
+                BinOp::Sub => 2,
+                BinOp::Mul => 3,
+                BinOp::Div | BinOp::RealDiv => 4,
+                _ => 0,
+            };
+            if op_code != 0 {
+                self.check_float(l, Some(r), result.into_float_value(), op_code, span)?;
+            }
             return Ok(result);
         }
 
@@ -9349,9 +9603,11 @@ impl<'ctx> CodeGen<'ctx> {
         match self.infer_declared_type(expr) {
             PascalType::SizedInt { .. } => PascalType::Integer,
             PascalType::ShortString { .. } => PascalType::String,
+            PascalType::Single => PascalType::Real,
             PascalType::Named(n) => match self.resolve_type(&PascalType::Named(n.clone())) {
                 PascalType::SizedInt { .. } => PascalType::Integer,
                 PascalType::ShortString { .. } => PascalType::String,
+                PascalType::Single => PascalType::Real,
                 _ => PascalType::Named(n),
             },
             other => other,
@@ -9450,10 +9706,31 @@ impl<'ctx> CodeGen<'ctx> {
                 })
                 .or_else(|| self.proc_return_types.get(name.as_str()).cloned().flatten())
                 .or_else(|| self.system_func_type(name, 0))
+                .or_else(|| (name == "random").then_some(PascalType::Real))
                 .unwrap_or(PascalType::Integer),
             Expr::Nil(_) => PascalType::Pointer(Box::new(PascalType::Integer)),
             Expr::SetConstructor { .. } => PascalType::Set {
                 elem: Box::new(PascalType::Integer),
+            },
+            // QWord arithmetic gives a QWord.
+            Expr::BinOp {
+                op:
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Xor
+                    | BinOp::Shl
+                    | BinOp::Shr,
+                left,
+                right,
+                ..
+            } if self.is_qword_arith(left, right) => PascalType::SizedInt {
+                bits: 64,
+                signed: false,
             },
             Expr::BinOp {
                 op, left, right, ..
@@ -9577,6 +9854,13 @@ impl<'ctx> CodeGen<'ctx> {
                 // Built-in functions
                 match name.as_str() {
                     "assigned" | "supports" => PascalType::Boolean,
+                    "random" if !self.is_user_routine(name) => {
+                        if args.is_empty() {
+                            PascalType::Real
+                        } else {
+                            PascalType::Integer
+                        }
+                    }
                     "integer" => PascalType::Integer,
                     "real" => PascalType::Real,
                     "char" => PascalType::Char,
@@ -9601,7 +9885,8 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                     }
                     "low" | "high" | "sizeof" => PascalType::Integer,
-                    "sqrt" | "sin" | "cos" | "arctan" | "exp" | "ln" => PascalType::Real,
+                    "sqrt" | "sin" | "cos" | "arctan" | "exp" | "ln" | "frac" => PascalType::Real,
+                    "int" if args.len() == 1 => PascalType::Real,
                     _ => self
                         .proc_return_types
                         .get(name.as_str())
@@ -9731,7 +10016,15 @@ impl<'ctx> CodeGen<'ctx> {
             } else if *mode == ParamMode::Var && param == PascalType::Untyped {
                 1
             } else {
+                // Integers of the same signedness fit better (a LongInt
+                // picks IntToStr(Int64) over IntToStr(QWord)).
+                let signed =
+                    |t: &PascalType| !matches!(t, PascalType::SizedInt { signed: false, .. });
                 match (&param, &arg_ty) {
+                    (
+                        PascalType::Integer | PascalType::SizedInt { .. },
+                        PascalType::Integer | PascalType::SizedInt { .. },
+                    ) if signed(&param) != signed(&arg_ty) => 1,
                     (
                         PascalType::Integer | PascalType::SizedInt { .. },
                         PascalType::Integer | PascalType::SizedInt { .. },

@@ -246,6 +246,7 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
         | PascalType::ShortString { .. }
         | PascalType::Untyped
         | PascalType::Real
+        | PascalType::Single
         | PascalType::String
         | PascalType::Boolean
         | PascalType::Char

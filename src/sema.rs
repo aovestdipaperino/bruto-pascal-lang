@@ -613,7 +613,8 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
         "shortstring" | "openstring" => PascalType::ShortString { max: 255 },
         "ansistring" | "rawbytestring" | "utf8string" => PascalType::String,
         "unicodestring" | "widestring" => PascalType::UnicodeString,
-        "single" | "double" | "extended" | "currency" | "comp" => PascalType::Real,
+        "single" => PascalType::Single,
+        "double" | "extended" | "currency" | "comp" => PascalType::Real,
         // A file variable is one pointer to the runtime's file record;
         // seen as FPC's `FileRec` / `TextRec`, that pointer is the handle.
         "filerec" | "textrec" => PascalType::Record {
@@ -883,6 +884,7 @@ impl ConstEnv {
             }
             PascalType::Integer
             | PascalType::Real
+            | PascalType::Single
             | PascalType::String
             | PascalType::Boolean
             | PascalType::Char
