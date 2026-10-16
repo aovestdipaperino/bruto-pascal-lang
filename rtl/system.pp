@@ -139,6 +139,10 @@ procedure Randomize;
 { A Currency's text as Write(C:Len:F) gives it (C its scaled Int64; Len
   -32767 and F -1 when not given), FPC's fpc_shortstr_currency. }
 function bruto_curr_str(C: Int64; Len, F: Int64): AnsiString;
+{ The Currency product of A and B (scaled Int64s): (A * B) div 10000 on
+  a 128-bit product, truncated, as FPC's fpc_mul_currency computes it
+  with 64-bit operations only. }
+function bruto_curr_mul(A, B: Int64): Int64;
 { S with ASCII letters in lower case, as FPC's System.LowerCase. }
 function LowerCase(const S: AnsiString): AnsiString;
 { Compare Len bytes: negative, zero or positive, as FPC. }
@@ -178,6 +182,50 @@ const
   varByRef = $4000;
 
 implementation
+
+function bruto_curr_mul(A, B: Int64): Int64;
+var
+  Neg: Boolean;
+  UA, UB, ALo, AHi, BLo, BHi, T0, T1, T2, T3, Mid, Lo, Hi: QWord;
+  Rem, Cur, Q1, Q0: QWord;
+begin
+  Neg := (A < 0) <> (B < 0);
+  if A < 0 then
+    UA := QWord(0) - QWord(A)
+  else
+    UA := QWord(A);
+  if B < 0 then
+    UB := QWord(0) - QWord(B)
+  else
+    UB := QWord(B);
+  ALo := UA and $FFFFFFFF;
+  AHi := UA shr 32;
+  BLo := UB and $FFFFFFFF;
+  BHi := UB shr 32;
+  T0 := ALo * BLo;
+  T1 := ALo * BHi;
+  T2 := AHi * BLo;
+  T3 := AHi * BHi;
+  Mid := (T0 shr 32) + (T1 and $FFFFFFFF) + (T2 and $FFFFFFFF);
+  Lo := (T0 and $FFFFFFFF) or (Mid shl 32);
+  Hi := T3 + (T1 shr 32) + (T2 shr 32) + (Mid shr 32);
+  { (Hi:Lo) div 10000, 32 bits at a time; only the low 64 bits of the
+    quotient are kept. }
+  Cur := Hi shr 32;
+  Rem := Cur mod 10000;
+  Cur := (Rem shl 32) or (Hi and $FFFFFFFF);
+  Rem := Cur mod 10000;
+  Cur := (Rem shl 32) or (Lo shr 32);
+  Q1 := Cur div 10000;
+  Rem := Cur mod 10000;
+  Cur := (Rem shl 32) or (Lo and $FFFFFFFF);
+  Q0 := Cur div 10000;
+  Cur := (Q1 shl 32) or Q0;
+  if Neg then
+    bruto_curr_mul := -Int64(Cur)
+  else
+    bruto_curr_mul := Int64(Cur);
+end;
 
 function bruto_curr_str(C: Int64; Len, F: Int64): AnsiString;
 const

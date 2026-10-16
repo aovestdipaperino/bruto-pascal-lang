@@ -6,7 +6,8 @@
 //! Arithmetic whose result is a Currency (`+`, `-` or `*` with a Currency
 //! operand) works on the scaled Int64s instead, as FPC's does: a real or
 //! integer operand is first made a Currency (rounding halves to even),
-//! and `*` keeps the 128-bit product's quotient by 10000, truncated. A
+//! and `*` keeps the 128-bit product's quotient by 10000, truncated
+//! (`bruto_curr_mul` in the System prelude). A
 //! value stored into a Currency takes the same conversion.
 
 use super::{CodeGen, CodeGenError};
@@ -151,24 +152,19 @@ impl<'ctx> CodeGen<'ctx> {
                     BinOp::Add => self.builder.build_int_add(l, r, "curr_add").map_err(err),
                     BinOp::Sub => self.builder.build_int_sub(l, r, "curr_sub").map_err(err),
                     _ => {
-                        // (l * r) div 10000 on 128 bits, truncated.
-                        let i128_ty = self.context.i128_type();
-                        let l = self
+                        // (l * r) div 10000 on 128 bits, truncated, by the
+                        // runtime (Windows' linker has no 128-bit division).
+                        let mul = self.module.get_function("bruto_curr_mul").ok_or_else(|| {
+                            CodeGenError::new("the Currency runtime is missing", Some(span))
+                        })?;
+                        Ok(self
                             .builder
-                            .build_int_s_extend(l, i128_ty, "l")
-                            .map_err(err)?;
-                        let r = self
-                            .builder
-                            .build_int_s_extend(r, i128_ty, "r")
-                            .map_err(err)?;
-                        let p = self.builder.build_int_mul(l, r, "curr_mul").map_err(err)?;
-                        let q = self
-                            .builder
-                            .build_int_signed_div(p, i128_ty.const_int(SCALE, false), "curr_q")
-                            .map_err(err)?;
-                        self.builder
-                            .build_int_truncate(q, i64_ty, "curr")
-                            .map_err(err)
+                            .build_call(mul, &[l.into(), r.into()], "curr_mul")
+                            .map_err(err)?
+                            .try_as_basic_value()
+                            .basic()
+                            .unwrap()
+                            .into_int_value())
                     }
                 };
             }
