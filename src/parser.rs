@@ -872,16 +872,43 @@ impl Lexer {
             while self.pos < self.chars.len() && self.peek().is_ascii_digit() {
                 n = n * 10 + (self.advance() as i64 - '0' as i64);
             }
+            // An exponent: `e`/`E`, an optional sign, digits.
+            let at_exponent = |lx: &Self| {
+                matches!(lx.chars.get(lx.pos), Some('e' | 'E'))
+                    && match lx.chars.get(lx.pos + 1) {
+                        Some(c) if c.is_ascii_digit() => true,
+                        Some('+' | '-') => {
+                            lx.chars.get(lx.pos + 2).is_some_and(|c| c.is_ascii_digit())
+                        }
+                        _ => false,
+                    }
+            };
             // Check for decimal point (but not ".." range operator)
-            if self.peek() == '.' && self.chars.get(self.pos + 1) != Some(&'.') {
-                self.advance(); // consume '.'
-                let mut frac = String::new();
-                frac.push_str(&n.to_string());
-                frac.push('.');
-                while self.pos < self.chars.len() && self.peek().is_ascii_digit() {
-                    frac.push(self.advance());
+            let has_point = self.peek() == '.'
+                && self
+                    .chars
+                    .get(self.pos + 1)
+                    .is_some_and(|c| c.is_ascii_digit() || *c == 'e' || *c == 'E')
+                || (self.peek() == '.' && self.chars.get(self.pos + 1) != Some(&'.'));
+            if has_point || at_exponent(self) {
+                let mut text = n.to_string();
+                if has_point {
+                    self.advance(); // consume '.'
+                    text.push('.');
+                    while self.pos < self.chars.len() && self.peek().is_ascii_digit() {
+                        text.push(self.advance());
+                    }
                 }
-                let val: f64 = frac.parse().unwrap_or(0.0);
+                if at_exponent(self) {
+                    text.push(self.advance());
+                    if matches!(self.peek(), '+' | '-') {
+                        text.push(self.advance());
+                    }
+                    while self.pos < self.chars.len() && self.peek().is_ascii_digit() {
+                        text.push(self.advance());
+                    }
+                }
+                let val: f64 = text.parse().unwrap_or(0.0);
                 return (Tok::RealLit(val), span);
             }
             return (Tok::IntLit(n), span);
@@ -1216,11 +1243,15 @@ pub struct Parser {
 }
 
 impl Parser {
-    /// Whether the source has `try` or `raise`.
+    /// Whether the source has `try`, `raise` or `array of const`, which
+    /// need the runtime in `rtl/objpas.pp`.
     fn uses_exceptions(&self) -> bool {
         self.tokens.iter().any(|(t, _)| {
             matches!(t, Tok::Ident(w) if w.eq_ignore_ascii_case("try") || w.eq_ignore_ascii_case("raise"))
-        })
+        }) || self
+            .tokens
+            .windows(3)
+            .any(|w| matches!((&w[0].0, &w[1].0, &w[2].0), (Tok::KwArray, Tok::KwOf, Tok::Const)))
     }
 
     pub fn new(source: &str) -> Self {
@@ -2073,6 +2104,19 @@ impl Parser {
 
     fn parse_array_type(&mut self) -> Result<PascalType, ParseError> {
         self.expect(&Tok::KwArray)?;
+        // `array of T`: a dynamic array (an open array as a parameter);
+        // `array of const`: an open array of TVarRec.
+        if *self.peek() == Tok::KwOf {
+            self.advance();
+            if *self.peek() == Tok::Const {
+                self.advance();
+                return Ok(PascalType::OpenArray(Box::new(PascalType::Named(
+                    "TVarRec".to_string(),
+                ))));
+            }
+            let elem = self.parse_type()?;
+            return Ok(PascalType::DynArray(Box::new(elem)));
+        }
         self.expect(&Tok::LBracket)?;
 
         let mut dimensions = Vec::new();
@@ -2613,8 +2657,14 @@ impl Parser {
             });
         }
         self.expect(&Tok::Colon)?;
-        let ty = self.parse_type()?;
+        let ty = match self.parse_type()? {
+            // `A: array of T` in a parameter list is an open array.
+            PascalType::DynArray(elem) => PascalType::OpenArray(elem),
+            other => other,
+        };
         let mode = match keyword {
+            // An open array is passed as its address and bounds either way.
+            _ if matches!(ty, PascalType::OpenArray(_)) => ParamMode::Value,
             Some("var" | "out" | "constref") => ParamMode::Var,
             _ => ParamMode::Value,
         };

@@ -4539,6 +4539,189 @@ end.
     }
 
     #[test]
+    fn dynamic_and_open_arrays() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+type
+  TIntArray = array of Integer;
+  TStrArray = array of string;
+  TPoint = record X, Y: Integer; Name: string; end;
+var
+  A, B: TIntArray;
+  S: TStrArray;
+  G: array of array of Integer;
+  P: array of TPoint;
+  I, J, Sum: Integer;
+  T: string;
+
+function Squares(N: Integer): TIntArray;
+var K: Integer;
+begin
+  SetLength(Result, N);
+  for K := 0 to N - 1 do
+    Result[K] := K * K;
+end;
+
+function Total(const V: array of Integer): Integer;
+var X: Integer;
+begin
+  Result := 0;
+  for X in V do
+    Result := Result + X;
+end;
+
+procedure Double(var V: array of Integer);
+var K: Integer;
+begin
+  for K := Low(V) to High(V) do
+    V[K] := V[K] * 2;
+end;
+
+procedure Show(const Args: array of const);
+var K: Integer;
+begin
+  for K := 0 to High(Args) do
+    case Args[K].VType of
+      vtInteger: Write('int:', Args[K].VInteger, ' ');
+      vtInt64: Write('int64:', Args[K].VInt64^, ' ');
+      vtAnsiString: Write('str:', AnsiString(Args[K].VAnsiString), ' ');
+      vtChar: Write('char:', Args[K].VChar, ' ');
+      vtBoolean: Write('bool:', Args[K].VBoolean, ' ');
+      vtExtended: Write('real:', Args[K].VExtended^:0:2, ' ');
+    else
+      Write('?', Args[K].VType, ' ');
+    end;
+  WriteLn;
+end;
+
+var
+  St: array[1..4] of Integer;
+begin
+  WriteLn(Length(A), ' ', A = nil);
+  SetLength(A, 3);
+  A[0] := 10; A[1] := 20; A[2] := 30;
+  WriteLn(Length(A), ' ', High(A), ' ', Low(A), ' ', A[1]);
+  B := A;
+  B[0] := 99;
+  WriteLn(A[0]);
+  SetLength(B, 5);
+  B[1] := 7;
+  WriteLn(A[1], ' ', B[1], ' ', B[4], ' ', Length(B));
+  A := Squares(6);
+  WriteLn(A[5], ' ', Total(A), ' ', Total([1, 2, 3]));
+  St[1] := 1; St[2] := 2; St[3] := 3; St[4] := 4;
+  Double(St);
+  WriteLn(St[4], ' ', Total(St));
+  Double(A);
+  WriteLn(A[5]);
+  SetLength(S, 3);
+  S[0] := 'a'; S[1] := 'b' + 'c'; S[2] := S[1] + S[1];
+  T := '';
+  for I := 0 to High(S) do T := T + S[I] + ';';
+  WriteLn(T);
+  S := Copy(S, 1, 2);
+  WriteLn(Length(S), ' ', S[0], ' ', S[1]);
+  SetLength(G, 3, 4);
+  for I := 0 to 2 do for J := 0 to 3 do G[I][J] := I * 10 + J;
+  WriteLn(G[2][3], ' ', G[1, 2], ' ', Length(G[0]));
+  SetLength(P, 2);
+  P[1].X := 5; P[1].Name := 'pt';
+  WriteLn(P[1].X, P[1].Name, ' ', Length(P));
+  A := [4, 5, 6];
+  Sum := 0;
+  for I in A do Sum := Sum + I;
+  WriteLn(Sum);
+  Show([42, 'hi', 'x', True, 2.5, Int64(5000000000), Sum]);
+  A := nil;
+  WriteLn(Length(A));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "0 TRUE\n3 2 0 20\n99\n20 7 0 5\n25 55 6\n8 20\n50\na;bc;bcbc;\n2 bc bcbc\n23 12 4\n5pt 2\n15\nint:42 str:hi char:x bool:TRUE real:2.50 int64:5000000000 int:15 \n0\n"
+        );
+    }
+
+    #[test]
+    fn dynamic_array_insert_and_delete() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+var
+  A: array of Integer;
+  S, T: array of string;
+  I: Integer;
+begin
+  A := [1, 2, 3, 4, 5];
+  Delete(A, 1, 2);
+  for I in A do Write(I, ' ');
+  WriteLn(Length(A));
+  Insert(9, A, 1);
+  Insert(7, A, 100);
+  Insert(0, A, 0);
+  for I in A do Write(I, ' ');
+  WriteLn(Length(A));
+  S := ['a', 'b', 'c'];
+  T := S;
+  Delete(S, 0, 1);
+  Insert('z' + 'z', S, 1);
+  for I := 0 to High(S) do Write(S[I], ' ');
+  for I := 0 to High(T) do Write(T[I], ' ');
+  WriteLn;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "1 4 5 3\n0 1 9 4 5 7 6\nb zz c a b c \n");
+    }
+
+    #[test]
+    fn format_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}{$H+}
+uses SysUtils;
+var P: Pointer; I64: Int64;
+begin
+  P := Pointer(PtrUInt($1234ABCD));
+  I64 := 123456789012;
+  WriteLn(Format('[%d] [%5d] [%-5d] [%.3d] [%x] [%.4X] [%u]', [42, 42, 42, 5, 255, 255, 7]));
+  WriteLn(Format('[%s] [%8s] [%-8s] [%.2s] [%s]', ['abc', 'abc', 'abc', 'abcdef', 'x']));
+  WriteLn(Format('[%f] [%.3f] [%8.1f] [%-8.1f] [%f]', [1.5, 3.14159, 2.25, 2.25, -0.005]));
+  WriteLn(Format('[%e] [%.3e] [%e] [%e]', [1.5, 12345.678, 0.000123, -2.0]));
+  WriteLn(Format('[%g] [%g] [%g] [%g] [%g] [%.3g]', [1.5, 100.0, 1e20, 0.0001, 123456789.0, 3.14159]));
+  WriteLn(Format('[%n] [%.0n] [%n]', [1234567.891, 1234.5, 12.0]));
+  WriteLn(Format('[%1:s %0:s] [%0:s]', ['a', 'b']));
+  WriteLn(Format('[%*d] [%-*d] [%.*f]', [4, 7, 4, 7, 1, 2.25]));
+  WriteLn(Format('[%f] [%.1f] [%.0f] [%.2f] [%.2f] [%f]', [0.125, 0.05, 2.5, 1.005, 1e15, 0.0]));
+  WriteLn(Format('[%e] [%g] [%g] [%n] [%d]', [0.0, 0.0, -1.5e-7, -1234.5, Low(Int64)]));
+  WriteLn(Format('[%d] [%s] [%%] [%p]', [I64, 'end', P]));
+  WriteLn(Format('[%d] [%x]', [-5, -1]));
+  WriteLn(Format('%s=%d', ['x', 1]), ' ', Format('no args', []));
+  try
+    WriteLn(Format('%d', ['x']));
+  except
+    on E: Exception do WriteLn(E.ClassName, ': ', E.Message);
+  end;
+  try
+    WriteLn(Format('%d %d', [1]));
+  except
+    on E: Exception do WriteLn(E.ClassName, ': ', E.Message);
+  end;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "[42] [   42] [42   ] [005] [FF] [00FF] [7]\n[abc] [     abc] [abc     ] [ab] [x]\n[1.50] [3.142] [     2.3] [2.3     ] [-0.01]\n[1.50000000000000E+000] [1.23E+004] [1.23000000000000E-004] [-2.00000000000000E+000]\n[1.5] [100] [1E20] [0.0001] [123456789] [3.14]\n[1,234,567.89] [1,235] [12.00]\n[b a] [a]\n[   7] [7   ] [2.3]\n[0.13] [0.1] [3] [1.01] [1000000000000000.00] [0.00]\n[0.00000000000000E+000] [0] [-1.5E-7] [-1,234.50] [-9223372036854775808]\n[123456789012] [end] [%] [000000001234ABCD]\n[-5] [FFFFFFFF]\nx=1 no args\nEConvertError: Invalid argument index in format \"%d\"\nEConvertError: Invalid argument index in format \"%d %d\"\n"
+        );
+    }
+
+    #[test]
     fn class_instances_and_their_strings_are_freed() {
         let (ok, out) = build_and_run_source(
             "program T;

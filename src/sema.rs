@@ -811,7 +811,9 @@ impl ConstEnv {
                 }
             }
             PascalType::ClassOf(_) => {}
-            PascalType::VarParam(inner) => self.resolve_type(inner, span)?,
+            PascalType::VarParam(inner)
+            | PascalType::DynArray(inner)
+            | PascalType::OpenArray(inner) => self.resolve_type(inner, span)?,
             PascalType::ArrayExpr { lo, hi, elem } => {
                 let lo = self.eval_at(lo, span)?;
                 let hi = self.eval_at(hi, span)?;

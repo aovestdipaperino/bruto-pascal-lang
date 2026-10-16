@@ -260,6 +260,14 @@ pub enum PascalType {
     /// A `var` / `out` (or untyped `const`) parameter of a procedural
     /// type: passed by reference.
     VarParam(Box<PascalType>),
+    /// `array of T` as a variable's type: a dynamic array, a reference
+    /// counted heap block of elements indexed from 0 (nil when empty).
+    DynArray(Box<PascalType>),
+    /// `array of T` as a parameter's type: an open array, any array of T
+    /// (static, dynamic or `[a, b]`) passed as its first element's address
+    /// and its highest index. `array of const` is an open array of
+    /// `TVarRec`.
+    OpenArray(Box<PascalType>),
     /// Enumerated type: (val1, val2, val3)
     Enum {
         /// The type name (e.g., "Color") — set during type section parsing

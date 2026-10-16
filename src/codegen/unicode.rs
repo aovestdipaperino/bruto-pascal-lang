@@ -474,6 +474,7 @@ impl<'ctx> CodeGen<'ctx> {
         let first_ty = self.resolve_type(&self.infer_declared_type(first));
         match name {
             "copy" if first_ty == PascalType::UnicodeString => Some(PascalType::UnicodeString),
+            "copy" if matches!(first_ty, PascalType::DynArray(_)) => Some(first_ty),
             "concat" if args.iter().any(|a| self.is_wide_expr(a)) => {
                 Some(PascalType::UnicodeString)
             }

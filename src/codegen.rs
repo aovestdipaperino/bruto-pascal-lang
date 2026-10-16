@@ -25,6 +25,7 @@ use std::path::Path;
 mod arc;
 mod classes;
 mod closures;
+mod dynarrays;
 mod exceptions;
 mod forin;
 mod layout;
@@ -1106,6 +1107,8 @@ impl<'ctx> CodeGen<'ctx> {
                 | PascalType::Object(_)
                 | PascalType::ClassOf(_)
                 | PascalType::VarParam(_)
+                | PascalType::DynArray(_)
+                | PascalType::OpenArray(_)
                 | PascalType::ShortString { .. } => {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
@@ -1988,8 +1991,9 @@ impl<'ctx> CodeGen<'ctx> {
                 self.var_types.insert(base.to_string(), ret_ty.clone());
             }
             // `Result` names the same variable (FPC's objfpc and Delphi
-            // modes), unless a parameter is called that.
-            if !self.variables.contains_key("result") {
+            // modes), unless a parameter is called that; in a nested
+            // function it hides the enclosing function's.
+            if !param_info.iter().any(|(n, _, _)| n == "result") {
                 self.variables.insert("result".to_string(), alloca);
                 self.var_types.insert("result".to_string(), ret_ty.clone());
             }
@@ -2034,8 +2038,12 @@ impl<'ctx> CodeGen<'ctx> {
                     nested_locals.insert(n.clone());
                 }
             }
-            // The nested proc's name is its own result variable (if function).
+            // The nested proc's name is its own result variable (if function),
+            // and so is `Result`.
             nested_locals.insert(nested.name.clone());
+            if nested.return_type.is_some() {
+                nested_locals.insert("result".to_string());
+            }
 
             let mut found: Vec<(String, PascalType)> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2159,7 +2167,7 @@ impl<'ctx> CodeGen<'ctx> {
                     (self.variables.get(&name), self.var_types.get(&name))
                     && matches!(
                         self.resolve_type(ty),
-                        PascalType::String | PascalType::UnicodeString
+                        PascalType::String | PascalType::UnicodeString | PascalType::DynArray(_)
                     )
                     && !string_slots.contains(&slot)
                 {
@@ -2239,7 +2247,7 @@ impl<'ctx> CodeGen<'ctx> {
             // The result's reference passes to the caller's statement.
             if self.arc && !self.in_runtime {
                 match self.resolve_type(ret_ty) {
-                    PascalType::String => {
+                    PascalType::String | PascalType::DynArray(_) => {
                         self.call_ustr_runtime("bruto_astr_return", &[ret_val.into()], proc.span)?;
                     }
                     PascalType::UnicodeString => {
@@ -2427,6 +2435,15 @@ impl<'ctx> CodeGen<'ctx> {
             }
         ) {
             return self.compile_method_pointer(expr);
+        }
+        match self.resolve_type(target) {
+            PascalType::OpenArray(elem) => return self.open_array_arg(expr, &elem, expr.span()),
+            PascalType::DynArray(elem) => {
+                if let Expr::SetConstructor { elements, span } = expr {
+                    return self.dynarray_from_elements(elements, &elem, *span);
+                }
+            }
+            _ => {}
         }
         // A PChar stored into a string: its characters are copied, as FPC
         // does (the C string may be a buffer about to change).
@@ -2854,34 +2871,25 @@ impl<'ctx> CodeGen<'ctx> {
                 let mut current_type = var_type;
                 for (dim, index_expr) in indices.iter().enumerate() {
                     let idx_val = self.compile_expr(index_expr)?;
-                    let (lo, hi, elem_ty) = match &current_type {
-                        PascalType::Array { lo, hi, elem, .. } => (*lo, *hi, elem.as_ref().clone()),
-                        _ => {
-                            return Err(CodeGenError::new(
-                                format!("too many indices for '{target}'"),
-                                Some(*span),
-                            ));
-                        }
-                    };
-                    self.emit_range_check(idx_val.into_int_value(), lo, hi, *span)?;
-                    let adj = self
-                        .builder
-                        .build_int_sub(
-                            idx_val.into_int_value(),
-                            self.context.i64_type().const_int(lo as u64, true),
-                            "adj_idx",
-                        )
-                        .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
-                    let gep = unsafe {
-                        self.builder
-                            .build_in_bounds_gep(
-                                self.llvm_type_for(&current_type),
-                                current_ptr,
-                                &[self.context.i64_type().const_int(0, false), adj],
-                                "multi_gep",
-                            )
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?
-                    };
+                    let idx_val = self.first_char_if_string(idx_val, *span)?;
+                    let resolved = self.resolve_type(&current_type);
+                    if !matches!(
+                        resolved,
+                        PascalType::Array { .. }
+                            | PascalType::DynArray(_)
+                            | PascalType::OpenArray(_)
+                    ) {
+                        return Err(CodeGenError::new(
+                            format!("too many indices for '{target}'"),
+                            Some(*span),
+                        ));
+                    }
+                    let (gep, elem_ty) = self.gep_array_elem(
+                        current_ptr,
+                        &resolved,
+                        idx_val.into_int_value(),
+                        *span,
+                    )?;
                     if dim == indices.len() - 1 {
                         self.store_value(gep, val, &elem_ty, *span)?;
                     } else {
@@ -3058,6 +3066,11 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 if name == "dec" && (args.len() == 1 || args.len() == 2) {
                     return self.compile_inc_dec(args, false, *span);
+                }
+                if (name == "delete" || name == "insert")
+                    && self.dynarray_insert_delete(name, args, *span)?
+                {
+                    return Ok(());
                 }
                 if name == "delete" && args.len() == 3 {
                     return self.compile_str_delete(args, *span);
@@ -3645,7 +3658,8 @@ impl<'ctx> CodeGen<'ctx> {
         match ty {
             // Object declarations are lowered to records when registered.
             PascalType::Object(_) => 0,
-            PascalType::ClassOf(_) | PascalType::VarParam(_) => 8,
+            PascalType::ClassOf(_) | PascalType::VarParam(_) | PascalType::DynArray(_) => 8,
+            PascalType::OpenArray(_) => 16,
             PascalType::ShortString { max } => *max as u64 + 1,
             PascalType::Integer
             | PascalType::Enum { .. }
@@ -5559,10 +5573,13 @@ impl<'ctx> CodeGen<'ctx> {
             }
             // A record or array a function returns, as in
             // `MakePerson(7).Name`: held in a temporary.
-            Expr::Call { .. }
+            Expr::Call { .. } | Expr::MethodCall { .. }
                 if matches!(
                     self.resolve_type(&self.infer_declared_type(expr)),
-                    PascalType::Record { .. } | PascalType::Array { .. }
+                    PascalType::Record { .. }
+                        | PascalType::Array { .. }
+                        | PascalType::DynArray(_)
+                        | PascalType::OpenArray(_)
                 ) =>
             {
                 let ty = self.infer_declared_type(expr);
@@ -5749,6 +5766,18 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         match expr {
+            // Length/High/Low/Copy of a dynamic or open array.
+            Expr::Call { name, args, span }
+                if matches!(name.as_str(), "length" | "high" | "low" | "copy")
+                    && !self.is_user_routine(name)
+                    && args.first().is_some_and(|a| {
+                        self.array_elem_of(&self.infer_declared_type(a)).is_some()
+                    }) =>
+            {
+                self.dynarray_func(name, args, *span)?.ok_or_else(|| {
+                    CodeGenError::new(format!("wrong arguments for '{name}'"), Some(*span))
+                })
+            }
             // `System.X`: the built-in X, whatever else X names here.
             Expr::Call { name, args, span } if name.starts_with("system.") => {
                 let bare = Expr::Call {
@@ -7600,10 +7629,12 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Untyped | PascalType::Object(_) => {
                 self.context.i8_type().as_basic_type_enum()
             }
-            PascalType::ClassOf(_) | PascalType::VarParam(_) => self
+            PascalType::ClassOf(_) | PascalType::VarParam(_) | PascalType::DynArray(_) => self
                 .context
                 .ptr_type(AddressSpace::default())
                 .as_basic_type_enum(),
+            // `{ first element's address, highest index }`.
+            PascalType::OpenArray(_) => self.open_array_type().as_basic_type_enum(),
             // Constant-expression types are folded by the semantic pass;
             // `ArrayExpr` can't reach here.
             PascalType::Integer
@@ -8558,6 +8589,9 @@ impl<'ctx> CodeGen<'ctx> {
             idx
         };
         match base_type {
+            PascalType::DynArray(_) | PascalType::OpenArray(_) => {
+                self.array_elem(base_ptr, base_type, idx, span)
+            }
             PascalType::Array { lo, hi, elem } => {
                 self.emit_range_check(idx, *lo, *hi, span)?;
                 let adj = self
@@ -9264,9 +9298,10 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Index { array, .. } => {
                 let arr_ty = self.infer_expr_type(array);
                 match self.resolve_type(&arr_ty) {
-                    PascalType::Array { elem, .. } | PascalType::ConformantArray { elem, .. } => {
-                        *elem
-                    }
+                    PascalType::Array { elem, .. }
+                    | PascalType::ConformantArray { elem, .. }
+                    | PascalType::DynArray(elem)
+                    | PascalType::OpenArray(elem) => *elem,
                     PascalType::String | PascalType::ShortString { .. } => PascalType::Char,
                     PascalType::UnicodeString => PascalType::WideChar,
                     PascalType::Pointer(elem) if *elem != PascalType::Untyped => *elem,

@@ -55,6 +55,9 @@ type
   ENotImplemented = class(Exception);
   ENotSupportedException = class(Exception);
 
+type
+  TFloatFormat = (ffGeneral, ffExponent, ffFixed, ffNumber, ffCurrency);
+
 const
   { FileOpen modes and sharing flags (sharing is accepted and ignored). }
   fmOpenRead = $0000;
@@ -122,6 +125,11 @@ procedure FreeAndNil(var Obj);
 { A Pascal format string (`%d`, `%4.4x`, `%s`...) as the C one that
   prints the same with 64-bit integers. }
 function BrutoCFormat(const Fmt: string): string;
+{ FPC's Format: `%[index:][-][width][.precision]type`, with types d, u,
+  x, s, f, e, g, n, m and p; `*` takes a width or precision from Args. }
+function Format(const Fmt: string; const Args: array of const): string;
+function FloatToStr(Value: Double): string;
+function FloatToStrF(Value: Double; Format: TFloatFormat; Precision, Digits: Integer): string;
 
 implementation
 
@@ -521,6 +529,437 @@ begin
     BoolToStr := '-1'
   else
     BoolToStr := '0';
+end;
+
+function bruto_fmt_snprintf(Buf: PChar; Size: PtrUInt; Fmt: PChar): LongInt; cdecl; varargs;
+  external 'c' name 'snprintf';
+
+{ Value's first 15 significant digits (Digits) and its decimal exponent:
+  Value = 0.D1D2... * 10^(Exp + 1), as in 1.5 = '150000000000000', 0. }
+procedure FloatDigits(Value: Double; var Digits: string; var Exp: Integer; var Negative: Boolean);
+var
+  Buf: array[0..63] of Char;
+  S: string;
+  P, Code: Integer;
+begin
+  Negative := Value < 0;
+  if Negative then
+    Value := -Value;
+  if Value = 0 then
+  begin
+    Digits := '000000000000000';
+    Exp := 0;
+    Exit;
+  end;
+  bruto_fmt_snprintf(@Buf, SizeOf(Buf), '%.14e', Value);
+  S := PChar(@Buf);
+  P := Pos('e', S);
+  Digits := Copy(S, 1, 1) + Copy(S, 3, P - 3);
+  Val(Copy(S, P + 1, Length(S)), Exp, Code);
+end;
+
+{ Round the digit string D (with exponent Exp) to Keep digits, half up. }
+procedure RoundDigits(var D: string; var Exp: Integer; Keep: Integer);
+var
+  I: Integer;
+  Carry: Boolean;
+begin
+  if Keep >= Length(D) then
+  begin
+    while Length(D) < Keep do
+      D := D + '0';
+    Exit;
+  end;
+  if Keep < 0 then
+  begin
+    D := '';
+    Exit;
+  end;
+  Carry := D[Keep + 1] >= '5';
+  D := Copy(D, 1, Keep);
+  I := Keep;
+  while Carry and (I >= 1) do
+  begin
+    if D[I] = '9' then
+    begin
+      D[I] := '0';
+      I := I - 1;
+    end
+    else
+    begin
+      D[I] := Chr(Ord(D[I]) + 1);
+      Carry := False;
+    end;
+  end;
+  if Carry then
+  begin
+    D := '1' + D;
+    Exp := Exp + 1;
+    if Keep > 0 then
+      D := Copy(D, 1, Keep);
+  end;
+end;
+
+function GroupThousands(const IntPart: string): string;
+var
+  I, N: Integer;
+  R: string;
+begin
+  R := '';
+  N := 0;
+  for I := Length(IntPart) downto 1 do
+  begin
+    if (N > 0) and (N mod 3 = 0) then
+      R := ',' + R;
+    R := IntPart[I] + R;
+    N := N + 1;
+  end;
+  GroupThousands := R;
+end;
+
+{ Value with Decimals digits after the point (ffFixed), grouped in
+  thousands for ffNumber. }
+function FormatFixed(Value: Double; Decimals: Integer; Grouped: Boolean): string;
+var
+  D, IntPart, Frac: string;
+  Exp, Keep: Integer;
+  Negative: Boolean;
+begin
+  FloatDigits(Value, D, Exp, Negative);
+  Keep := Exp + 1 + Decimals;
+  if Value = 0 then
+    Keep := 0;
+  RoundDigits(D, Exp, Keep);
+  if Keep <= 0 then
+  begin
+    if D = '' then
+      D := '0'
+    else
+      Exp := Exp;
+  end;
+  { Digits before the point, then after it. }
+  if D = '' then
+  begin
+    IntPart := '0';
+    Frac := StringOfChar('0', Decimals);
+  end
+  else if Exp >= 0 then
+  begin
+    while Length(D) < Exp + 1 + Decimals do
+      D := D + '0';
+    IntPart := Copy(D, 1, Exp + 1);
+    Frac := Copy(D, Exp + 2, Decimals);
+  end
+  else
+  begin
+    IntPart := '0';
+    Frac := StringOfChar('0', -Exp - 1) + D;
+    while Length(Frac) < Decimals do
+      Frac := Frac + '0';
+    Frac := Copy(Frac, 1, Decimals);
+  end;
+  if Grouped then
+    IntPart := GroupThousands(IntPart);
+  Result := IntPart;
+  if Decimals > 0 then
+    Result := Result + '.' + Frac;
+  if Negative and (Pos('1', D) + Pos('2', D) + Pos('3', D) + Pos('4', D) + Pos('5', D) +
+    Pos('6', D) + Pos('7', D) + Pos('8', D) + Pos('9', D) > 0) then
+    Result := '-' + Result;
+end;
+
+{ Value in scientific notation with Precision significant digits and a
+  3-digit exponent: 1.50000000000000E+000. }
+function FormatExponent(Value: Double; Precision: Integer): string;
+var
+  D, ExpText: string;
+  Exp: Integer;
+  Negative: Boolean;
+begin
+  if Precision < 1 then
+    Precision := 1;
+  FloatDigits(Value, D, Exp, Negative);
+  RoundDigits(D, Exp, Precision);
+  if Value = 0 then
+    Exp := 0;
+  Result := D[1];
+  if Length(D) > 1 then
+    Result := Result + '.' + Copy(D, 2, Length(D));
+  ExpText := IntToStr(Abs(Exp));
+  while Length(ExpText) < 3 do
+    ExpText := '0' + ExpText;
+  if Exp < 0 then
+    Result := Result + 'E-' + ExpText
+  else
+    Result := Result + 'E+' + ExpText;
+  if Negative then
+    Result := '-' + Result;
+end;
+
+{ The shortest of fixed and scientific notation, with at most Precision
+  significant digits: 1.5, 100, 1E20, -1.5E-7. }
+function FormatGeneral(Value: Double; Precision: Integer): string;
+var
+  D: string;
+  Exp, I: Integer;
+  Negative: Boolean;
+begin
+  if (Precision < 1) or (Precision > 15) then
+    Precision := 15;
+  if Value = 0 then
+    Exit('0');
+  FloatDigits(Value, D, Exp, Negative);
+  RoundDigits(D, Exp, Precision);
+  { Trailing zeros go. }
+  I := Length(D);
+  while (I > 1) and (D[I] = '0') do
+    I := I - 1;
+  D := Copy(D, 1, I);
+  if (Exp < -4) or (Exp >= Precision) then
+  begin
+    Result := D[1];
+    if Length(D) > 1 then
+      Result := Result + '.' + Copy(D, 2, Length(D));
+    Result := Result + 'E' + IntToStr(Exp);
+  end
+  else if Exp < 0 then
+    Result := '0.' + StringOfChar('0', -Exp - 1) + D
+  else if Length(D) <= Exp + 1 then
+    Result := D + StringOfChar('0', Exp + 1 - Length(D))
+  else
+    Result := Copy(D, 1, Exp + 1) + '.' + Copy(D, Exp + 2, Length(D));
+  if Negative then
+    Result := '-' + Result;
+end;
+
+function FloatToStrF(Value: Double; Format: TFloatFormat; Precision, Digits: Integer): string;
+begin
+  case Format of
+    ffExponent: Result := FormatExponent(Value, Precision);
+    ffFixed: Result := FormatFixed(Value, Digits, False);
+    ffNumber, ffCurrency: Result := FormatFixed(Value, Digits, True);
+  else
+    Result := FormatGeneral(Value, Precision);
+  end;
+end;
+
+function FloatToStr(Value: Double): string;
+begin
+  FloatToStr := FormatGeneral(Value, 15);
+end;
+
+function Format(const Fmt: string; const Args: array of const): string;
+var
+  I, Len, ArgIndex, Index, Width, Precision, N: Integer;
+  LeftAlign: Boolean;
+  Kind: Char;
+  Value, Number: string;
+  Arg: TVarRec;
+  IntValue: Int64;
+  FloatValue: Double;
+
+  procedure Fail;
+  begin
+    raise EConvertError.Create('Invalid argument index in format "' + Fmt + '"');
+  end;
+
+  function NextArg: TVarRec;
+  begin
+    if ArgIndex > High(Args) then
+      Fail;
+    Result := Args[ArgIndex];
+    ArgIndex := ArgIndex + 1;
+  end;
+
+  { An integer from the format, or `*` taking one from Args. }
+  function ReadNumber: Integer;
+  var
+    A: TVarRec;
+  begin
+    Result := -1;
+    if (I <= Len) and (Fmt[I] = '*') then
+    begin
+      A := NextArg;
+      if A.VType <> vtInteger then
+        Fail;
+      Result := A.VInteger;
+      I := I + 1;
+      Exit;
+    end;
+    while (I <= Len) and (Fmt[I] >= '0') and (Fmt[I] <= '9') do
+    begin
+      if Result < 0 then
+        Result := 0;
+      Result := Result * 10 + Ord(Fmt[I]) - Ord('0');
+      I := I + 1;
+    end;
+  end;
+
+  function ArgInteger(const A: TVarRec): Int64;
+  begin
+    case A.VType of
+      vtInteger: Result := A.VInteger;
+      vtInt64: Result := A.VInt64^;
+      vtQWord: Result := Int64(A.VQWord^);
+    else
+      Fail;
+    end;
+  end;
+
+  function ArgFloat(const A: TVarRec): Double;
+  begin
+    case A.VType of
+      vtExtended: Result := A.VExtended^;
+    else
+      Fail;
+    end;
+  end;
+
+  function ArgString(const A: TVarRec): string;
+  begin
+    case A.VType of
+      vtAnsiString: Result := AnsiString(A.VAnsiString);
+      vtChar: Result := A.VChar;
+      vtString: Result := A.VString^;
+      vtPChar: Result := A.VPChar;
+      vtUnicodeString: Result := UnicodeString(A.VUnicodeString);
+      vtWideChar: Result := UnicodeString(A.VWideChar);
+    else
+      Fail;
+    end;
+  end;
+
+begin
+  Result := '';
+  Len := Length(Fmt);
+  ArgIndex := 0;
+  I := 1;
+  while I <= Len do
+  begin
+    if Fmt[I] <> '%' then
+    begin
+      Result := Result + Fmt[I];
+      I := I + 1;
+      Continue;
+    end;
+    I := I + 1;
+    if (I <= Len) and (Fmt[I] = '%') then
+    begin
+      Result := Result + '%';
+      I := I + 1;
+      Continue;
+    end;
+    { [index:] }
+    Index := ReadNumber;
+    if (I <= Len) and (Fmt[I] = ':') then
+    begin
+      ArgIndex := Index;
+      I := I + 1;
+      Index := -1;
+    end;
+    LeftAlign := False;
+    if (I <= Len) and (Fmt[I] = '-') then
+    begin
+      LeftAlign := True;
+      I := I + 1;
+    end;
+    if Index >= 0 then
+      Width := Index
+    else
+      Width := ReadNumber;
+    Precision := -1;
+    if (I <= Len) and (Fmt[I] = '.') then
+    begin
+      I := I + 1;
+      Precision := ReadNumber;
+      if Precision < 0 then
+        Precision := 0;
+    end;
+    if I > Len then
+      Fail;
+    Kind := UpCase(Fmt[I]);
+    I := I + 1;
+    Arg := NextArg;
+    case Kind of
+      'D':
+        begin
+          IntValue := ArgInteger(Arg);
+          Number := IntToStr(Abs(IntValue));
+          if IntValue = Low(Int64) then
+            Number := '9223372036854775808';
+          if Precision > Length(Number) then
+            Number := StringOfChar('0', Precision - Length(Number)) + Number;
+          if IntValue < 0 then
+            Number := '-' + Number;
+          Value := Number;
+        end;
+      'U':
+        begin
+          IntValue := ArgInteger(Arg);
+          if (Arg.VType = vtInteger) and (IntValue < 0) then
+            IntValue := IntValue + 4294967296;
+          Value := IntToStr(IntValue);
+          if Precision > Length(Value) then
+            Value := StringOfChar('0', Precision - Length(Value)) + Value;
+        end;
+      'X':
+        begin
+          IntValue := ArgInteger(Arg);
+          if (Arg.VType = vtInteger) and (IntValue < 0) then
+            Value := IntToHex(IntValue and $FFFFFFFF, 16)
+          else
+            Value := IntToHex(IntValue, 16);
+          while (Length(Value) > 1) and (Value[1] = '0') do
+            Delete(Value, 1, 1);
+          if Precision > Length(Value) then
+            Value := StringOfChar('0', Precision - Length(Value)) + Value;
+        end;
+      'S':
+        begin
+          Value := ArgString(Arg);
+          if (Precision >= 0) and (Precision < Length(Value)) then
+            Value := Copy(Value, 1, Precision);
+        end;
+      'F', 'N', 'M':
+        begin
+          FloatValue := ArgFloat(Arg);
+          if Precision < 0 then
+            Precision := 2;
+          Value := FormatFixed(FloatValue, Precision, Kind <> 'F');
+        end;
+      'E':
+        begin
+          FloatValue := ArgFloat(Arg);
+          if Precision < 0 then
+            Precision := 15;
+          Value := FormatExponent(FloatValue, Precision);
+        end;
+      'G':
+        begin
+          FloatValue := ArgFloat(Arg);
+          if Precision < 0 then
+            Precision := 15;
+          Value := FormatGeneral(FloatValue, Precision);
+        end;
+      'P':
+        begin
+          if Arg.VType <> vtPointer then
+            Fail;
+          Value := IntToHex(PtrUInt(Arg.VPointer), 16);
+        end;
+    else
+      raise EConvertError.Create('Invalid format specifier : "' + Fmt + '"');
+    end;
+    N := Width - Length(Value);
+    if N > 0 then
+    begin
+      if LeftAlign then
+        Value := Value + StringOfChar(' ', N)
+      else
+        Value := StringOfChar(' ', N) + Value;
+    end;
+    Result := Result + Value;
+  end;
 end;
 
 constructor Exception.Create(const Msg: string);

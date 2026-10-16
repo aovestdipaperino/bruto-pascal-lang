@@ -115,14 +115,20 @@ impl<'ctx> CodeGen<'ctx> {
         } else {
             let collection_ty = self.resolve_type(&self.infer_declared_type(collection));
             // The first index, and the last one (`None`: the length).
+            // (A dynamic or open array runs to its High.)
+            let zero_based = matches!(
+                collection_ty,
+                PascalType::DynArray(_) | PascalType::OpenArray(_)
+            );
             let (first, last) = match &collection_ty {
                 PascalType::String | PascalType::ShortString { .. } | PascalType::UnicodeString => {
                     (1, None)
                 }
+                PascalType::DynArray(_) | PascalType::OpenArray(_) => (0, None),
                 PascalType::Array { lo, hi, .. } => (*lo, Some(*hi)),
                 _ => {
                     return Err(CodeGenError::new(
-                        "for-in needs a string, an array or an enumerator (T.Create(...))",
+                        "for-in needs a string, an array, a class with GetEnumerator or an enumerator",
                         Some(span),
                     ));
                 }
@@ -144,7 +150,7 @@ impl<'ctx> CodeGen<'ctx> {
                 right: Box::new(match last {
                     Some(hi) => Expr::IntLit(hi, span),
                     None => Expr::Call {
-                        name: "length".to_string(),
+                        name: if zero_based { "high" } else { "length" }.to_string(),
                         args: vec![var_expr(&items)],
                         span,
                     },

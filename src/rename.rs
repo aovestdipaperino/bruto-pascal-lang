@@ -190,7 +190,9 @@ fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
             }
         }
         PascalType::ClassOf(name) => *name = n.rename(name),
-        PascalType::VarParam(inner) => rewrite_type(inner, n),
+        PascalType::VarParam(inner)
+        | PascalType::DynArray(inner)
+        | PascalType::OpenArray(inner) => rewrite_type(inner, n),
         PascalType::Enum { name, values } => {
             *name = n.rename(name);
             for v in values {

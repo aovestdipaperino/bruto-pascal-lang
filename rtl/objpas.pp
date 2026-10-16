@@ -15,6 +15,33 @@ interface
 type
   TClass = class of TObject;
 
+  PExtended = ^Double;
+  PInt64 = ^Int64;
+  PQWord = ^QWord;
+
+  { An element of an `array of const` parameter: VType says which field
+    holds the value (vtInteger: VInteger, vtAnsiString: VAnsiString...).
+    Integers that don't fit a LongInt come as vtInt64. }
+  PVarRec = ^TVarRec;
+  TVarRec = record
+    case VType: SizeInt of
+      0: (VInteger: LongInt);
+      1: (VBoolean: Boolean);
+      2: (VChar: Char);
+      3: (VExtended: PExtended);
+      4: (VString: PShortString);
+      5: (VPointer: Pointer);
+      6: (VPChar: PChar);
+      7: (VObject: TObject);
+      8: (VClass: TClass);
+      9: (VWideChar: WideChar);
+      10: (VPWideChar: PWideChar);
+      11: (VAnsiString: Pointer);
+      16: (VInt64: PInt64);
+      17: (VQWord: PQWord);
+      18: (VUnicodeString: Pointer);
+  end;
+
   { A method pointer's parts: `TMethod(OnClick).Data` is the instance. }
   TMethod = record
     Code, Data: Pointer;
@@ -42,6 +69,27 @@ type
   { Called with a runtime error's code before the program stops; SysUtils
     raises the matching exception from it. }
   TBrutoRunErrorHook = procedure(Code: LongInt);
+
+const
+  vtInteger = 0;
+  vtBoolean = 1;
+  vtChar = 2;
+  vtExtended = 3;
+  vtString = 4;
+  vtPointer = 5;
+  vtPChar = 6;
+  vtObject = 7;
+  vtClass = 8;
+  vtWideChar = 9;
+  vtPWideChar = 10;
+  vtAnsiString = 11;
+  vtCurrency = 12;
+  vtVariant = 13;
+  vtInterface = 14;
+  vtWideString = 15;
+  vtInt64 = 16;
+  vtQWord = 17;
+  vtUnicodeString = 18;
 
 var
   { The innermost exception frame (one per `try` being run). }

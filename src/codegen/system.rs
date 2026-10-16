@@ -58,7 +58,11 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// An integer argument, widened to 64 bits.
-    fn int_arg(&mut self, arg: &Expr, span: Span) -> Result<IntValue<'ctx>, CodeGenError> {
+    pub(super) fn int_arg(
+        &mut self,
+        arg: &Expr,
+        span: Span,
+    ) -> Result<IntValue<'ctx>, CodeGenError> {
         let val = self.compile_expr(arg)?;
         let val = self.first_char_if_string(val, span)?;
         if !val.is_int_value() {
@@ -263,6 +267,8 @@ impl<'ctx> CodeGen<'ctx> {
                     .build_call(memset, &[dst.into(), value.into(), count.into()], "")
                     .map_err(err)?;
             }
+            // SetLength(A, N[, M...]) on a dynamic array.
+            ("setlength", _) if self.dynarray_setlength(args, span)? => {}
             // SetLength(S, N): a short string's length byte, or a dynamic
             // string reallocated (new characters are spaces, since a
             // dynamic string ends at its first NUL).

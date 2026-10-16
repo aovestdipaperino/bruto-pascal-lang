@@ -27,9 +27,15 @@ impl<'ctx> CodeGen<'ctx> {
         self.holds_counted_string(ty)
     }
 
+    /// Whether a value of type `ty` holds strings or dynamic arrays
+    /// (whether or not counting is on).
+    pub(super) fn holds_counted(&self, ty: &PascalType) -> bool {
+        self.holds_counted_string(ty)
+    }
+
     fn holds_counted_string(&self, ty: &PascalType) -> bool {
         match self.resolve_type(ty) {
-            PascalType::String | PascalType::UnicodeString => true,
+            PascalType::String | PascalType::UnicodeString | PascalType::DynArray(_) => true,
             PascalType::Array { elem, .. } => self.holds_counted_string(&elem),
             PascalType::Record { fields, .. } => {
                 fields.iter().any(|(_, t)| self.holds_counted_string(t))
@@ -52,10 +58,10 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         match self.resolve_type(ty) {
-            PascalType::String if val.is_pointer_value() => {
+            PascalType::String | PascalType::DynArray(_) if val.is_pointer_value() => {
                 self.arc_call("bruto_astr_addref", val.into_pointer_value(), span)
             }
-            PascalType::String => Ok(()),
+            PascalType::String | PascalType::DynArray(_) => Ok(()),
             PascalType::UnicodeString if self.is_ustr(val) => {
                 let p = self.ustr_ptr(val, span)?;
                 self.arc_call("bruto_astr_addref", p, span)
@@ -99,7 +105,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Apply runtime routine `op` to every AnsiString in the memory at
     /// `slot`, of type `ty`.
-    fn arc_walk(
+    pub(super) fn arc_walk(
         &mut self,
         slot: PointerValue<'ctx>,
         ty: &PascalType,
@@ -109,8 +115,9 @@ impl<'ctx> CodeGen<'ctx> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let ptr = self.context.ptr_type(AddressSpace::default());
         match self.resolve_type(ty) {
-            // A UnicodeString slot holds the pointer too.
-            PascalType::String | PascalType::UnicodeString => {
+            // A UnicodeString slot holds the pointer too, and so does a
+            // dynamic array's.
+            PascalType::String | PascalType::UnicodeString | PascalType::DynArray(_) => {
                 let s = self
                     .builder
                     .build_load(ptr, slot, "arc_str")

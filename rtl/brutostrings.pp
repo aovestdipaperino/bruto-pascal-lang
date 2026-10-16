@@ -42,7 +42,11 @@ const
   BrutoAStrMarker = $B57A57A1;
   BrutoAStrPooled = 2;
   BrutoAStrShifted = 4;
-  BrutoAStrFlags = 6;
+  { A dynamic array: the header's count is its number of elements, and the
+    two words before the header are the routines that release and count
+    a run of its elements (nil when they hold nothing counted). }
+  BrutoDynArray = 8;
+  BrutoAStrFlags = 14;
 
 var
   { Strings made by the statement being run and not yet stored anywhere
@@ -53,6 +57,21 @@ var
 
 function bruto_astr_len(S: Pointer): Int64;
 function bruto_astr_alloc(Len: Int64): Pointer;
+
+{ Dynamic arrays: a pointer to the first of Count elements of ElemSize
+  bytes (zeroed), with the string header before it; nil when empty.
+  Cleanup and Addref are procedure(P: Pointer; Count: Int64), or nil. }
+function bruto_dynarr_block(Count, ElemSize: Int64; Cleanup, Addref: Pointer): Pointer;
+{ SetLength on the dynamic array in Slot: it ends up the only reference
+  to a block of NewCount elements, the old ones kept. }
+procedure bruto_dynarr_setlength(Slot: Pointer; NewCount, ElemSize: Int64; Cleanup, Addref: Pointer);
+{ Count elements of P from Start (0-based), in a new array. }
+function bruto_dynarr_copy(P: Pointer; Start, Count, ElemSize: Int64): Pointer;
+{ Delete(A, Index, Count) on the dynamic array in Slot. }
+procedure bruto_dynarr_delete(Slot: Pointer; Index, Count, ElemSize: Int64);
+{ Make room for one element at Index (at most the length) in the
+  dynamic array in Slot (its own block afterwards); the index used. }
+function bruto_dynarr_insert_gap(Slot: Pointer; Index, ElemSize: Int64; Cleanup, Addref: Pointer): Int64;
 function bruto_astr_from_buf(P: Pointer; Len: Int64): Pointer;
 function bruto_astr_from_char(C: Int64): Pointer;
 { A string holding the C string P, whose memory (from malloc) is freed. }
@@ -176,9 +195,30 @@ begin
   PBrutoMarker(S - 16)^ := PBrutoMarker(S - 16)^ or BrutoAStrPooled;
 end;
 
-procedure bruto_astr_free(S: Pointer);
+type
+  TBrutoElemProc = procedure(P: Pointer; Count: Int64);
+
+{ Free a dynamic array's block, without touching its elements. }
+procedure bruto_dynarr_free_block(S: Pointer);
 begin
   if (PBrutoMarker(S - 16)^ and BrutoAStrShifted) <> 0 then
+    FreeMem(S - 48)
+  else
+    FreeMem(S - 32);
+end;
+
+procedure bruto_astr_free(S: Pointer);
+var
+  Cleanup: Pointer;
+begin
+  if (PBrutoMarker(S - 16)^ and BrutoDynArray) <> 0 then
+  begin
+    Cleanup := PPointer(S - 32)^;
+    if Cleanup <> nil then
+      TBrutoElemProc(Cleanup)(S, PBrutoLength(S - 8)^);
+    bruto_dynarr_free_block(S);
+  end
+  else if (PBrutoMarker(S - 16)^ and BrutoAStrShifted) <> 0 then
     FreeMem(S - 32)
   else
     FreeMem(S - 16);
@@ -275,6 +315,136 @@ begin
   if Len < 0 then
     Len := 0;
   bruto_astr_alloc := bruto_string_block(Len, Len + 1);
+end;
+
+function bruto_dynarr_block(Count, ElemSize: Int64; Cleanup, Addref: Pointer): Pointer;
+var
+  Block, Header: Pointer;
+  Size: Int64;
+begin
+  Size := Count * ElemSize;
+  GetMem(Block, 64 + Size);
+  FillChar(Block^, 64 + Size, 0);
+  Header := Block + 16;
+  PBrutoMarker(Header)^ := BrutoAStrMarker or BrutoDynArray;
+  if ((PtrUInt(Header) + 16) and 4095) < 16 then
+  begin
+    Header := Block + 32;
+    PBrutoMarker(Header)^ := BrutoAStrMarker or BrutoDynArray or BrutoAStrShifted;
+  end;
+  PPointer(Header - 16)^ := Cleanup;
+  PPointer(Header - 8)^ := Addref;
+  PBrutoLength(Header + 8)^ := Count;
+  if BrutoArc then
+    bruto_pool_add(Header + 16);
+  bruto_dynarr_block := Header + 16;
+end;
+
+procedure bruto_dynarr_setlength(Slot: Pointer; NewCount, ElemSize: Int64; Cleanup, Addref: Pointer);
+var
+  P, Q: Pointer;
+  Old, Keep: Int64;
+begin
+  P := PPointer(Slot)^;
+  Old := bruto_astr_len(P);
+  if NewCount <= 0 then
+  begin
+    if P <> nil then
+      bruto_astr_release(P);
+    PPointer(Slot)^ := nil;
+    Exit;
+  end;
+  Q := bruto_dynarr_block(NewCount, ElemSize, Cleanup, Addref);
+  Keep := Old;
+  if NewCount < Keep then
+    Keep := NewCount;
+  if Keep > 0 then
+    Move(P^, Q^, Keep * ElemSize);
+  if P <> nil then
+  begin
+    if (PBrutoCount(P - 12)^ = 1) and ((PBrutoMarker(P - 16)^ and BrutoAStrPooled) = 0) then
+    begin
+      { The only reference: the kept elements moved; the others go. }
+      if (Old > Keep) and (Cleanup <> nil) then
+        TBrutoElemProc(Cleanup)(P + Keep * ElemSize, Old - Keep);
+      bruto_dynarr_free_block(P);
+    end
+    else
+    begin
+      { Shared: the copies are references of their own. }
+      if (Keep > 0) and (Addref <> nil) then
+        TBrutoElemProc(Addref)(Q, Keep);
+      bruto_astr_release(P);
+    end;
+  end;
+  bruto_astr_addref(Q);
+  PPointer(Slot)^ := Q;
+end;
+
+function bruto_dynarr_copy(P: Pointer; Start, Count, ElemSize: Int64): Pointer;
+var
+  Old: Int64;
+  Q, Addref: Pointer;
+begin
+  bruto_dynarr_copy := nil;
+  Old := bruto_astr_len(P);
+  if Start < 0 then
+    Start := 0;
+  if Start > Old then
+    Start := Old;
+  if Count > Old - Start then
+    Count := Old - Start;
+  if Count <= 0 then
+    Exit;
+  Addref := PPointer(P - 24)^;
+  Q := bruto_dynarr_block(Count, ElemSize, PPointer(P - 32)^, Addref);
+  Move((P + Start * ElemSize)^, Q^, Count * ElemSize);
+  if Addref <> nil then
+    TBrutoElemProc(Addref)(Q, Count);
+  bruto_dynarr_copy := Q;
+end;
+
+procedure bruto_dynarr_delete(Slot: Pointer; Index, Count, ElemSize: Int64);
+var
+  P, Cleanup, Addref: Pointer;
+  Len: Int64;
+begin
+  P := PPointer(Slot)^;
+  Len := bruto_astr_len(P);
+  if (P = nil) or (Index < 0) or (Index >= Len) or (Count <= 0) then
+    Exit;
+  if Count > Len - Index then
+    Count := Len - Index;
+  Cleanup := PPointer(P - 32)^;
+  Addref := PPointer(P - 24)^;
+  { A block of its own, then the elements go and the rest move down. }
+  bruto_dynarr_setlength(Slot, Len, ElemSize, Cleanup, Addref);
+  P := PPointer(Slot)^;
+  if Cleanup <> nil then
+    TBrutoElemProc(Cleanup)(P + Index * ElemSize, Count);
+  if Len - Index - Count > 0 then
+    Move((P + (Index + Count) * ElemSize)^, (P + Index * ElemSize)^, (Len - Index - Count) * ElemSize);
+  FillChar((P + (Len - Count) * ElemSize)^, Count * ElemSize, 0);
+  bruto_dynarr_setlength(Slot, Len - Count, ElemSize, Cleanup, Addref);
+end;
+
+function bruto_dynarr_insert_gap(Slot: Pointer; Index, ElemSize: Int64; Cleanup, Addref: Pointer): Int64;
+var
+  P: Pointer;
+  Len: Int64;
+begin
+  P := PPointer(Slot)^;
+  Len := bruto_astr_len(P);
+  if Index < 0 then
+    Index := 0;
+  if Index > Len then
+    Index := Len;
+  bruto_dynarr_setlength(Slot, Len + 1, ElemSize, Cleanup, Addref);
+  P := PPointer(Slot)^;
+  if Len - Index > 0 then
+    Move((P + Index * ElemSize)^, (P + (Index + 1) * ElemSize)^, (Len - Index) * ElemSize);
+  FillChar((P + Index * ElemSize)^, ElemSize, 0);
+  bruto_dynarr_insert_gap := Index;
 end;
 
 function bruto_astr_from_pchar(P: Pointer): Pointer;
