@@ -541,9 +541,16 @@ impl<'ctx> CodeGen<'ctx> {
                     };
                 }
                 if !self.involves_class(&place) {
-                    return Ok(None);
+                    // The place is plain, but the value may read a class.
+                    Statement::ChainedAssignment {
+                        target: target.clone(),
+                        chain: chain.clone(),
+                        expr: d(expr)?,
+                        span: *span,
+                    }
+                } else {
+                    return self.place_write(&place, d(expr)?, *span).map(Some);
                 }
-                return self.place_write(&place, d(expr)?, *span).map(Some);
             }
             Statement::PlaceAssignment { target, expr, span } => {
                 return self.place_write(target, d(expr)?, *span).map(Some);

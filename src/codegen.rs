@@ -2771,6 +2771,23 @@ impl<'ctx> CodeGen<'ctx> {
         )
     }
 
+    /// Whether `expr` is an Int64 as FPC types it (for overloads such as
+    /// `Random`): a constant beyond LongInt, a 64-bit variable or call
+    /// (`Length` gives a SizeInt), or arithmetic with one.
+    fn is_int64_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLit(n, _) => i32::try_from(*n).is_err(),
+            Expr::BinOp { left, right, .. } => {
+                self.is_int64_expr(left) || self.is_int64_expr(right)
+            }
+            Expr::UnaryOp { operand, .. } => self.is_int64_expr(operand),
+            _ => matches!(
+                self.resolve_type(&self.infer_declared_type(expr)),
+                PascalType::Integer | PascalType::SizedInt { bits: 64, .. }
+            ),
+        }
+    }
+
     /// Whether `expr` is a QWord (or an expression of QWords).
     fn is_qword(&self, expr: &Expr) -> bool {
         matches!(
@@ -6556,6 +6573,27 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn compile_expr_inner(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         match expr {
+            // `Length(A)` of a static array: its element count.
+            Expr::Call { name, args, .. }
+                if name == "length"
+                    && args.len() == 1
+                    && !self.is_user_routine(name)
+                    && matches!(
+                        self.resolve_type(&self.infer_declared_type(&args[0])),
+                        PascalType::Array { .. }
+                    ) =>
+            {
+                let PascalType::Array { lo, hi, .. } =
+                    self.resolve_type(&self.infer_declared_type(&args[0]))
+                else {
+                    unreachable!()
+                };
+                Ok(self
+                    .context
+                    .i64_type()
+                    .const_int((hi - lo + 1).max(0) as u64, true)
+                    .into())
+            }
             // Length/High/Low/Copy of a dynamic or open array.
             Expr::Call { name, args, span }
                 if matches!(name.as_str(), "length" | "high" | "low" | "copy")
@@ -7192,6 +7230,9 @@ impl<'ctx> CodeGen<'ctx> {
                 if name == "random" && args.len() <= 1 && !self.is_user_routine(name) {
                     let target = if args.is_empty() {
                         "brutorandomfloat"
+                    } else if self.is_int64_expr(&args[0]) {
+                        // FPC's Random(Int64) overload draws differently.
+                        "brutorandomint64"
                     } else {
                         "brutorandomint"
                     };

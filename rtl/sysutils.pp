@@ -122,6 +122,8 @@ function StrToInt(const S: string): Int64;
 function StrToIntDef(const S: string; Default: Int64): Int64;
 function StrToInt64(const S: string): Int64;
 function StrToInt64Def(const S: string; Default: Int64): Int64;
+function TryStrToInt(const S: string; out Value: LongInt): Boolean;
+function TryStrToInt64(const S: string; out Value: Int64): Boolean;
 { Whether the Length bytes at P1 and P2 are the same. }
 function CompareMem(P1, P2: Pointer; Length: PtrUInt): Boolean;
 function StrToFloat(const S: string): Double;
@@ -133,6 +135,15 @@ function Trim(const S: string): string;
 function TrimLeft(const S: string): string;
 function TrimRight(const S: string): string;
 function FileExists(const FileName: string): Boolean;
+{ File names, as FPC splits them ('/' separates directories, and '\' and
+  ':' too on Windows; a name starting with '.' has no extension). }
+function ChangeFileExt(const FileName, Extension: string): string;
+function ExtractFileName(const FileName: string): string;
+function ExtractFilePath(const FileName: string): string;
+function ExtractFileDir(const FileName: string): string;
+function ExtractFileExt(const FileName: string): string;
+function IncludeTrailingPathDelimiter(const Path: string): string;
+function ExcludeTrailingPathDelimiter(const Path: string): string;
 function DirectoryExists(const Directory: string): Boolean;
 procedure Sleep(Milliseconds: LongWord);
 { Free the class instance Obj refers to (if any) and set Obj to nil. }
@@ -221,6 +232,25 @@ end;
 function StrToInt64Def(const S: string; Default: Int64): Int64;
 begin
   StrToInt64Def := StrToIntDef(S, Default);
+end;
+
+function TryStrToInt64(const S: string; out Value: Int64): Boolean;
+var
+  Code: Integer;
+begin
+  Val(S, Value, Code);
+  Result := Code = 0;
+  if not Result then
+    Value := 0;
+end;
+
+{ As FPC's (Val into a LongInt): a value beyond LongInt wraps. }
+function TryStrToInt(const S: string; out Value: LongInt): Boolean;
+var
+  V: Int64;
+begin
+  Result := TryStrToInt64(S, V);
+  Value := LongInt(V);
 end;
 
 function CompareMem(P1, P2: Pointer; Length: PtrUInt): Boolean;
@@ -321,6 +351,92 @@ end;
 function Trim(const S: string): string;
 begin
   Trim := TrimLeft(TrimRight(S));
+end;
+
+function BrutoIsPathSep(C: Char): Boolean;
+begin
+  {$IFDEF WINDOWS}
+  BrutoIsPathSep := (C = '/') or (C = '\') or (C = ':');
+  {$ELSE}
+  BrutoIsPathSep := C = '/';
+  {$ENDIF}
+end;
+
+{ The index of FileName's extension's '.', or 0. }
+function BrutoExtensionAt(const FileName: string): Integer;
+var
+  I: Integer;
+begin
+  I := Length(FileName);
+  while (I > 0) and not BrutoIsPathSep(FileName[I]) and (FileName[I] <> '.') do
+    Dec(I);
+  if (I > 1) and (FileName[I] = '.') and not BrutoIsPathSep(FileName[I - 1]) then
+    Result := I
+  else
+    Result := 0;
+end;
+
+function ChangeFileExt(const FileName, Extension: string): string;
+var
+  I: Integer;
+begin
+  I := BrutoExtensionAt(FileName);
+  if I = 0 then
+    I := Length(FileName) + 1;
+  Result := Copy(FileName, 1, I - 1) + Extension;
+end;
+
+function ExtractFileExt(const FileName: string): string;
+var
+  I: Integer;
+begin
+  I := BrutoExtensionAt(FileName);
+  if I = 0 then
+    Result := ''
+  else
+    Result := Copy(FileName, I, MaxInt);
+end;
+
+{ The index of FileName's last separator, or 0. }
+function BrutoLastSep(const FileName: string): Integer;
+begin
+  Result := Length(FileName);
+  while (Result > 0) and not BrutoIsPathSep(FileName[Result]) do
+    Dec(Result);
+end;
+
+function ExtractFileName(const FileName: string): string;
+begin
+  Result := Copy(FileName, BrutoLastSep(FileName) + 1, MaxInt);
+end;
+
+function ExtractFilePath(const FileName: string): string;
+begin
+  Result := Copy(FileName, 1, BrutoLastSep(FileName));
+end;
+
+function ExtractFileDir(const FileName: string): string;
+var
+  I: Integer;
+begin
+  I := BrutoLastSep(FileName);
+  if (I > 1) and not BrutoIsPathSep(FileName[I - 1]) then
+    Dec(I);
+  Result := Copy(FileName, 1, I);
+end;
+
+function IncludeTrailingPathDelimiter(const Path: string): string;
+begin
+  Result := Path;
+  if (Result = '') or not BrutoIsPathSep(Result[Length(Result)]) then
+    Result := Result + {$IFDEF WINDOWS}'\'{$ELSE}'/'{$ENDIF};
+end;
+
+function ExcludeTrailingPathDelimiter(const Path: string): string;
+begin
+  Result := Path;
+  if (Result <> '') and BrutoIsPathSep(Result[Length(Result)]) then
+    SetLength(Result, Length(Result) - 1);
 end;
 
 function FileExists(const FileName: string): Boolean;

@@ -132,6 +132,9 @@ var
 { FPC 3.2's generator (MT19937), giving the same numbers for a seed:
   Random(L) (0 <= it < L) and Random (0 <= it < 1) call these. }
 function BrutoRandomInt(L: LongInt): LongInt;
+{ Random(L) with an Int64 L (FPC's overload): two draws, low word first,
+  as a non-negative Int64, mod L. }
+function BrutoRandomInt64(L: Int64): Int64;
 function BrutoRandomFloat: Double;
 { A seed from the clock. }
 procedure Randomize;
@@ -451,7 +454,23 @@ function BrutoRandomInt(L: LongInt): LongInt;
 begin
   if L < 0 then
     L := L + 1;
-  BrutoRandomInt := (Int64(BrutoMTNext) * L) div 4294967296;
+  { The product's high 32 bits, as FPC takes them (a floor, for a
+    negative L). }
+  BrutoRandomInt := LongInt((Int64(BrutoMTNext) * L) shr 32);
+end;
+
+function BrutoRandomInt64(L: Int64): Int64;
+var
+  Lo, Hi: QWord;
+  V: Int64;
+begin
+  Lo := BrutoMTNext;
+  Hi := BrutoMTNext;
+  V := Int64(((Hi shl 32) or Lo) and $7FFFFFFFFFFFFFFF);
+  if L <> 0 then
+    BrutoRandomInt64 := V mod L
+  else
+    BrutoRandomInt64 := 0;
 end;
 
 function BrutoRandomFloat: Double;

@@ -31,6 +31,22 @@ struct Scope {
 pub(crate) fn separate_unit_scopes(program: &mut Program, units: &mut [Unit]) {
     let mut scopes: Vec<Scope> = units.iter().map(unit_scope).collect();
     scopes.push(program_scope(program));
+    let program_index = scopes.len() - 1;
+    // A unit with a TObject of its own (Free Vision's Objects) hides the
+    // root class only where it is used: the root class is declared by the
+    // System unit, which every unit uses first.
+    if scopes.iter().any(|s| s.declared.contains(ROOT_CLASS)) {
+        for scope in &mut scopes {
+            scope.uses.insert(0, SYSTEM_SCOPE.to_string());
+        }
+        let root: HashSet<String> = [ROOT_CLASS.to_string()].into_iter().collect();
+        scopes.push(Scope {
+            name: SYSTEM_SCOPE.to_string(),
+            uses: Vec::new(),
+            declared: root.clone(),
+            exported: root,
+        });
+    }
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut conflicted: HashSet<String> = HashSet::new();
@@ -84,14 +100,23 @@ pub(crate) fn separate_unit_scopes(program: &mut Program, units: &mut [Unit]) {
     for (unit, scope) in units.iter_mut().zip(&scopes) {
         rewrite_unit(unit, &renamer_for(scope));
     }
-    rewrite_program(program, &renamer_for(scopes.last().unwrap()));
+    rewrite_program(program, &renamer_for(&scopes[program_index]));
 }
+
+/// The root class's name.
+const ROOT_CLASS: &str = "tobject";
+
+/// The scope that declares the root class (it keeps its name).
+const SYSTEM_SCOPE: &str = "system";
 
 fn lower(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
 fn mangle(name: &str, unit: &str) -> String {
+    if unit == SYSTEM_SCOPE {
+        return name.to_string();
+    }
     format!("{name}@{unit}")
 }
 

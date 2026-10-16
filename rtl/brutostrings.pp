@@ -2030,6 +2030,7 @@ function bruto_val_int(S: Pointer; var Code: Int64): Int64;
 var
   P: PBrutoBytes;
   I, Base, D, V: Int64;
+  UV, Limit: QWord;
   Negative, Any: Boolean;
   C: Byte;
 begin
@@ -2068,7 +2069,15 @@ begin
     Base := 16;
     I := I + 2;
   end;
-  V := 0;
+  { As FPC: a decimal number must fit an Int64, a hexadecimal, octal or
+    binary one 64 bits; beyond that the digit is an error. }
+  if Base <> 10 then
+    Limit := QWord($FFFFFFFFFFFFFFFF)
+  else if Negative then
+    Limit := QWord($8000000000000000)
+  else
+    Limit := QWord($7FFFFFFFFFFFFFFF);
+  UV := 0;
   Any := False;
   while P^[I] <> 0 do
   begin
@@ -2086,7 +2095,12 @@ begin
       Code := I + 1;
       Exit;
     end;
-    V := V * Base + D;
+    if UV > (Limit - QWord(D)) div QWord(Base) then
+    begin
+      Code := I + 1;
+      Exit;
+    end;
+    UV := UV * QWord(Base) + QWord(D);
     Any := True;
     I := I + 1;
   end;
@@ -2095,6 +2109,7 @@ begin
     Code := I + 1;
     Exit;
   end;
+  V := Int64(UV);
   if Negative then
     V := -V;
   Code := 0;

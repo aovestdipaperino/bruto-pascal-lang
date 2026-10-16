@@ -8106,6 +8106,212 @@ masked
     }
 
     #[test]
+    fn a_units_own_tobject_is_seen_only_where_it_is_used() {
+        // Free Vision's Objects unit has an object type called TObject:
+        // units that don't use it (SysUtils, Classes, Modern) still mean
+        // the root class.
+        let old_obj: &[u8] = br#"unit OldObj;
+interface
+type
+  PObject = ^TObject;
+  TObject = object
+    Tag: Integer;
+    constructor Init;
+    destructor Done; virtual;
+    function Describe: string; virtual;
+  end;
+  PThing = ^TThing;
+  TThing = object(TObject)
+    function Describe: string; virtual;
+  end;
+implementation
+constructor TObject.Init; begin Tag := 7; end;
+destructor TObject.Done; begin end;
+function TObject.Describe: string; begin Describe := 'object'; end;
+function TThing.Describe: string; begin Describe := 'thing'; end;
+end.
+"#;
+        let modern: &[u8] = br#"unit Modern;
+{$mode objfpc}{$H+}
+interface
+uses SysUtils, Classes;
+type
+  TNote = class(TObject)
+    Text: string;
+    constructor Create(const S: string);
+  end;
+function Lines(const S: string): Integer;
+implementation
+constructor TNote.Create(const S: string); begin inherited Create; Text := S; end;
+function Lines(const S: string): Integer;
+var L: TStringList;
+begin
+  L := TStringList.Create;
+  try L.Text := S; Result := L.Count; finally L.Free; end;
+end;
+end.
+"#;
+        let (ok, out) = build_and_run_in_dir(
+            "bruto_tobject_scope_test",
+            &[("OldObj.pas", old_obj), ("Modern.pas", modern)],
+            r#"program ObjMix;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, Modern, OldObj;
+var
+  P: PObject;
+  N: TNote;
+  L: Classes.TStringList;
+begin
+  P := New(PThing, Init);
+  WriteLn(P^.Describe, ' ', P^.Tag);
+  Dispose(P, Done);
+  N := TNote.Create('hello');
+  WriteLn(N.Text, ' ', N.ClassName, ' ', N.ClassParent.ClassName, ' ', Lines('a'#10'b'));
+  N.Free;
+  L := Classes.TStringList.Create;
+  L.Add('x');
+  try
+    raise Exception.Create('caught ' + L[0]);
+  except
+    on E: Exception do WriteLn(E.Message);
+  end;
+  L.Free;
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"thing 7
+hello TNote TObject 2
+caught x
+"#
+        );
+    }
+
+    #[test]
+    fn chained_assignments_static_array_lengths_file_names_and_random_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program Misc;
+{$mode objfpc}{$H+}
+uses SysUtils;
+type
+  TG = (ga, gb);
+  TInfo = class
+  private FGenre: TG;
+  public property Genre: TG read FGenre write FGenre;
+  end;
+  PCl = ^TCl;
+  TCl = object Value: LongInt; end;
+  PDoc = ^TDoc;
+  TDoc = object Info: TInfo; end;
+const
+  Names: array[1..4] of string = ('one', 'two', 'three', 'four');
+var
+  D: TDoc;
+  N: LongInt;
+  I6: Int64;
+  I: Integer;
+procedure Chained(Doc: PDoc);
+var
+  Genre: PCl;
+const
+  Local: array[0..2] of Char = ('a', 'b', 'c');
+begin
+  New(Genre);
+  Genre^.Value := Ord(Doc^.Info.Genre) + Length(Local);
+  WriteLn(Genre^.Value);
+  Dispose(Genre);
+end;
+begin
+  D.Info := TInfo.Create;
+  D.Info.Genre := gb;
+  Chained(@D);
+  WriteLn(Length(Names), ' ', Names[Length(Names)]);
+  WriteLn(ChangeFileExt('/tmp/a.b/doc.wri', '.html'), ' ', ChangeFileExt('notes', '.md'), ' ',
+    ChangeFileExt('/tmp/.hidden', '.x'));
+  WriteLn(ExtractFileName('/tmp/a/doc.wri'), ' ', ExtractFilePath('/tmp/a/doc.wri'), ' ',
+    ExtractFileDir('/tmp/a/doc.wri'), ' ', ExtractFileExt('/tmp/a/doc.wri'), '|',
+    ExtractFileExt('/tmp/.hidden'), '|');
+  WriteLn(IncludeTrailingPathDelimiter('/tmp'), ' ', ExcludeTrailingPathDelimiter('/tmp/'));
+  WriteLn(TryStrToInt('42', N), ' ', N, ' ', TryStrToInt('4x', N), ' ',
+    TryStrToInt('9999999999', N), ' ', TryStrToInt64('9999999999', I6), ' ', I6);
+  RandSeed := 42;
+  for I := 1 to 3 do Write(Random(-7), ' ', Random(I6), ' ', Random(Length(Names)), ' ');
+  WriteLn;
+  D.Info.Free;
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"4
+4 four
+/tmp/a.b/doc.html notes.md /tmp/.hidden.x
+doc.wri /tmp/a/ /tmp/a .wri||
+/tmp/ /tmp
+TRUE 42 FALSE TRUE TRUE 9999999999
+-3 3778711 2 -5 4343377330 2 -1 8910898524 2 
+"#
+        );
+    }
+
+    #[test]
+    fn val_and_try_str_to_int_overflow_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program t3;
+var V: Int64; C: Integer; Q: QWord;
+begin
+  Val('99999999999999999999', V, C); WriteLn(V, ' ', C);
+  Val('9223372036854775807', V, C); WriteLn(V, ' ', C);
+  Val('9223372036854775808', V, C); WriteLn(V, ' ', C);
+  Val('-9223372036854775808', V, C); WriteLn(V, ' ', C);
+  Val('-9223372036854775809', V, C); WriteLn(V, ' ', C);
+  Val('$FFFFFFFFFFFFFFFF', V, C); WriteLn(V, ' ', C);
+  Val('$1FFFFFFFFFFFFFFFF', V, C); WriteLn(V, ' ', C);
+  Val(' 12', V, C); WriteLn(V, ' ', C);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"0 19
+9223372036854775807 0
+0 19
+-9223372036854775808 0
+0 20
+-1 0
+0 18
+12 0
+"#
+        );
+        let (ok, out) = build_and_run_source(
+            r#"program t2;
+{$mode objfpc}
+uses SysUtils;
+var N: LongInt; C: Integer;
+begin
+  WriteLn(TryStrToInt('9999999999', N), ' ', N);
+  WriteLn(TryStrToInt('-9999999999', N), ' ', N);
+  WriteLn(TryStrToInt('99999999999999999999', N), ' ', N);
+  Val('9999999999', N, C); WriteLn(N, ' ', C);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"TRUE 1410065407
+TRUE -1410065407
+FALSE 0
+1410065407 0
+"#
+        );
+    }
+
+    #[test]
     fn generic_routines_delphi_syntax() {
         let (ok, out) = build_and_run_source(
             "program T;
