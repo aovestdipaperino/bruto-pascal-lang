@@ -189,7 +189,7 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
         PascalType::VarParam(inner)
         | PascalType::DynArray(inner)
         | PascalType::OpenArray(inner) => collect_type(inner, n),
-        PascalType::Enum { name, values } => {
+        PascalType::Enum { name, values, .. } => {
             n.declare(name);
             for v in values {
                 n.declare(v);

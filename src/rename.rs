@@ -229,7 +229,7 @@ pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
         PascalType::VarParam(inner)
         | PascalType::DynArray(inner)
         | PascalType::OpenArray(inner) => rewrite_type(inner, n),
-        PascalType::Enum { name, values } => {
+        PascalType::Enum { name, values, .. } => {
             *name = n.rename(name);
             for v in values {
                 *v = n.rename(v);

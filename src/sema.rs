@@ -642,9 +642,10 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
 
 impl ConstEnv {
     fn add_enum_values(&mut self, ty: &PascalType) {
-        ty.for_each_enum(&mut |values| {
+        ty.for_each_enum(&mut |values, ordinals| {
             for (i, name) in values.iter().enumerate() {
-                self.values.insert(name.clone(), i as i64);
+                self.values
+                    .insert(name.clone(), ordinals.get(i).copied().unwrap_or(i as i64));
             }
         });
     }
@@ -717,7 +718,10 @@ impl ConstEnv {
     /// alias of a type whose bounds are known.
     fn add_type_bounds(&mut self, name: &str, ty: &PascalType) {
         let bounds = match ty {
-            PascalType::Enum { values, .. } => Some((0, values.len() as i64 - 1)),
+            PascalType::Enum { ordinals, .. } => Some((
+                ordinals.iter().copied().min().unwrap_or(0),
+                ordinals.iter().copied().max().unwrap_or(0),
+            )),
             PascalType::Subrange { lo, hi } => Some((*lo, *hi)),
             PascalType::SubrangeExpr { lo, hi } => self.eval(lo).ok().zip(self.eval(hi).ok()),
             PascalType::Named(other) => self.bounds_of(other),

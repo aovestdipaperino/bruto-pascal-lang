@@ -298,6 +298,9 @@ pub enum PascalType {
         /// The type name (e.g., "Color") — set during type section parsing
         name: String,
         values: Vec<String>,
+        /// Each value's ordinal: its position, unless given (`(A = 1, B =
+        /// 5)`; a value without one follows the previous).
+        ordinals: Vec<i64>,
     },
     /// Subrange type: lo..hi (stored as i64)
     Subrange {
@@ -358,9 +361,11 @@ impl PascalType {
     /// Call `f` with the values of every enumeration written inside this
     /// type, as in `Phase: (phFocused, phPreProcess)` in a record or
     /// object, each of which names a constant.
-    pub fn for_each_enum(&self, f: &mut impl FnMut(&[String])) {
+    pub fn for_each_enum(&self, f: &mut impl FnMut(&[String], &[i64])) {
         match self {
-            PascalType::Enum { values, .. } => f(values),
+            PascalType::Enum {
+                values, ordinals, ..
+            } => f(values, ordinals),
             PascalType::Record {
                 fields, variant, ..
             } => {
@@ -791,6 +796,10 @@ pub struct ExceptHandler {
     pub body: Block,
     pub span: Span,
 }
+
+/// The marker call `WriteStr(S, ...)`'s target rides on, as the first
+/// argument of a `Write`.
+pub const WRITESTR_TARGET: &str = "writestr$target";
 
 /// A single write/writeln argument with optional formatting: `expr[:width[:precision]]`.
 #[derive(Debug, Clone)]

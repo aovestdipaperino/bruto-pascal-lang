@@ -981,10 +981,11 @@ mod tests {
     #[test]
     fn enum_type() {
         let (ok, out) = build_and_run_source(
-            "program T;\ntype\n  Color = (Red, Green, Blue);\nvar c: Color;\nbegin\n  c := Green;\n  writeln(c)\nend.\n",
+            "program T;\ntype\n  Color = (Red, Green, Blue);\nvar c: Color;\nbegin\n  c := Green;\n  writeln(c, ' ', ord(c))\nend.\n",
         );
         assert!(ok);
-        assert_eq!(out.trim(), "1");
+        // As FPC, an enumeration value is written by its name.
+        assert_eq!(out.trim(), "Green 1");
     }
 
     #[test]
@@ -2394,7 +2395,7 @@ end.
 "#;
         let (ok, out) = build_and_run_source(source);
         assert!(ok, "new features program failed to run");
-        assert!(out.contains("Blue = 2"), "enum: {out}");
+        assert!(out.contains("Blue = Blue"), "enum: {out}");
         assert!(out.contains("n = 7"), "subrange: {out}");
         assert!(out.contains("5 in set: TRUE"), "set-in: {out}");
         assert!(out.contains("4 in set: FALSE"), "set-not-in: {out}");
@@ -6228,6 +6229,36 @@ end.
             out,
             "drawing square 4.0\nsquare: 4.00\nsquare: 9.00\nscalable\nTRUE TRUE\ndrawing square 36.0\nrefs dropped, object alive\ndrawing square 36.0\nsquare destroyed\n"
         );
+    }
+
+    #[test]
+    fn enum_names_and_writestr_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program ws;
+{$mode objfpc}{$H+}
+type
+  TColor = (clRed, clGreen, clBlue);
+  TSize = (szSmall = 1, szLarge = 5, szHuge);
+var
+  C: TColor; Z: TSize; S: string; B: Boolean; Q: QWord; F: Text;
+begin
+  C := clGreen;
+  WriteLn(C, ' ', Ord(C), ' [', C:8, ']', High(TSize), Low(TSize), Ord(szHuge));
+  Z := szLarge;
+  WriteLn(Z, ' ', Ord(Z), ' ', Succ(clRed));
+  B := True; Q := QWord($FFFFFFFFFFFFFFFF);
+  WriteStr(S, C, ' ', 42:5, ' ', 3.5:0:2, ' ', B, ' ', 'x', ' ', Q, '|', 'abc':6, '|', 1.25);
+  WriteLn(S);
+  WriteStr(S, Z);
+  WriteLn(Length(S), S);
+  Assign(F, 'bruto_ws_test.txt'); Rewrite(F); WriteLn(F, C, ' ', Z:7); Close(F);
+  Assign(F, 'bruto_ws_test.txt'); Reset(F); ReadLn(F, S); Close(F); WriteLn(S);
+end.
+",
+        );
+        let _ = std::fs::remove_file("bruto_ws_test.txt");
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "clGreen 1 [clGreen ]szHugeszSmall6\nszLarge 5 clGreen\nclGreen    42 3.50 TRUE x 18446744073709551615|   abc| 1.250000000E+00\n7szLarge\nclGreen szLarge\n");
     }
 
     #[test]

@@ -2849,17 +2849,33 @@ impl Parser {
     fn parse_enum_type(&mut self) -> Result<PascalType, ParseError> {
         self.expect(&Tok::LParen)?;
         let mut values = Vec::new();
-        let (first, _) = self.expect_ident()?;
-        values.push(first);
-        while *self.peek() == Tok::Comma {
-            self.advance();
+        let mut ordinals: Vec<i64> = Vec::new();
+        loop {
             let (name, _) = self.expect_ident()?;
             values.push(name);
+            // `B = 5` (or `B := 5`): an explicit ordinal.
+            let ordinal = if matches!(self.peek(), Tok::Eq | Tok::Assign) {
+                self.advance();
+                let negative = *self.peek() == Tok::Minus;
+                if negative {
+                    self.advance();
+                }
+                let n = self.parse_int_literal()?;
+                if negative { -n } else { n }
+            } else {
+                ordinals.last().map_or(0, |o| o + 1)
+            };
+            ordinals.push(ordinal);
+            if *self.peek() != Tok::Comma {
+                break;
+            }
+            self.advance();
         }
         self.expect(&Tok::RParen)?;
         Ok(PascalType::Enum {
             name: String::new(),
             values,
+            ordinals,
         })
     }
 
@@ -3556,6 +3572,27 @@ impl Parser {
         let (name, _) = self.expect_ident()?;
 
         // `str(x:width:precision, s)`: the value takes write-style formats.
+        // `WriteStr(S, args)`: a `Write` into S, whose target rides on a
+        // marker call as the first argument.
+        if name.eq_ignore_ascii_case("writestr") && *self.peek() == Tok::LParen {
+            self.advance();
+            let target = self.parse_expr()?;
+            let mut args = vec![WriteArg {
+                expr: Expr::Call {
+                    name: WRITESTR_TARGET.into(),
+                    args: vec![target],
+                    span,
+                },
+                width: None,
+                precision: None,
+            }];
+            while *self.peek() == Tok::Comma {
+                self.advance();
+                args.push(self.parse_write_arg()?);
+            }
+            self.expect(&Tok::RParen)?;
+            return Ok(Statement::Write { args, span });
+        }
         if name.eq_ignore_ascii_case("str") && *self.peek() == Tok::LParen {
             self.advance();
             let value = self.parse_write_arg()?;

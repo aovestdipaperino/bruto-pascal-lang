@@ -122,6 +122,8 @@ pub struct CodeGen<'ctx> {
 
     // Enum value → ordinal mapping
     enum_values: HashMap<String, i64>,
+    /// Each enumeration value's type.
+    enum_value_types: HashMap<String, PascalType>,
     // Enum type name → value names
     enum_type_values: HashMap<String, Vec<String>>,
 
@@ -291,6 +293,7 @@ impl<'ctx> CodeGen<'ctx> {
             saved_scopes: Vec::new(),
             type_defs: HashMap::new(),
             enum_values: HashMap::new(),
+            enum_value_types: HashMap::new(),
             enum_type_values: HashMap::new(),
             proc_return_types: HashMap::new(),
             proc_param_modes: HashMap::new(),
@@ -1289,10 +1292,17 @@ impl<'ctx> CodeGen<'ctx> {
     /// Make the values of the enumerations written in `ty` constants.
     fn register_enum_values(&mut self, ty: &PascalType) {
         let mut found = Vec::new();
-        ty.for_each_enum(&mut |values| found.push(values.to_vec()));
-        for values in found {
+        ty.for_each_enum(&mut |values, ordinals| found.push((values.to_vec(), ordinals.to_vec())));
+        for (values, ordinals) in found {
+            let enum_ty = PascalType::Enum {
+                name: String::new(),
+                values: values.clone(),
+                ordinals: ordinals.clone(),
+            };
             for (i, val) in values.into_iter().enumerate() {
-                self.enum_values.insert(val, i as i64);
+                self.enum_values
+                    .insert(val.clone(), ordinals.get(i).copied().unwrap_or(i as i64));
+                self.enum_value_types.insert(val, enum_ty.clone());
             }
         }
     }
@@ -4834,6 +4844,137 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(Some(text))
     }
 
+    /// The name of the enumeration value `val` (a C string), as written in
+    /// its type's declaration.
+    fn enum_name_text(
+        &mut self,
+        val: BasicValueEnum<'ctx>,
+        values: &[String],
+        ordinals: &[i64],
+        span: Span,
+    ) -> Result<PointerValue<'ctx>, CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let ord = self.to_i64(val, span)?;
+        let i64_ty = self.context.i64_type();
+        let mut text = self
+            .builder
+            .build_global_string_ptr("", "enum_none")
+            .map_err(err)?
+            .as_pointer_value();
+        for (i, value) in values.iter().enumerate() {
+            let ordinal = ordinals.get(i).copied().unwrap_or(i as i64);
+            let name = self
+                .builder
+                .build_global_string_ptr(&self.display(value), "enum_name")
+                .map_err(err)?
+                .as_pointer_value();
+            let is = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    ord,
+                    i64_ty.const_int(ordinal as u64, true),
+                    "is_value",
+                )
+                .map_err(err)?;
+            text = self
+                .builder
+                .build_select(is, name, text, "enum_text")
+                .map_err(err)?
+                .into_pointer_value();
+        }
+        Ok(text)
+    }
+
+    /// A `Write` argument's text (an AnsiString), its width applied.
+    fn write_arg_text(
+        &mut self,
+        arg: &WriteArg,
+        span: Span,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let val = self.compile_expr(&arg.expr)?;
+        // A real formats its width itself.
+        if let Some(text) = self.real_text(arg, val, span)? {
+            return Ok(text);
+        }
+        let declared = self.resolve_type(&self.infer_declared_type(&arg.expr));
+        let text: BasicValueEnum = if self.is_ustr(val) || Self::is_wide_char(val) {
+            self.ustr_to_ansi(val, span)?
+        } else if let PascalType::Enum {
+            values, ordinals, ..
+        } = &declared
+        {
+            let (values, ordinals) = (values.clone(), ordinals.clone());
+            self.enum_name_text(val, &values, &ordinals, span)?.into()
+        } else if declared == PascalType::Boolean
+            || self.resolve_type(&self.infer_expr_type(&arg.expr)) == PascalType::Boolean
+        {
+            let iv = val.into_int_value();
+            let truth = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    iv,
+                    iv.get_type().const_zero(),
+                    "truth",
+                )
+                .map_err(err)?;
+            let yes = self
+                .builder
+                .build_global_string_ptr("TRUE", "str_true")
+                .map_err(err)?;
+            let no = self
+                .builder
+                .build_global_string_ptr("FALSE", "str_false")
+                .map_err(err)?;
+            self.builder
+                .build_select(
+                    truth,
+                    yes.as_pointer_value(),
+                    no.as_pointer_value(),
+                    "bool_text",
+                )
+                .map_err(err)?
+        } else if val.is_int_value() && val.into_int_value().get_type().get_bit_width() == 8 {
+            self.as_string_value(val, span)?
+        } else if val.is_int_value() && self.is_qword(&arg.expr) {
+            let wide = self.to_i64(val, span)?;
+            self.call_ustr_runtime("bruto_qword_str", &[wide.into()], span)?
+                .unwrap()
+        } else if val.is_int_value() {
+            let wide = self.to_i64(val, span)?;
+            let f = self.module.get_function("bruto_int_to_str").unwrap();
+            let c = self
+                .builder
+                .build_call(f, &[wide.into()], "int_text")
+                .map_err(err)?
+                .try_as_basic_value()
+                .basic()
+                .unwrap();
+            self.call_ustr_runtime("bruto_astr_adopt", &[c.into()], span)?
+                .unwrap()
+        } else {
+            val
+        };
+        // Enumeration names are left-justified, the rest right-justified.
+        let pad = if matches!(declared, PascalType::Enum { .. }) {
+            "bruto_astr_pad_right"
+        } else {
+            "bruto_astr_pad"
+        };
+        match &arg.width {
+            Some(width) => {
+                let width = self.compile_expr(width)?;
+                let width = self.to_i64(width, span)?;
+                Ok(self
+                    .call_ustr_runtime(pad, &[text.into(), width.into()], span)?
+                    .unwrap())
+            }
+            None => Ok(text),
+        }
+    }
+
     /// Whether `expr` is a real literal (perhaps negated) that a Single
     /// holds exactly.
     fn single_literal(expr: &Expr) -> bool {
@@ -5473,6 +5614,27 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
 
+        // `WriteStr(S, args)`: the arguments' text, concatenated into S.
+        if let Some(WriteArg {
+            expr: Expr::Call {
+                name, args: target, ..
+            },
+            ..
+        }) = args.first()
+            && name == WRITESTR_TARGET
+        {
+            let target = target[0].clone();
+            let (slot, target_ty) = self.resolve_array_base(&target, span)?;
+            let mut text = self.empty_string_constant();
+            for arg in &args[1..] {
+                let part = self.write_arg_text(arg, span)?;
+                text = self
+                    .call_ustr_runtime("bruto_astr_concat", &[text.into(), part.into()], span)?
+                    .unwrap();
+            }
+            return self.store_value(slot, text, &target_ty, span);
+        }
+
         // If first arg is a file variable, switch to file-write mode
         let mut start_idx = 0;
         let mut file_target: Option<PointerValue<'ctx>> = None;
@@ -5512,6 +5674,39 @@ impl<'ctx> CodeGen<'ctx> {
                 continue;
             }
             let mut arg_type = self.resolve_type(&self.infer_expr_type(&arg.expr));
+            // An enumeration value: its name, left-justified in its width,
+            // as FPC writes it.
+            if let PascalType::Enum {
+                values, ordinals, ..
+            } = self.resolve_type(&self.infer_declared_type(&arg.expr))
+                && val.is_int_value()
+            {
+                let mut text: BasicValueEnum =
+                    self.enum_name_text(val, &values, &ordinals, span)?.into();
+                if let Some(width) = &arg.width {
+                    let width = self.compile_expr(width)?;
+                    let width = self.to_i64(width, span)?;
+                    text = self
+                        .call_ustr_runtime(
+                            "bruto_astr_pad_right",
+                            &[text.into(), width.into()],
+                            span,
+                        )?
+                        .unwrap();
+                }
+                match file_target {
+                    Some(fp) => {
+                        let f = self.module.get_function("bruto_file_write_str").unwrap();
+                        self.builder
+                            .build_call(f, &[fp.into(), text.into()], "")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    }
+                    None => {
+                        self.call_ustr_runtime("bruto_astr_write", &[text.into()], span)?;
+                    }
+                }
+                continue;
+            }
             // A QWord, unsigned.
             let val = if val.is_int_value() && self.is_qword(&arg.expr) && !self.in_runtime {
                 arg_type = PascalType::String;
@@ -7159,8 +7354,13 @@ impl<'ctx> CodeGen<'ctx> {
                                         .const_int(*lo as u64, true)
                                         .into());
                                 }
-                                PascalType::Enum { .. } => {
-                                    return Ok(self.context.i64_type().const_int(0, false).into());
+                                PascalType::Enum { ordinals, .. } => {
+                                    let lo = ordinals.iter().copied().min().unwrap_or(0);
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(lo as u64, true)
+                                        .into());
                                 }
                                 PascalType::Char => {
                                     return Ok(self.context.i64_type().const_int(0, false).into());
@@ -7212,11 +7412,12 @@ impl<'ctx> CodeGen<'ctx> {
                                         .const_int(*hi as u64, true)
                                         .into());
                                 }
-                                PascalType::Enum { values, .. } => {
+                                PascalType::Enum { ordinals, .. } => {
+                                    let hi = ordinals.iter().copied().max().unwrap_or(0);
                                     return Ok(self
                                         .context
                                         .i64_type()
-                                        .const_int((values.len() - 1) as u64, false)
+                                        .const_int(hi as u64, true)
                                         .into());
                                 }
                                 PascalType::Char => {
@@ -7870,7 +8071,11 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn create_debug_type(&self, ty: &PascalType) -> Option<DIType<'ctx>> {
         match ty {
-            PascalType::Enum { name, values } => {
+            PascalType::Enum {
+                name,
+                values,
+                ordinals,
+            } => {
                 // Emit DW_TAG_enumeration_type so lldb prints names rather
                 // than ordinals. Falls back to plain `long` if the inner
                 // basic type can't be created.
@@ -7882,8 +8087,9 @@ impl<'ctx> CodeGen<'ctx> {
                     .iter()
                     .enumerate()
                     .map(|(i, v)| {
+                        let ordinal = ordinals.get(i).copied().unwrap_or(i as i64);
                         self.di_builder
-                            .create_enumerator(&self.display(v), i as i64, false)
+                            .create_enumerator(&self.display(v), ordinal, false)
                     })
                     .collect();
                 let display_name = if name.is_empty() {
@@ -9713,6 +9919,7 @@ impl<'ctx> CodeGen<'ctx> {
                 })
                 .or_else(|| self.proc_return_types.get(name.as_str()).cloned().flatten())
                 .or_else(|| self.system_func_type(name, 0))
+                .or_else(|| self.enum_value_types.get(name.as_str()).cloned())
                 .or_else(|| (name == "random").then_some(PascalType::Real))
                 .unwrap_or(PascalType::Integer),
             Expr::Nil(_) => PascalType::Pointer(Box::new(PascalType::Integer)),
@@ -9886,10 +10093,23 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     "succ" | "pred" => {
                         if !args.is_empty() {
-                            self.infer_expr_type(&args[0])
+                            self.infer_declared_type(&args[0])
                         } else {
                             PascalType::Integer
                         }
+                    }
+                    // `High(TColor)`, `Low(C)`: a value of the enumeration.
+                    "low" | "high"
+                        if matches!(args.as_slice(), [Expr::Var(n, _)]
+                        if matches!(
+                            self.type_of_name(n).map(|t| self.resolve_type(&t)),
+                            Some(PascalType::Enum { .. })
+                        )) =>
+                    {
+                        let Expr::Var(n, _) = &args[0] else {
+                            unreachable!()
+                        };
+                        self.type_of_name(n).unwrap()
                     }
                     "low" | "high" | "sizeof" => PascalType::Integer,
                     "sqrt" | "sin" | "cos" | "arctan" | "exp" | "ln" | "frac" => PascalType::Real,

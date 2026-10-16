@@ -137,6 +137,10 @@ function bruto_float_error(A, B, R: Double; Op: LongInt): LongInt;
 function bruto_real_str(X: Double; Width, FracDigits: LongInt; IsSingle: Boolean): Pointer;
 { The QWord Q (held in an Int64) in decimal. }
 function bruto_qword_str(Q: Int64): Pointer;
+{ S right-aligned in Width characters (S itself if it is as long). }
+function bruto_astr_pad(S: Pointer; Width: Int64): Pointer;
+{ S left-aligned in Width characters. }
+function bruto_astr_pad_right(S: Pointer; Width: Int64): Pointer;
 { Write S to the console (and the IDE's capture), #0 characters included. }
 procedure bruto_astr_write(S: Pointer);
 
@@ -621,6 +625,44 @@ begin
   R := bruto_astr_alloc(N);
   Move(Buf, R^, N);
   bruto_qword_str := R;
+end;
+
+function bruto_astr_pad(S: Pointer; Width: Int64): Pointer;
+var
+  Len, I: Int64;
+  R: PBrutoBytes;
+begin
+  Len := bruto_astr_len(S);
+  if Len >= Width then
+  begin
+    bruto_astr_pad := S;
+    Exit;
+  end;
+  R := PBrutoBytes(bruto_astr_alloc(Width));
+  for I := 0 to Width - Len - 1 do
+    R^[I] := 32;
+  if Len > 0 then
+    Move(S^, R^[Width - Len], Len);
+  bruto_astr_pad := R;
+end;
+
+function bruto_astr_pad_right(S: Pointer; Width: Int64): Pointer;
+var
+  Len, I: Int64;
+  R: PBrutoBytes;
+begin
+  Len := bruto_astr_len(S);
+  if Len >= Width then
+  begin
+    bruto_astr_pad_right := S;
+    Exit;
+  end;
+  R := PBrutoBytes(bruto_astr_alloc(Width));
+  if Len > 0 then
+    Move(S^, R^[0], Len);
+  for I := Len to Width - 1 do
+    R^[I] := 32;
+  bruto_astr_pad_right := R;
 end;
 
 { ── Reals as text, as FPC's str_real (flt_core.inc) makes them ── }
