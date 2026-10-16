@@ -199,6 +199,9 @@ pub struct CodeGen<'ctx> {
     intf_temps_used: usize,
     // Classes whose instance cleanup routines still need bodies.
     class_cleanups: Vec<String>,
+    /// Delegating interface getters (class, interface) whose bodies are
+    /// still to be written.
+    intf_getters: Vec<(String, String)>,
     // Other names of object types and classes: alias -> the type.
     class_aliases: HashMap<String, String>,
     // Each routine's parameter defaults, one per parameter (by symbol).
@@ -313,6 +316,7 @@ impl<'ctx> CodeGen<'ctx> {
             intf_pool: Vec::new(),
             intf_temps_used: 0,
             class_cleanups: Vec::new(),
+            intf_getters: Vec::new(),
             class_aliases: HashMap::new(),
             runtime_error_stubs: std::cell::RefCell::new(Vec::new()),
             proc_param_defaults: HashMap::new(),
@@ -781,6 +785,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.in_runtime = false;
         self.emit_class_cleanups()?;
+        self.emit_interface_getters()?;
         self.emit_runtime_error_stubs()?;
         self.di_builder.finalize();
 
@@ -6158,7 +6163,9 @@ impl<'ctx> CodeGen<'ctx> {
         };
         if returned
             && value.is_struct_value()
-            && self.interface_of(&self.infer_declared_type(expr)).is_some()
+            && self
+                .interface_of(&self.infer_declared_type(expr))
+                .is_some_and(|i| self.interface_counted(&i))
         {
             self.hold_interface_temp(value, true, expr.span())?;
         }

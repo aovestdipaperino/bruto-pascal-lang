@@ -46,10 +46,11 @@ pub struct Resolved {
 pub fn resolve_program(program: &Program) -> Result<Resolved, SemaError> {
     let mut program = program.clone();
     add_system_constants(&mut program);
-    let display_names = fold_identifier_case(&mut program);
+    let mut display_names = fold_identifier_case(&mut program);
     strip_unit_qualifiers(&mut program);
-    crate::generics::instantiate_generics(&mut program)
+    let specializations = crate::generics::instantiate_generics(&mut program, &display_names)
         .map_err(|(message, span)| SemaError { message, span })?;
+    display_names.extend(specializations);
     name_overloads(&mut program);
     name_method_overloads(&mut program);
     name_nested_routines(&mut program);

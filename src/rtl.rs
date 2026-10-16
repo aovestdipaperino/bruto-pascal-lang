@@ -165,11 +165,17 @@ fn add_prelude(program: &mut Program, file: &str, source: &str) -> Result<(), St
         )
         .collect();
     let fresh = |name: &str| !declared.contains(&name.to_ascii_lowercase());
-    let types = unit
+    let types: Vec<_> = unit
         .interface_types
         .into_iter()
         .chain(unit.impl_types)
-        .filter(|t| fresh(&t.name));
+        .filter(|t| fresh(&t.name))
+        .collect();
+    for t in &types {
+        program
+            .type_units
+            .insert(t.name.to_ascii_lowercase(), "System".into());
+    }
     program.type_decls.splice(0..0, types);
     let consts = unit
         .interface_consts

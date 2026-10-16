@@ -65,6 +65,15 @@ pub(super) struct ObjectInfo {
     pub interfaces: Vec<(String, String)>,
     /// An interface's GUID.
     pub guid: Option<String>,
+    /// A CORBA interface: its references aren't counted.
+    pub is_corba: bool,
+    /// A class's method resolution clauses, own and inherited:
+    /// (interface, its method) -> the class's method.
+    pub resolutions: HashMap<(String, String), String>,
+    /// The interfaces a class implements through a property
+    /// (`implements`), own and inherited: interface -> (the property,
+    /// the class declaring it).
+    pub delegates: HashMap<String, (PropertyDecl, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +143,7 @@ impl<'ctx> CodeGen<'ctx> {
             .into_iter()
             .find(|r| self.objects.get(*r).is_some_and(|o| o.is_class));
         // `class(IFoo, ...)`: no parent but TObject, implementing IFoo.
+        let decl_resolutions = decl.resolutions.clone();
         let mut listed = decl.interfaces.clone();
         let mut decl_parent = decl.parent.clone();
         if decl.is_class
@@ -291,6 +301,29 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
 
+        let mut resolutions = parent
+            .as_ref()
+            .map(|p| p.resolutions.clone())
+            .unwrap_or_default();
+        for (intf, method, target) in &decl_resolutions {
+            let intf = self
+                .interface_of(&PascalType::Named(intf.clone()))
+                .unwrap_or_else(|| intf.clone());
+            resolutions.insert((intf, method.clone()), target.clone());
+        }
+        let mut delegates = parent
+            .as_ref()
+            .map(|p| p.delegates.clone())
+            .unwrap_or_default();
+        for prop in &decl.properties {
+            for intf in &prop.implements {
+                let intf = self
+                    .interface_of(&PascalType::Named(intf.clone()))
+                    .unwrap_or_else(|| intf.clone());
+                delegates.insert(intf, (prop.clone(), name.to_string()));
+            }
+        }
+
         let record = PascalType::Record {
             fields,
             variant: None,
@@ -317,6 +350,9 @@ impl<'ctx> CodeGen<'ctx> {
             is_interface: false,
             interfaces,
             guid: None,
+            is_corba: false,
+            resolutions,
+            delegates,
         };
 
         // Declare this type's own methods so calls and VMTs can refer to

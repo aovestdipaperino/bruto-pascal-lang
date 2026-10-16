@@ -26,7 +26,9 @@ use super::{CodeGen, CodeGenError};
 use crate::ast::*;
 use inkwell::AddressSpace;
 use inkwell::module::Linkage;
-use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, PointerValue, StructValue};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue, StructValue,
+};
 use std::collections::HashMap;
 
 /// The interface every other descends from.
@@ -48,7 +50,10 @@ impl<'ctx> CodeGen<'ctx> {
                     .cloned()
                     .unwrap_or_else(|| p.clone()),
             ),
-            None if name != ROOT && self.objects.get(ROOT).is_some_and(|o| o.is_interface) => {
+            None if !decl.is_corba
+                && name != ROOT
+                && self.objects.get(ROOT).is_some_and(|o| o.is_interface) =>
+            {
                 Some(ROOT.to_string())
             }
             None => None,
@@ -138,6 +143,9 @@ impl<'ctx> CodeGen<'ctx> {
                 is_interface: true,
                 interfaces: Vec::new(),
                 guid: decl.guid.clone(),
+                is_corba: decl.is_corba,
+                resolutions: HashMap::new(),
+                delegates: HashMap::new(),
             },
         );
         Ok(())
@@ -332,7 +340,13 @@ impl<'ctx> CodeGen<'ctx> {
         let class_info = &self.objects[class];
         let declarer_info = &self.objects[declarer];
         let mut entries = Vec::new();
+        let chain = self.interface_chain(intf);
         for key in self.objects[intf].slots.iter().flatten() {
+            // `function IFoo.Bar = MyBar;` names the method that implements it.
+            let resolved = chain
+                .iter()
+                .find_map(|i| declarer_info.resolutions.get(&(i.clone(), key.clone())));
+            let key = resolved.unwrap_or(key);
             let found = declarer_info.methods.get(key).ok_or_else(|| {
                 CodeGenError::new(
                     format!(
@@ -367,16 +381,31 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// The table of interfaces class `class` implements, for its VMT:
     /// `{ Count: i64, [Descriptor, ITable] x Count }`, or nil if none.
-    pub(super) fn interface_table(&self, class: &str) -> Result<PointerValue<'ctx>, CodeGenError> {
+    pub(super) fn interface_table(
+        &mut self,
+        class: &str,
+    ) -> Result<PointerValue<'ctx>, CodeGenError> {
         let ptr = self.context.ptr_type(AddressSpace::default());
         let interfaces = self.objects[class].interfaces.clone();
         if interfaces.is_empty() {
             return Ok(ptr.const_null());
         }
+        // (descriptor, itable, getter): a delegated interface has a getter
+        // giving the reference instead of an itable.
         let mut words = Vec::new();
         for (intf, declarer) in &interfaces {
             words.push(self.interface_descriptor(intf));
-            words.push(self.itable(class, declarer, intf, Span::default())?);
+            if self.objects[class].delegates.contains_key(intf) {
+                words.push(ptr.const_null());
+                words.push(
+                    self.delegate_getter(class, intf)
+                        .as_global_value()
+                        .as_pointer_value(),
+                );
+            } else {
+                words.push(self.itable(class, declarer, intf, Span::default())?);
+                words.push(ptr.const_null());
+            }
         }
         let count = self
             .context
@@ -392,6 +421,151 @@ impl<'ctx> CodeGen<'ctx> {
         g.set_constant(true);
         g.set_initializer(&init);
         Ok(g.as_pointer_value())
+    }
+
+    /// The routine giving class `class`'s reference to `intf`, which a
+    /// property implements: `(Self, Out)` stores the (uncounted)
+    /// reference at `Out`.
+    fn delegate_getter(&mut self, class: &str, intf: &str) -> FunctionValue<'ctx> {
+        let name = format!("intfget.{class}.{intf}");
+        if let Some(f) = self.module.get_function(&name) {
+            return f;
+        }
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let f = self.module.add_function(
+            &name,
+            self.context
+                .void_type()
+                .fn_type(&[ptr.into(), ptr.into()], false),
+            None,
+        );
+        f.set_linkage(Linkage::Internal);
+        self.intf_getters
+            .push((class.to_string(), intf.to_string()));
+        f
+    }
+
+    /// Write the delegating getters' bodies: read the property, and make
+    /// its value a reference to the interface.
+    pub(super) fn emit_interface_getters(&mut self) -> Result<(), CodeGenError> {
+        let saved_block = self.builder.get_insert_block();
+        let saved_fn = self.current_fn;
+        let saved_ctx = self.method_context;
+        let mut done = 0;
+        while done < self.intf_getters.len() {
+            let (class, intf) = self.intf_getters[done].clone();
+            done += 1;
+            let span = Span::default();
+            let err =
+                |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+            let f = self
+                .module
+                .get_function(&format!("intfget.{class}.{intf}"))
+                .unwrap();
+            let entry = self.context.append_basic_block(f, "entry");
+            self.builder.position_at_end(entry);
+            self.builder.unset_current_debug_location();
+            self.current_fn = Some(f);
+            let self_ptr = f.get_nth_param(0).unwrap().into_pointer_value();
+            let out = f.get_nth_param(1).unwrap().into_pointer_value();
+            self.method_context = Some(super::objects::MethodContext {
+                self_ptr,
+                in_constructor: false,
+                in_class_method: false,
+            });
+            let (prop, _) = self.objects[&class].delegates[&intf].clone();
+            let accessor = prop.read.clone().ok_or_else(|| {
+                CodeGenError::new(
+                    format!("'{}' can't be read", self.display(&prop.name)),
+                    Some(prop.span),
+                )
+            })?;
+            let info = self.objects[&class].clone();
+            let value = if info.methods.contains_key(&accessor) {
+                self.call_method(
+                    super::objects::Receiver {
+                        object: &class,
+                        self_ptr,
+                        dispatch: super::objects::Dispatch::Virtual,
+                        vmt: None,
+                        class: None,
+                    },
+                    &accessor,
+                    &[],
+                    prop.span,
+                )?
+                .unwrap()
+            } else {
+                // A field, or a path of fields.
+                let mut at = self_ptr;
+                let mut ty = info.record.clone();
+                for part in accessor.split('.') {
+                    let (addr, field_ty) = self.field_address(at, &ty, part, prop.span)?;
+                    at = addr;
+                    ty = self.resolve_type(&field_ty);
+                }
+                let llvm_ty = self.llvm_type_for(&ty);
+                self.builder
+                    .build_load(llvm_ty, at, "delegate")
+                    .map_err(err)?
+            };
+            let reference = match self.resolve_type(&prop.ty) {
+                PascalType::Interface(_) => value,
+                _ => match self.class_instance_of(&prop.ty) {
+                    Some(inner) => {
+                        let obj = value.into_pointer_value();
+                        if self.objects[&inner].delegates.contains_key(&intf) {
+                            let getter = self.delegate_getter(&inner, &intf);
+                            self.builder
+                                .build_call(getter, &[obj.into(), out.into()], "")
+                                .map_err(err)?;
+                            self.builder.build_return(None).map_err(err)?;
+                            continue;
+                        }
+                        let declarer = self.objects[&inner]
+                            .interfaces
+                            .iter()
+                            .find(|(i, _)| *i == intf)
+                            .map(|(_, d)| d.clone())
+                            .ok_or_else(|| {
+                                CodeGenError::new(
+                                    format!(
+                                        "'{}' doesn't implement '{}'",
+                                        self.display(&inner),
+                                        self.display(&intf)
+                                    ),
+                                    Some(prop.span),
+                                )
+                            })?;
+                        let itable = self.itable(&inner, &declarer, &intf, prop.span)?;
+                        self.interface_value(obj, itable, prop.span)?.into()
+                    }
+                    None => {
+                        return Err(CodeGenError::new(
+                            format!(
+                                "'{}' must be an interface or a class to implement '{}'",
+                                self.display(&prop.name),
+                                self.display(&intf)
+                            ),
+                            Some(prop.span),
+                        ));
+                    }
+                },
+            };
+            self.builder.build_store(out, reference).map_err(err)?;
+            self.builder.build_return(None).map_err(err)?;
+        }
+        self.current_fn = saved_fn;
+        self.method_context = saved_ctx;
+        if let Some(block) = saved_block {
+            self.builder.position_at_end(block);
+        }
+        Ok(())
+    }
+
+    /// Whether references to interface `name` are counted (not CORBA).
+    pub(super) fn interface_counted(&self, name: &str) -> bool {
+        !self.objects.get(name).is_some_and(|o| o.is_corba)
     }
 
     /// The interface reference `{ obj, itable }`.
@@ -459,6 +633,36 @@ impl<'ctx> CodeGen<'ctx> {
                 ));
             }
             return self.compile_expr(expr);
+        }
+        if let Some(class) = self.class_instance_of(&declared)
+            && self.objects[&class].delegates.contains_key(intf)
+        {
+            // A property implements it: the reference it gives.
+            let err =
+                |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+            let obj = self.compile_expr(expr)?.into_pointer_value();
+            let ty = self.method_pointer_type();
+            let out = self.entry_alloca(ty, "delegated").map_err(err)?;
+            self.builder
+                .build_store(out, ty.const_zero())
+                .map_err(err)?;
+            let getter = self.delegate_getter(&class, intf);
+            let func = self.current_fn.unwrap();
+            let call_bb = self.context.append_basic_block(func, "delegate");
+            let done_bb = self.context.append_basic_block(func, "delegated");
+            let nil = self.builder.build_is_null(obj, "nil").map_err(err)?;
+            self.builder
+                .build_conditional_branch(nil, done_bb, call_bb)
+                .map_err(err)?;
+            self.builder.position_at_end(call_bb);
+            self.builder
+                .build_call(getter, &[obj.into(), out.into()], "")
+                .map_err(err)?;
+            self.builder
+                .build_unconditional_branch(done_bb)
+                .map_err(err)?;
+            self.builder.position_at_end(done_bb);
+            return Ok(self.builder.build_load(ty, out, "reference").map_err(err)?);
         }
         if let Some(class) = self.class_instance_of(&declared) {
             // As in FPC, only an interface the class (or an ancestor) lists.
@@ -556,19 +760,34 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    /// The itable for interface `intf` of the instance `obj` (nil if `obj`
-    /// is nil or its class doesn't implement `intf`).
-    fn find_itable(
+    /// The instance `obj`'s reference to interface `intf`, looked up at
+    /// run time (through a delegating property too): whether there is one,
+    /// and the (uncounted) reference, nil if not.
+    fn query_interface(
         &self,
         obj: PointerValue<'ctx>,
         intf: &str,
         span: Span,
-    ) -> Result<PointerValue<'ctx>, CodeGenError> {
+    ) -> Result<(inkwell::values::IntValue<'ctx>, BasicValueEnum<'ctx>), CodeGenError> {
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let ty = self.method_pointer_type();
+        let out = self.entry_alloca(ty, "intf_query").map_err(err)?;
+        self.builder
+            .build_store(out, ty.const_zero())
+            .map_err(err)?;
         let desc = self.interface_descriptor(intf);
-        Ok(self
-            .call_ustr_runtime("bruto_intf_find", &[obj.into(), desc.into()], span)?
-            .unwrap()
-            .into_pointer_value())
+        self.call_ustr_runtime(
+            "bruto_intf_query",
+            &[obj.into(), desc.into(), out.into()],
+            span,
+        )?;
+        let value = self.builder.build_load(ty, out, "intf_ref").map_err(err)?;
+        let (found_obj, _) = self.interface_parts(value, span)?;
+        let found = self
+            .builder
+            .build_is_not_null(found_obj, "supported")
+            .map_err(err)?;
+        Ok((found, value))
     }
 
     /// The instance an expression of class or interface type refers to.
@@ -622,11 +841,7 @@ impl<'ctx> CodeGen<'ctx> {
             self.fail_unless(fine, span)?;
             return Ok(obj.into());
         }
-        let itable = self.find_itable(obj, right, span)?;
-        let found = self
-            .builder
-            .build_is_not_null(itable, "supported")
-            .map_err(err)?;
+        let (found, value) = self.query_interface(obj, right, span)?;
         if op == BinOp::Is {
             return Ok(found.into());
         }
@@ -634,9 +849,9 @@ impl<'ctx> CodeGen<'ctx> {
         let fine = self.builder.build_or(found, nil, "as_fine").map_err(err)?;
         self.fail_unless(fine, span)?;
         // A counted reference, held as FPC holds its temps.
-        let value: BasicValueEnum = self.interface_value(obj, itable, span)?.into();
-        if self.arc && !self.in_runtime {
-            self.call_ustr_runtime("bruto_intf_addref", &[obj.into(), itable.into()], span)?;
+        if self.arc && !self.in_runtime && self.interface_counted(right) {
+            let (ref_obj, itable) = self.interface_parts(value, span)?;
+            self.call_ustr_runtime("bruto_intf_addref", &[ref_obj.into(), itable.into()], span)?;
             self.hold_interface_temp(value, false, span)?;
         }
         Ok(value)
@@ -665,20 +880,8 @@ impl<'ctx> CodeGen<'ctx> {
         if static_ok {
             return self.compile_interface_value(expr, intf);
         }
-        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let obj = self.instance_of_expr(expr, "a type cast", span)?;
-        let itable = self.find_itable(obj, intf, span)?;
-        let found = self
-            .builder
-            .build_is_not_null(itable, "supported")
-            .map_err(err)?;
-        let ptr = self.context.ptr_type(AddressSpace::default());
-        let obj = self
-            .builder
-            .build_select(found, obj, ptr.const_null(), "cast_obj")
-            .map_err(err)?
-            .into_pointer_value();
-        Ok(self.interface_value(obj, itable, span)?.into())
+        Ok(self.query_interface(obj, intf, span)?.1)
     }
 
     /// Runtime error 219 (an invalid type cast) unless `ok`.
@@ -710,7 +913,6 @@ impl<'ctx> CodeGen<'ctx> {
         args: &[Expr],
         span: Span,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
-        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         let intf = match args {
             [_, Expr::Var(name, _)] | [_, Expr::Var(name, _), _]
                 if self.is_interface_name(name) =>
@@ -723,21 +925,10 @@ impl<'ctx> CodeGen<'ctx> {
             _ => return Ok(None),
         };
         let obj = self.instance_of_expr(&args[0], "Supports", span)?;
-        let itable = self.find_itable(obj, &intf, span)?;
-        let found = self
-            .builder
-            .build_is_not_null(itable, "supported")
-            .map_err(err)?;
+        let (found, value) = self.query_interface(obj, &intf, span)?;
         if let Some(target) = args.get(2) {
-            let ptr = self.context.ptr_type(AddressSpace::default());
-            let obj = self
-                .builder
-                .build_select(found, obj, ptr.const_null(), "supported_obj")
-                .map_err(err)?
-                .into_pointer_value();
-            let value = self.interface_value(obj, itable, span)?;
             let (slot, ty) = self.resolve_array_base(target, span)?;
-            self.store_value(slot, value.into(), &ty, span)?;
+            self.store_value(slot, value, &ty, span)?;
         }
         Ok(Some(found.into()))
     }

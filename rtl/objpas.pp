@@ -316,6 +316,7 @@ type
   PBrutoGUIDBytes = ^TBrutoGUIDBytes;
   TBrutoGUIDBytes = array[0..15] of Byte;
   TBrutoIntfCount = function(Obj: Pointer): LongInt;
+  TBrutoIntfGetter = procedure(Obj, Out: Pointer);
 
 function TObject.GetInterface(const IID: TGUID; out Obj): Boolean;
 var
@@ -323,6 +324,7 @@ var
   Count, I, J: Int64;
   Same: Boolean;
   AddRef: TBrutoIntfCount;
+  Getter: TBrutoIntfGetter;
 begin
   GetInterface := False;
   Table := PBrutoWords(PBrutoWords(Pointer(Self))^[0])^[5];
@@ -332,18 +334,29 @@ begin
   I := 0;
   while I < Count do
   begin
-    Desc := PBrutoWords(Table)^[1 + I * 2];
+    Desc := PBrutoWords(Table)^[1 + I * 3];
     Same := True;
     for J := 0 to 15 do
       if PBrutoGUIDBytes(Desc)^[J] <> PBrutoGUIDBytes(@IID)^[J] then
         Same := False;
     if Same then
     begin
-      ITable := PBrutoWords(Table)^[2 + I * 2];
-      PBrutoWords(@Obj)^[0] := Pointer(Self);
-      PBrutoWords(@Obj)^[1] := ITable;
+      if PBrutoWords(Table)^[3 + I * 3] <> nil then
+      begin
+        { A property implements it. }
+        Getter := TBrutoIntfGetter(PBrutoWords(Table)^[3 + I * 3]);
+        Getter(Pointer(Self), @Obj);
+      end
+      else
+      begin
+        PBrutoWords(@Obj)^[0] := Pointer(Self);
+        PBrutoWords(@Obj)^[1] := PBrutoWords(Table)^[2 + I * 3];
+      end;
+      if PBrutoWords(@Obj)^[0] = nil then
+        Exit;
+      ITable := PBrutoWords(@Obj)^[1];
       AddRef := TBrutoIntfCount(PBrutoWords(ITable)^[1]);
-      AddRef(Pointer(Self));
+      AddRef(PBrutoWords(@Obj)^[0]);
       GetInterface := True;
       Exit;
     end;

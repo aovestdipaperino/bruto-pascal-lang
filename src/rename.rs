@@ -186,6 +186,11 @@ pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
             for i in &mut obj.interfaces {
                 *i = n.rename(i);
             }
+            for (intf, method, target) in &mut obj.resolutions {
+                *intf = n.rename(intf);
+                *method = n.rename_member(method);
+                *target = n.rename_member(target);
+            }
             for (vname, vty) in &mut obj.class_vars {
                 *vname = n.rename_member(vname);
                 rewrite_type(vty, n);
@@ -202,6 +207,9 @@ pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
                     }
                 }
                 rewrite_type(&mut p.ty, n);
+                for i in &mut p.implements {
+                    *i = n.rename(i);
+                }
                 for accessor in [&mut p.read, &mut p.write].into_iter().flatten() {
                     *accessor = accessor
                         .split('.')

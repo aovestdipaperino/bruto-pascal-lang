@@ -35,10 +35,8 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn holds_counted_string(&self, ty: &PascalType) -> bool {
         match self.resolve_type(ty) {
-            PascalType::String
-            | PascalType::UnicodeString
-            | PascalType::DynArray(_)
-            | PascalType::Interface(_) => true,
+            PascalType::String | PascalType::UnicodeString | PascalType::DynArray(_) => true,
+            PascalType::Interface(name) => self.interface_counted(&name),
             PascalType::Array { elem, .. } => self.holds_counted_string(&elem),
             PascalType::Record { fields, .. } => {
                 fields.iter().any(|(_, t)| self.holds_counted_string(t))

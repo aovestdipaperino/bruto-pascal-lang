@@ -120,8 +120,12 @@ procedure bruto_pool_drain(Mark: Int64);
   _AddRef and _Release. }
 procedure bruto_intf_addref(Obj, ITable: Pointer);
 procedure bruto_intf_release(Obj, ITable: Pointer);
-{ The itable of the interface described by Desc in Obj's class, or nil. }
-function bruto_intf_find(Obj, Desc: Pointer): Pointer;
+{ Obj's reference to the interface described by Desc, stored at Out
+  (two words: instance and itable; uncounted): whether there is one.
+  A class's interface table holds (descriptor, itable, getter) triples; a
+  getter (for a property that implements the interface) gives the
+  reference itself. }
+function bruto_intf_query(Obj, Desc, Out: Pointer): Boolean;
 { The runtime error a floating point operation Op (1 +, 2 -, 3 *, 4 /,
   5 Sqrt, 6 Ln, 7 Exp) on A (and B) giving R (an infinity or NaN) is, as
   FPC reports it: 208 division by zero, 207 invalid operation, 205
@@ -288,12 +292,16 @@ begin
   bruto_float_error := Code;
 end;
 
-function bruto_intf_find(Obj, Desc: Pointer): Pointer;
+type
+  TBrutoIntfGetter = procedure(Obj, Out: Pointer);
+
+function bruto_intf_query(Obj, Desc, Out: Pointer): Boolean;
 var
   Table: Pointer;
   I, Count: Int64;
+  Getter: TBrutoIntfGetter;
 begin
-  bruto_intf_find := nil;
+  bruto_intf_query := False;
   if Obj = nil then
     Exit;
   { The table is the VMT's sixth word. }
@@ -304,9 +312,19 @@ begin
   I := 0;
   while I < Count do
   begin
-    if PBrutoPointers(Table)^[1 + I * 2] = Desc then
+    if PBrutoPointers(Table)^[1 + I * 3] = Desc then
     begin
-      bruto_intf_find := PBrutoPointers(Table)^[2 + I * 2];
+      if PBrutoPointers(Table)^[3 + I * 3] <> nil then
+      begin
+        Getter := TBrutoIntfGetter(PBrutoPointers(Table)^[3 + I * 3]);
+        Getter(Obj, Out);
+      end
+      else
+      begin
+        PBrutoPointers(Out)^[0] := Obj;
+        PBrutoPointers(Out)^[1] := PBrutoPointers(Table)^[2 + I * 3];
+      end;
+      bruto_intf_query := PBrutoPointers(Out)^[0] <> nil;
       Exit;
     end;
     I := I + 1;

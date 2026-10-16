@@ -47,6 +47,14 @@ struct Generics {
     /// TEnum<T>.Create`): the hidden alias's name -> the generic and its
     /// arguments, made again for each instantiation.
     templated: HashMap<String, (String, Vec<PascalType>)>,
+    /// Identifiers as written, for the names FPC gives specializations.
+    display: HashMap<String, String>,
+    /// The unit (or program) declaring each type.
+    type_units: HashMap<String, String>,
+    program_name: String,
+    /// What each specialization is called, as FPC calls it:
+    /// `TBox<System.LongInt>`.
+    names: HashMap<String, String>,
 }
 
 /// A short name for a type argument, for the specialization's name (a
@@ -222,6 +230,12 @@ impl Generics {
             return name.to_string();
         }
         self.done.insert(mangled.clone());
+        let shown: Vec<String> = args.iter().map(|a| self.qualified_name(a)).collect();
+        let generic_name = self.shown(name);
+        self.names.insert(
+            mangled.clone(),
+            format!("{generic_name}<{}>", shown.join(",")),
+        );
         let mut names = HashMap::new();
         names.insert(name.to_string(), mangled.clone());
         let mut aliases = Vec::new();
@@ -269,6 +283,91 @@ impl Generics {
         self.out.extend(aliases);
         self.out.push(inst);
         mangled
+    }
+}
+
+impl Generics {
+    /// `name` as written.
+    fn shown(&self, name: &str) -> String {
+        self.display
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// A type argument as FPC names it in a specialization's name: its
+    /// unit, a dot and its name (`System.LongInt`, `Prog.TRec`).
+    fn qualified_name(&self, ty: &PascalType) -> String {
+        let system = |n: &str| format!("System.{n}");
+        match ty {
+            PascalType::Named(n) => {
+                if let Some(arg) = self.aliases.get(n) {
+                    return self.qualified_name(arg);
+                }
+                // A specialization: in the unit of its generic.
+                if let Some(made) = self.names.get(n) {
+                    let generic = n.split('<').next().unwrap_or(n);
+                    return format!("{}.{made}", self.unit_of(generic));
+                }
+                let builtin = match n.as_str() {
+                    "integer" => Some("Int64"),
+                    "longint" | "int32" => Some("LongInt"),
+                    "shortint" | "int8" => Some("ShortInt"),
+                    "smallint" | "int16" => Some("SmallInt"),
+                    "byte" | "uint8" => Some("Byte"),
+                    "word" | "uint16" => Some("Word"),
+                    "longword" | "cardinal" | "dword" | "uint32" => Some("LongWord"),
+                    "int64" => Some("Int64"),
+                    "qword" | "uint64" => Some("QWord"),
+                    "real" | "double" | "extended" => Some("Double"),
+                    "single" => Some("Single"),
+                    "currency" => Some("Currency"),
+                    "string" | "ansistring" => Some("AnsiString"),
+                    "shortstring" => Some("ShortString"),
+                    "unicodestring" | "widestring" => Some("UnicodeString"),
+                    "char" | "ansichar" => Some("Char"),
+                    "widechar" | "unicodechar" => Some("WideChar"),
+                    "boolean" => Some("Boolean"),
+                    "pointer" => Some("Pointer"),
+                    "pchar" => Some("PChar"),
+                    "sizeint" | "ptrint" | "nativeint" => Some("Int64"),
+                    "sizeuint" | "ptruint" | "nativeuint" => Some("QWord"),
+                    _ => None,
+                };
+                match builtin {
+                    Some(b) if !self.type_units.contains_key(n) => system(b),
+                    _ => format!("{}.{}", self.unit_of(n), self.shown(n)),
+                }
+            }
+            PascalType::Integer => system("Int64"),
+            PascalType::Real => system("Double"),
+            PascalType::Single => system("Single"),
+            PascalType::String => system("AnsiString"),
+            PascalType::UnicodeString => system("UnicodeString"),
+            PascalType::Boolean => system("Boolean"),
+            PascalType::Char => system("Char"),
+            PascalType::WideChar => system("WideChar"),
+            PascalType::ShortString { .. } => system("ShortString"),
+            PascalType::SizedInt { bits, signed } => system(match (bits, signed) {
+                (8, true) => "ShortInt",
+                (8, false) => "Byte",
+                (16, true) => "SmallInt",
+                (16, false) => "Word",
+                (32, true) => "LongInt",
+                (32, false) => "LongWord",
+                (_, true) => "Int64",
+                (_, false) => "QWord",
+            }),
+            other => type_key(other, &self.aliases),
+        }
+    }
+
+    /// The unit or program declaring type `name`.
+    fn unit_of(&self, name: &str) -> String {
+        match self.type_units.get(name) {
+            Some(unit) => unit.clone(),
+            None => self.program_name.clone(),
+        }
     }
 }
 
@@ -351,13 +450,16 @@ fn has_specialization(ty: &PascalType) -> bool {
 
 /// Make the specializations `program` uses and drop the generics
 /// themselves. Errors name an unknown generic or a wrong argument count.
-pub(crate) fn instantiate_generics(program: &mut Program) -> Result<(), (String, Span)> {
+pub(crate) fn instantiate_generics(
+    program: &mut Program,
+    display: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, (String, Span)> {
     if !program.type_decls.iter().any(|t| !t.type_params.is_empty())
         && !format!("{:?}", program.type_decls).contains("Specialize")
         && !format!("{:?}", program.procedures).contains("Specialize")
         && !program.vars.iter().any(|v| has_specialization(&v.ty))
     {
-        return Ok(());
+        return Ok(HashMap::new());
     }
     let (generic, rest): (Vec<TypeDecl>, Vec<TypeDecl>) = std::mem::take(&mut program.type_decls)
         .into_iter()
@@ -394,6 +496,13 @@ pub(crate) fn instantiate_generics(program: &mut Program) -> Result<(), (String,
         errors: Vec::new(),
         aliases: HashMap::new(),
         templated: HashMap::new(),
+        display: display.clone(),
+        type_units: program.type_units.clone(),
+        program_name: display
+            .get(&program.name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| program.name.clone()),
+        names: HashMap::new(),
     };
     // Hidden aliases of specializations naming a generic's parameters
     // belong to that generic's code.
@@ -468,5 +577,5 @@ pub(crate) fn instantiate_generics(program: &mut Program) -> Result<(), (String,
         crate::rename::rewrite_block(&mut program.body, &rename);
     }
     program.procedures = procs;
-    Ok(())
+    Ok(g.names)
 }

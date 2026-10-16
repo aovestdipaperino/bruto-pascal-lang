@@ -304,6 +304,8 @@ struct Lexer {
     /// Whether `Integer` means a 32-bit LongInt here: `{$mode objfpc}`
     /// and `{$mode delphi}`, as in FPC.
     int32: bool,
+    /// `{$interfaces corba}`: interfaces declared here aren't counted.
+    corba: bool,
     /// `{$DEFINE NAME := text}` macros: upper-case name -> replacement.
     macros: std::collections::HashMap<String, String>,
     conditions: Vec<Condition>,
@@ -392,6 +394,7 @@ impl Lexer {
             macros: std::collections::HashMap::new(),
             short_strings: false,
             int32: false,
+            corba: false,
             conditions: Vec::new(),
             include_dirs: options.include_dirs.clone(),
             error: None,
@@ -535,6 +538,7 @@ impl Lexer {
                 _ => {}
             },
             "longstrings" => self.short_strings = first_word(rest) == "OFF",
+            "interfaces" => self.corba = first_word(rest) == "CORBA",
             "codepage" => self.cp437 = matches!(first_word(rest).as_str(), "CP437" | "437"),
             "include" => self.include(rest, span),
             "i" if !rest.starts_with(['+', '-']) => self.include(rest, span),
@@ -1249,6 +1253,8 @@ pub struct Parser {
     short_strings: Vec<bool>,
     /// For each token, whether `Integer` meant a 32-bit LongInt there.
     int32: Vec<bool>,
+    /// For each token, whether interfaces were CORBA ones there.
+    corba: Vec<bool>,
     /// Aliases for the specializations written in expressions.
     hidden_types: Vec<TypeDecl>,
     pos: usize,
@@ -1283,6 +1289,7 @@ impl Parser {
         let mut tokens = Vec::new();
         let mut short_strings = Vec::new();
         let mut int32 = Vec::new();
+        let mut corba = Vec::new();
         loop {
             let (tok, span) = lexer.next_token();
             let is_eof = tok == Tok::Eof;
@@ -1297,6 +1304,7 @@ impl Parser {
             tokens.push((tok, span));
             short_strings.push(lexer.short_strings);
             int32.push(lexer.int32);
+            corba.push(lexer.corba);
             if is_eof {
                 break;
             }
@@ -1305,6 +1313,7 @@ impl Parser {
             tokens,
             short_strings,
             int32,
+            corba,
             hidden_types: Vec::new(),
             pos: 0,
             directives: lexer.directives,
@@ -1444,6 +1453,7 @@ impl Parser {
             body,
             span,
             uses_exceptions: self.uses_exceptions(),
+            type_units: std::collections::HashMap::new(),
         })
     }
 
@@ -2438,6 +2448,7 @@ impl Parser {
     /// have class methods and properties.
     fn parse_object_type(&mut self) -> Result<PascalType, ParseError> {
         let is_interface = *self.peek() == Tok::KwInterface;
+        let is_corba = is_interface && self.corba[self.pos];
         let is_class = !is_interface && *self.peek() != Tok::KwObject;
         self.advance();
         let mut parent = None;
@@ -2494,6 +2505,8 @@ impl Parser {
             is_interface,
             interfaces,
             guid,
+            is_corba,
+            resolutions: Vec::new(),
         };
         // After `class var`, fields are class variables until the next
         // section.
@@ -2524,6 +2537,21 @@ impl Parser {
                 Tok::End => {
                     self.advance();
                     break;
+                }
+                // `function IFoo.Bar = MyBar;`: a method resolution clause.
+                Tok::KwProcedure | Tok::KwFunction
+                    if is_class
+                        && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _)))
+                        && matches!(self.tokens.get(self.pos + 2), Some((Tok::Dot, _))) =>
+                {
+                    self.advance();
+                    let (intf, _) = self.expect_ident()?;
+                    self.expect(&Tok::Dot)?;
+                    let (method, _) = self.expect_member_name()?;
+                    self.expect(&Tok::Eq)?;
+                    let (target, _) = self.expect_member_name()?;
+                    self.expect(&Tok::Semi)?;
+                    obj.resolutions.push((intf, method, target));
                 }
                 _ if self.at_routine() => {
                     let heading = self.parse_routine_heading()?;
@@ -2646,6 +2674,7 @@ impl Parser {
             write: None,
             index: None,
             is_default: false,
+            implements: Vec::new(),
             span,
         };
         loop {
@@ -2677,6 +2706,14 @@ impl Parser {
                 }
                 Tok::Ident(w) if w.eq_ignore_ascii_case("nodefault") => {
                     self.advance();
+                }
+                Tok::Ident(w) if w.eq_ignore_ascii_case("implements") => {
+                    self.advance();
+                    prop.implements.push(self.expect_ident()?.0);
+                    while *self.peek() == Tok::Comma {
+                        self.advance();
+                        prop.implements.push(self.expect_ident()?.0);
+                    }
                 }
                 _ => break,
             }
@@ -3286,6 +3323,15 @@ impl Parser {
                 span,
                 end_span: span,
             }));
+        }
+
+        // `(Obj as IFoo).Run;`: a call on a parenthesized expression.
+        if *self.peek() == Tok::LParen {
+            let span = self.span();
+            self.advance();
+            let value = self.parse_expr()?;
+            self.expect(&Tok::RParen)?;
+            return self.parse_chained_call_statement(value, span);
         }
 
         match self.peek() {

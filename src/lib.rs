@@ -453,6 +453,11 @@ pub fn resolve_uses(program: &mut ast::Program, search_dirs: &[PathBuf]) -> Resu
     for mut unit in loaded {
         program.uses_exceptions |= unit.uses_exceptions;
         copy_interface_defaults(&mut unit);
+        for t in unit.interface_types.iter().chain(&unit.impl_types) {
+            program
+                .type_units
+                .insert(t.name.to_ascii_lowercase(), unit.name.clone());
+        }
         consts.extend(unit.interface_consts);
         consts.extend(unit.impl_consts);
         types.extend(unit.interface_types);
@@ -5970,6 +5975,259 @@ end.
         );
         assert!(ok, "program failed: {out}");
         assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn specialization_class_names_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program cn;
+{$mode objfpc}{$H+}
+uses fgl, Generics.Collections;
+type
+  generic TBox<T> = class
+    V: T;
+  end;
+  generic TPair2<A, B> = class end;
+  TRec = record X: Integer; end;
+  TIntBox = specialize TBox<Integer>;
+  TMyList = specialize TFPGList<Integer>;
+var
+  B1: TIntBox;
+  B2: specialize TBox<string>;
+  B3: specialize TBox<Double>;
+  B4: specialize TBox<TRec>;
+  B5: specialize TBox<TObject>;
+  P: specialize TPair2<Byte, specialize TBox<Char>>;
+  L: TMyList;
+  D: specialize TDictionary<string, Integer>;
+  B6: specialize TBox<Int64>;
+  B7: specialize TBox<Boolean>;
+  B8: specialize TBox<AnsiString>;
+begin
+  B1 := TIntBox.Create; WriteLn(B1.ClassName);
+  B2 := specialize TBox<string>.Create; WriteLn(B2.ClassName);
+  B3 := specialize TBox<Double>.Create; WriteLn(B3.ClassName);
+  B4 := specialize TBox<TRec>.Create; WriteLn(B4.ClassName);
+  B5 := specialize TBox<TObject>.Create; WriteLn(B5.ClassName);
+  P := specialize TPair2<Byte, specialize TBox<Char>>.Create; WriteLn(P.ClassName);
+  L := TMyList.Create; WriteLn(L.ClassName);
+  D := specialize TDictionary<string, Integer>.Create; WriteLn(D.ClassName);
+  B6 := specialize TBox<Int64>.Create; WriteLn(B6.ClassName);
+  B7 := specialize TBox<Boolean>.Create; WriteLn(B7.ClassName);
+  B8 := specialize TBox<AnsiString>.Create; WriteLn(B8.ClassName);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "TBox<System.LongInt>\nTBox<System.AnsiString>\nTBox<System.Double>\nTBox<cn.TRec>\nTBox<System.TObject>\nTPair2<System.Byte,cn.TBox<System.Char>>\nTFPGList<System.LongInt>\nTDictionary<System.AnsiString,System.LongInt>\nTBox<System.Int64>\nTBox<System.Boolean>\nTBox<System.AnsiString>\n"
+        );
+    }
+
+    #[test]
+    fn interface_resolution_clauses_and_delegation() {
+        let (ok, out) = build_and_run_source(
+            "program res;
+{$mode objfpc}{$H+}
+uses SysUtils;
+type
+  IReader = interface
+    ['{11111111-0000-0000-0000-000000000001}']
+    function Read: string;
+    function Name: string;
+  end;
+  IWriter = interface
+    ['{11111111-0000-0000-0000-000000000002}']
+    procedure Write(const S: string);
+    function Name: string;
+  end;
+
+  TFile = class(TInterfacedObject, IReader, IWriter)
+  private
+    FData: string;
+  public
+    function IReader.Name = ReaderName;
+    function IWriter.Name = WriterName;
+    procedure IWriter.Write = Store;
+    function Read: string;
+    function ReaderName: string;
+    function WriterName: string;
+    procedure Store(const S: string);
+    destructor Destroy; override;
+  end;
+
+  { Delegation: TOuter implements IWriter through FInner. }
+  TOuter = class(TInterfacedObject, IWriter)
+  private
+    FInner: IWriter;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    property Inner: IWriter read FInner implements IWriter;
+  end;
+
+  TLog = class(TInterfacedObject, IWriter)
+    procedure Write(const S: string);
+    function Name: string;
+    destructor Destroy; override;
+  end;
+
+  { Delegation to a class-typed field. }
+  TOuter2 = class(TInterfacedObject, IReader)
+  private
+    FFile: TFile;
+    function GetFile: TFile;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    property AsFile: TFile read GetFile implements IReader;
+  end;
+
+function TFile.Read: string; begin Result := FData; end;
+function TFile.ReaderName: string; begin Result := 'reader'; end;
+function TFile.WriterName: string; begin Result := 'writer'; end;
+procedure TFile.Store(const S: string); begin FData := FData + S; end;
+destructor TFile.Destroy; begin WriteLn('file gone'); inherited; end;
+
+constructor TOuter.Create; begin inherited Create; FInner := TLog.Create; end;
+destructor TOuter.Destroy; begin WriteLn('outer gone'); inherited; end;
+
+procedure TLog.Write(const S: string); begin WriteLn('log: ', S); end;
+function TLog.Name: string; begin Result := 'log'; end;
+destructor TLog.Destroy; begin WriteLn('log gone'); inherited; end;
+
+constructor TOuter2.Create; begin inherited Create; FFile := TFile.Create; FFile.Store('inside'); end;
+destructor TOuter2.Destroy; begin WriteLn('outer2 gone'); FFile.Free; inherited; end;
+function TOuter2.GetFile: TFile; begin Result := FFile; end;
+
+procedure Main;
+var
+  F: TFile;
+  R: IReader;
+  W: IWriter;
+  O: TOuter;
+  R2: IReader;
+begin
+  F := TFile.Create;
+  R := F;
+  W := F;
+  W.Write('abc');
+  W.Write('def');
+  WriteLn(R.Read, ' ', R.Name, ' ', W.Name);
+  WriteLn(Supports(R, IWriter), ' ', (R as IWriter).Name);
+  R := nil;
+  W := nil;
+  WriteLn('--');
+  O := TOuter.Create;
+  W := O;
+  W.Write('via outer');
+  WriteLn(W.Name);
+  W := nil;
+  WriteLn(Supports(O, IWriter, W));
+  W.Write('again');
+  W := nil;
+  O.Free;
+  WriteLn('--');
+  R2 := TOuter2.Create;
+  WriteLn(R2.Read, ' ', R2.Name);
+  R2 := nil;
+  WriteLn('end');
+end;
+
+begin
+  Main;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "abcdef reader writer\nTRUE writer\n--\nlog: via outer\nlog\nTRUE\nlog: again\nouter gone\nlog gone\n--\ninside reader\nfile gone\nend\nfile gone\n"
+        );
+    }
+
+    #[test]
+    fn corba_interfaces() {
+        let (ok, out) = build_and_run_source(
+            "program corba;
+{$mode objfpc}{$H+}
+{$interfaces corba}
+uses SysUtils;
+type
+  IShape = interface
+    ['IShape']
+    function Area: Double;
+    function Name: string;
+  end;
+  IScalable = interface
+    ['IScalable']
+    procedure Scale(F: Double);
+  end;
+  IDrawable = interface(IShape)
+    ['IDrawable']
+    procedure Draw;
+  end;
+
+  TSquare = class(TObject, IDrawable, IScalable)
+    FSide: Double;
+    constructor Create(S: Double);
+    destructor Destroy; override;
+    function Area: Double;
+    function Name: string;
+    procedure Draw;
+    procedure Scale(F: Double);
+  end;
+
+constructor TSquare.Create(S: Double); begin FSide := S; end;
+destructor TSquare.Destroy; begin WriteLn('square destroyed'); inherited; end;
+function TSquare.Area: Double; begin Result := FSide * FSide; end;
+function TSquare.Name: string; begin Result := 'square'; end;
+procedure TSquare.Draw; begin WriteLn('drawing ', Name, ' ', Area:0:1); end;
+procedure TSquare.Scale(F: Double); begin FSide := FSide * F; end;
+
+procedure Show(S: IShape);
+begin
+  WriteLn(S.Name, ': ', S.Area:0:2);
+end;
+
+function GetDrawable(Sq: TSquare): IDrawable;
+begin
+  Result := Sq;
+end;
+
+var
+  Sq: TSquare;
+  D: IDrawable;
+  Sc: IScalable;
+  S: IShape;
+begin
+  Sq := TSquare.Create(2);
+  D := Sq;
+  D.Draw;
+  S := D;
+  Show(S);
+  Sc := Sq;
+  Sc.Scale(1.5);
+  Show(D);
+  if Supports(Sq, IScalable) then WriteLn('scalable');
+  WriteLn(Sq is IDrawable, ' ', D <> nil);
+  (Sq as IScalable).Scale(2);
+  GetDrawable(Sq).Draw;
+  D := nil;
+  S := nil;
+  Sc := nil;
+  WriteLn('refs dropped, object alive');
+  Sq.Draw;
+  Sq.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "drawing square 4.0\nsquare: 4.00\nsquare: 9.00\nscalable\nTRUE TRUE\ndrawing square 36.0\nrefs dropped, object alive\ndrawing square 36.0\nsquare destroyed\n"
+        );
     }
 
     #[test]

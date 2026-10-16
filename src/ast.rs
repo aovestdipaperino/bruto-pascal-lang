@@ -52,6 +52,10 @@ pub struct Program {
     /// Whether the program (or a unit it uses) raises or handles
     /// exceptions, so it needs the exception runtime in `rtl/objpas.pp`.
     pub uses_exceptions: bool,
+    /// The unit declaring each type that came from one (lower-case type
+    /// name -> the unit's name as written; `System` for the built-in
+    /// ones). For the names FPC gives specializations.
+    pub type_units: std::collections::HashMap<String, String>,
 }
 
 /// A unit module: `unit Name; interface ... implementation ... end.`
@@ -511,6 +515,12 @@ pub struct ObjectType {
     pub interfaces: Vec<String>,
     /// An interface's GUID (`['{...}']`), if given.
     pub guid: Option<String>,
+    /// A CORBA interface (`{$interfaces corba}`): not counted, and not
+    /// descending from IInterface.
+    pub is_corba: bool,
+    /// Method resolution clauses: `function IFoo.Bar = MyBar;` as
+    /// (interface, its method, the class's method).
+    pub resolutions: Vec<(String, String, String)>,
 }
 
 /// A class property: `property Name[Index: T]: T read Getter write
@@ -528,6 +538,9 @@ pub struct PropertyDecl {
     pub index: Option<i64>,
     /// The class's default array property: `Obj[I]` means `Obj.Name[I]`.
     pub is_default: bool,
+    /// `implements IFoo, IBar`: the class's IFoo is what the property
+    /// gives.
+    pub implements: Vec<String>,
     pub span: Span,
 }
 
