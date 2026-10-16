@@ -109,7 +109,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .builder
                     .build_float_mul(f, f64_ty.const_float(SCALE as f64), "scaled")
                     .map_err(err)?;
-                let round = self.get_or_declare_f64_intrinsic("llvm.roundeven.f64");
+                let round = self.get_or_declare_f64_intrinsic("llvm.rint.f64");
                 let rounded = self
                     .builder
                     .build_call(round, &[scaled.into()], "rounded")

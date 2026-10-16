@@ -7458,8 +7458,10 @@ impl<'ctx> CodeGen<'ctx> {
                 if name == "round" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
-                    // Halves to even, as FPC rounds.
-                    let round_fn = self.get_or_declare_f64_intrinsic("llvm.roundeven.f64");
+                    // In the current rounding mode, as FPC rounds: halves to
+                    // even by default. (`rint`, which every C library has;
+                    // Windows' has no `roundeven`.)
+                    let round_fn = self.get_or_declare_f64_intrinsic("llvm.rint.f64");
                     let rounded = self
                         .builder
                         .build_call(round_fn, &[fval.into()], "rounded")
