@@ -123,7 +123,8 @@ type
 
 function GetTypeData(TypeInfo: PTypeInfo): PTypeData;
 begin
-  Result := PTypeData(Pointer(TypeInfo) + SizeOf(TTypeInfo));
+  { After the TTypeInfo, 8-byte aligned. }
+  Result := PTypeData(Pointer(TypeInfo) + ((SizeOf(TTypeInfo) + 7) and not 7));
 end;
 
 function GetEnumName(TypeInfo: PTypeInfo; Value: Integer): string;

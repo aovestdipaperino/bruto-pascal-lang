@@ -1187,13 +1187,13 @@ impl<'ctx> CodeGen<'ctx> {
                 | PascalType::OpenArray(_)
                 | PascalType::Specialize { .. }
                 | PascalType::Interface(_)
+                | PascalType::Enum { .. }
                 | PascalType::ShortString { .. } => {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
                         .map_err(|e| CodeGenError::new(e.to_string(), Some(decl.span)))?;
                 }
                 PascalType::Integer
-                | PascalType::Enum { .. }
                 | PascalType::Subrange { .. }
                 | PascalType::SubrangeExpr { .. } => {
                     self.builder
@@ -1301,12 +1301,15 @@ impl<'ctx> CodeGen<'ctx> {
     /// Make the values of the enumerations written in `ty` constants.
     fn register_enum_values(&mut self, ty: &PascalType) {
         let mut found = Vec::new();
-        ty.for_each_enum(&mut |values, ordinals| found.push((values.to_vec(), ordinals.to_vec())));
-        for (values, ordinals) in found {
+        ty.for_each_enum(&mut |values, ordinals, size| {
+            found.push((values.to_vec(), ordinals.to_vec(), size))
+        });
+        for (values, ordinals, size) in found {
             let enum_ty = PascalType::Enum {
                 name: String::new(),
                 values: values.clone(),
                 ordinals: ordinals.clone(),
+                size,
             };
             for (i, val) in values.into_iter().enumerate() {
                 self.enum_values
@@ -2487,8 +2490,14 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?
                 .into());
         }
-        let PascalType::SizedInt { bits, signed } = resolved else {
-            return Ok(val);
+        // An enumeration's value, widened (signed if an ordinal is
+        // negative).
+        let (bits, signed) = match resolved {
+            PascalType::SizedInt { bits, signed } => (bits, signed),
+            PascalType::Enum { size, ordinals, .. } => {
+                (u32::from(size) * 8, ordinals.iter().any(|o| *o < 0))
+            }
+            _ => return Ok(val),
         };
         if bits >= 64 || !val.is_int_value() {
             return Ok(val);
@@ -3703,6 +3712,7 @@ impl<'ctx> CodeGen<'ctx> {
             fields,
             variant,
             object,
+            ..
         } = &resolved
         else {
             return Err(CodeGenError::new(
@@ -3974,10 +3984,10 @@ impl<'ctx> CodeGen<'ctx> {
             // Replaced by the generics pass before code generation.
             PascalType::Specialize { .. } => 8,
             PascalType::ShortString { max } => *max as u64 + 1,
-            PascalType::Integer
-            | PascalType::Enum { .. }
-            | PascalType::Subrange { .. }
-            | PascalType::SubrangeExpr { .. } => 8,
+            PascalType::Integer | PascalType::Subrange { .. } | PascalType::SubrangeExpr { .. } => {
+                8
+            }
+            PascalType::Enum { size, .. } => u64::from(*size),
             PascalType::SizedInt { bits, .. } => (*bits / 8) as u64,
             PascalType::Untyped => 1,
             PascalType::Real => 8,
@@ -3998,8 +4008,11 @@ impl<'ctx> CodeGen<'ctx> {
                 count * self.sizeof_type(elem)
             }
             PascalType::Record {
-                fields, variant, ..
-            } => self.record_size(fields, variant),
+                fields,
+                variant,
+                packed,
+                ..
+            } => self.record_size(fields, variant, *packed),
             PascalType::Named(_) => {
                 let resolved = self.resolve_type(ty);
                 self.sizeof_type(&resolved)
@@ -6567,8 +6580,11 @@ impl<'ctx> CodeGen<'ctx> {
                 })
             }
             Expr::Var(name, span) => {
-                // Check if this is an enum constant before looking up variables
-                if let Some(&ordinal) = self.enum_values.get(name.as_str()) {
+                // An enumeration value, unless a variable (a parameter in a
+                // unit's routine, say) of the same name hides it.
+                if self.lookup_var(name).is_none()
+                    && let Some(&ordinal) = self.enum_values.get(name.as_str())
+                {
                     return Ok(self
                         .context
                         .i64_type()
@@ -8037,14 +8053,17 @@ impl<'ctx> CodeGen<'ctx> {
                 fields,
                 variant,
                 object,
+                packed,
             } => PascalType::Record {
                 object: object.clone(),
+                packed: *packed,
                 fields: fields
                     .iter()
                     .map(|(n, t)| (n.clone(), self.resolve_type_at(t, behind_pointer)))
                     .collect(),
                 variant: variant.as_ref().map(|v| {
                     Box::new(RecordVariant {
+                        packed: v.packed,
                         tag_name: v.tag_name.clone(),
                         tag_type: self.resolve_type_at(&v.tag_type, behind_pointer),
                         variants: v
@@ -8106,13 +8125,15 @@ impl<'ctx> CodeGen<'ctx> {
                 name,
                 values,
                 ordinals,
+                size,
             } => {
                 // Emit DW_TAG_enumeration_type so lldb prints names rather
                 // than ordinals. Falls back to plain `long` if the inner
                 // basic type can't be created.
+                let bits = u64::from(*size) * 8;
                 let inner = self
                     .di_builder
-                    .create_basic_type("long", 64, 0x05, DIFlags::ZERO)
+                    .create_basic_type("long", bits, 0x05, DIFlags::ZERO)
                     .ok()?;
                 let enumerators: Vec<_> = values
                     .iter()
@@ -8135,8 +8156,8 @@ impl<'ctx> CodeGen<'ctx> {
                             &display_name,
                             self.compile_unit.get_file(),
                             0,
-                            64,
-                            64,
+                            bits,
+                            bits as u32,
                             &enumerators,
                             inner.as_type(),
                         )
@@ -8244,8 +8265,11 @@ impl<'ctx> CodeGen<'ctx> {
                 )
             }
             PascalType::Record {
-                fields, variant, ..
-            } => self.create_record_debug_type(fields, variant.as_deref()),
+                fields,
+                variant,
+                packed,
+                ..
+            } => self.create_record_debug_type(fields, variant.as_deref(), *packed),
             _ => {
                 // Arrays, sets, etc. — opaque aggregate.
                 self.di_builder
@@ -8265,12 +8289,13 @@ impl<'ctx> CodeGen<'ctx> {
         &self,
         fields: &[(String, PascalType)],
         variant: Option<&RecordVariant>,
+        packed: bool,
     ) -> Option<DIType<'ctx>> {
         let scope = self.compile_unit.as_debug_info_scope();
         let file = self.compile_unit.get_file();
         let mut members: Vec<DIType<'ctx>> = Vec::new();
         let boxed = variant.map(|v| Box::new(v.clone()));
-        let (offsets, tag_offset, area_offset) = self.record_offsets(fields, &boxed);
+        let (offsets, tag_offset, area_offset) = self.record_offsets(fields, &boxed, packed);
         let mut member = |name: &str, ty: &PascalType, offset: u64| -> Option<()> {
             let resolved = self.resolve_type(ty);
             let mty = self.create_debug_type(&resolved)?;
@@ -8310,7 +8335,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
         }
-        let size = self.record_size(fields, &boxed) * 8;
+        let size = self.record_size(fields, &boxed, packed) * 8;
         Some(
             self.di_builder
                 .create_struct_type(
@@ -8359,10 +8384,14 @@ impl<'ctx> CodeGen<'ctx> {
             // Constant-expression types are folded by the semantic pass;
             // `ArrayExpr` can't reach here.
             PascalType::Integer
-            | PascalType::Enum { .. }
             | PascalType::Subrange { .. }
             | PascalType::SubrangeExpr { .. }
             | PascalType::ArrayExpr { .. } => self.context.i64_type().as_basic_type_enum(),
+            // An enumeration value takes its type's bytes.
+            PascalType::Enum { size, .. } => self
+                .context
+                .custom_width_int_type(u32::from(*size) * 8)
+                .as_basic_type_enum(),
             PascalType::Real => self.context.f64_type().as_basic_type_enum(),
             PascalType::Single => self.context.f32_type().as_basic_type_enum(),
             PascalType::Boolean => self.context.bool_type().as_basic_type_enum(),
@@ -8395,7 +8424,10 @@ impl<'ctx> CodeGen<'ctx> {
                 elem_ty.array_type(count).as_basic_type_enum()
             }
             PascalType::Record {
-                fields, variant, ..
+                fields,
+                variant,
+                packed,
+                ..
             } => {
                 let mut field_types: Vec<inkwell::types::BasicTypeEnum> =
                     fields.iter().map(|(_, t)| self.llvm_type_for(t)).collect();
@@ -8413,7 +8445,7 @@ impl<'ctx> CodeGen<'ctx> {
                     );
                 }
                 self.context
-                    .struct_type(&field_types, false)
+                    .struct_type(&field_types, *packed)
                     .as_basic_type_enum()
             }
             PascalType::Named(_) => {

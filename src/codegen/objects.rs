@@ -350,6 +350,7 @@ impl<'ctx> CodeGen<'ctx> {
             fields,
             variant: None,
             object: Some(name.to_string()),
+            packed: false,
         };
         // A class's name means a reference to an instance (see
         // `class_instance_type`); the record is the instance itself.

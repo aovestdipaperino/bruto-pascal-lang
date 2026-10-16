@@ -132,6 +132,7 @@ impl<'ctx> CodeGen<'ctx> {
                     fields: Vec::new(),
                     variant: None,
                     object: None,
+                    packed: false,
                 },
                 vmt_field: None,
                 methods,

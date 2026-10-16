@@ -34,7 +34,10 @@ impl<'ctx> CodeGen<'ctx> {
             | PascalType::ShortString { .. }
             | PascalType::Object(_) => 1,
             PascalType::WideChar => 2,
+            PascalType::Single => 4,
+            PascalType::Enum { size, .. } => u64::from(*size),
             PascalType::Array { elem, .. } => self.align_of(elem),
+            PascalType::Record { packed: true, .. } => 1,
             PascalType::Record {
                 fields, variant, ..
             } => {
@@ -55,23 +58,29 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// A field's alignment in a record: 1 when the record is packed.
+    fn field_align(&self, ty: &PascalType, packed: bool) -> u64 {
+        if packed { 1 } else { self.align_of(ty) }
+    }
+
     /// The size of a record with `fields` and `variant`, padded to its
     /// alignment.
     pub(super) fn record_size(
         &self,
         fields: &[(String, PascalType)],
         variant: &Option<Box<RecordVariant>>,
+        packed: bool,
     ) -> u64 {
         let mut offset = 0;
         let mut align = 1;
         for (_, t) in fields {
-            let a = self.align_of(t);
+            let a = self.field_align(t, packed);
             offset = align_up(offset, a) + self.sizeof_type(t);
             align = align.max(a);
         }
         if let Some(v) = variant {
             if !v.tag_name.is_empty() {
-                let a = self.align_of(&v.tag_type);
+                let a = self.field_align(&v.tag_type, packed);
                 offset = align_up(offset, a) + self.sizeof_type(&v.tag_type);
                 align = align.max(a);
             }
@@ -87,11 +96,12 @@ impl<'ctx> CodeGen<'ctx> {
         &self,
         fields: &[(String, PascalType)],
         variant: &Option<Box<RecordVariant>>,
+        packed: bool,
     ) -> (Vec<u64>, Option<u64>, u64) {
         let mut offsets = Vec::with_capacity(fields.len());
         let mut offset = 0;
         for (_, t) in fields {
-            offset = align_up(offset, self.align_of(t));
+            offset = align_up(offset, self.field_align(t, packed));
             offsets.push(offset);
             offset += self.sizeof_type(t);
         }
@@ -99,7 +109,7 @@ impl<'ctx> CodeGen<'ctx> {
         let mut area = offset;
         if let Some(v) = variant {
             if !v.tag_name.is_empty() {
-                offset = align_up(offset, self.align_of(&v.tag_type));
+                offset = align_up(offset, self.field_align(&v.tag_type, packed));
                 tag = Some(offset);
                 offset += self.sizeof_type(&v.tag_type);
             }
@@ -115,7 +125,7 @@ impl<'ctx> CodeGen<'ctx> {
         for (_, vfields) in &v.variants {
             let mut offset = 0;
             for (_, t) in vfields {
-                let a = self.align_of(t);
+                let a = self.field_align(t, v.packed);
                 offset = align_up(offset, a) + self.sizeof_type(t);
                 align = align.max(a);
             }
@@ -134,7 +144,7 @@ impl<'ctx> CodeGen<'ctx> {
         for (_, vfields) in &v.variants {
             let mut offset = 0;
             for (name, ty) in vfields {
-                offset = align_up(offset, self.align_of(ty));
+                offset = align_up(offset, self.field_align(ty, v.packed));
                 if name == field {
                     return Some((offset, ty.clone()));
                 }
@@ -144,11 +154,12 @@ impl<'ctx> CodeGen<'ctx> {
                     && let PascalType::Record {
                         fields,
                         variant: Some(nested),
+                        packed,
                         ..
                     } = ty
                     && let Some((inner, inner_ty)) = self.variant_field_offset(nested, field)
                 {
-                    let (_, _, area) = self.record_offsets(fields, &Some(nested.clone()));
+                    let (_, _, area) = self.record_offsets(fields, &Some(nested.clone()), *packed);
                     return Some((offset + area + inner, inner_ty));
                 }
                 offset += self.sizeof_type(ty);

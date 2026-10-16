@@ -92,11 +92,18 @@ impl<'ctx> CodeGen<'ctx> {
         let fields: Vec<BasicValueEnum> = names
             .iter()
             .zip(ty.get_field_types())
-            .map(|(n, field_ty)| {
-                values
-                    .get(n.as_str())
-                    .copied()
-                    .unwrap_or_else(|| zero_of(field_ty))
+            .map(|(n, field_ty)| match values.get(n.as_str()).copied() {
+                // An integer at the field's width (an enumeration's is
+                // its own).
+                Some(BasicValueEnum::IntValue(v)) if field_ty.is_int_type() => {
+                    let want = field_ty.into_int_type();
+                    match v.get_sign_extended_constant() {
+                        Some(n) if v.get_type() != want => want.const_int(n as u64, true).into(),
+                        _ => v.into(),
+                    }
+                }
+                Some(v) => v,
+                None => zero_of(field_ty),
             })
             .collect();
         Some(ty.const_named_struct(&fields).into())
@@ -342,11 +349,23 @@ impl<'ctx> CodeGen<'ctx> {
                 TK_BOOL
             }
             PascalType::Enum {
-                values, ordinals, ..
+                values,
+                ordinals,
+                size,
+                ..
             } => {
                 let lo = ordinals.iter().copied().min().unwrap_or(0);
                 let hi = ordinals.iter().copied().max().unwrap_or(0);
-                ordinal(data, OT_SQWORD, lo, hi);
+                // As its storage: unsigned unless an ordinal is negative.
+                let ord_type = match (size, lo < 0) {
+                    (1, false) => OT_UBYTE,
+                    (1, true) => OT_SBYTE,
+                    (2, false) => OT_UWORD,
+                    (2, true) => OT_SWORD,
+                    (_, false) => OT_ULONG,
+                    (_, true) => OT_SLONG,
+                };
+                ordinal(data, ord_type, lo, hi);
                 data.insert("basetype", me.into());
                 let shown: Vec<String> = values.iter().map(|v| self.display(v)).collect();
                 let names = self.enum_name_table(&shown, ordinals);

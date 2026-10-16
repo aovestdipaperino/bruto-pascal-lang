@@ -266,6 +266,8 @@ pub enum PascalType {
         /// For the record an `object` type lowers to, the object type's
         /// name, so its methods can be found.
         object: Option<String>,
+        /// `packed record`: no padding between fields.
+        packed: bool,
     },
     /// An `object` type as declared. Code generation lowers it to a
     /// `Record` (with `object` set) plus a method table.
@@ -301,6 +303,9 @@ pub enum PascalType {
         /// Each value's ordinal: its position, unless given (`(A = 1, B =
         /// 5)`; a value without one follows the previous).
         ordinals: Vec<i64>,
+        /// Bytes a value takes (1, 2 or 4), as FPC's `{$PACKENUM}` and
+        /// mode give it.
+        size: u8,
     },
     /// Subrange type: lo..hi (stored as i64)
     Subrange {
@@ -361,11 +366,14 @@ impl PascalType {
     /// Call `f` with the values of every enumeration written inside this
     /// type, as in `Phase: (phFocused, phPreProcess)` in a record or
     /// object, each of which names a constant.
-    pub fn for_each_enum(&self, f: &mut impl FnMut(&[String], &[i64])) {
+    pub fn for_each_enum(&self, f: &mut impl FnMut(&[String], &[i64], u8)) {
         match self {
             PascalType::Enum {
-                values, ordinals, ..
-            } => f(values, ordinals),
+                values,
+                ordinals,
+                size,
+                ..
+            } => f(values, ordinals, *size),
             PascalType::Record {
                 fields, variant, ..
             } => {
@@ -584,6 +592,8 @@ pub struct RecordVariant {
     /// (case labels, fields). Labels are folded to `ConstExpr::Int` by the
     /// semantic pass.
     pub variants: Vec<(Vec<ConstExpr>, Vec<(String, PascalType)>)>,
+    /// Part of a `packed record`: no padding.
+    pub packed: bool,
 }
 
 /// A begin/end block containing statements.

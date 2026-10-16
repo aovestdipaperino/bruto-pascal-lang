@@ -12,6 +12,28 @@ use super::{CodeGen, CodeGenError};
 use crate::ast::*;
 
 impl<'ctx> CodeGen<'ctx> {
+    /// The lowest and highest values of an ordinal type.
+    pub(super) fn ordinal_bounds(&self, ty: &PascalType) -> Option<(i64, i64)> {
+        match ty {
+            PascalType::Enum { ordinals, .. } => Some((
+                ordinals.iter().copied().min().unwrap_or(0),
+                ordinals.iter().copied().max().unwrap_or(0),
+            )),
+            PascalType::Subrange { lo, hi } => Some((*lo, *hi)),
+            PascalType::Boolean => Some((0, 1)),
+            PascalType::Char => Some((0, 255)),
+            PascalType::SizedInt {
+                bits: 8,
+                signed: false,
+            } => Some((0, 255)),
+            PascalType::SizedInt {
+                bits: 8,
+                signed: true,
+            } => Some((-128, 127)),
+            _ => None,
+        }
+    }
+
     pub(super) fn compile_for_in(
         &mut self,
         var: &str,
@@ -20,6 +42,50 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
+        // `for C in TColor`: every value of an ordinal type.
+        if let Expr::Var(name, _) = collection
+            && self.lookup_var(name).is_none()
+            && let Some((lo, hi)) = self
+                .type_of_name(name)
+                .and_then(|t| self.ordinal_bounds(&self.resolve_type(&t)))
+        {
+            return self.compile_statement(&Statement::For {
+                var: var.to_string(),
+                from: Expr::IntLit(lo, span),
+                to: Expr::IntLit(hi, span),
+                downto: false,
+                body: body.clone(),
+                span,
+            });
+        }
+        // `for X in S`: the members of a set, in order.
+        if let PascalType::Set { elem } = self.resolve_type(&self.infer_declared_type(collection))
+            && let Some((lo, hi)) = self.ordinal_bounds(&self.resolve_type(&elem))
+        {
+            let test = Statement::If {
+                condition: Expr::BinOp {
+                    op: BinOp::In,
+                    left: Box::new(Expr::Var(var.to_string(), span)),
+                    right: Box::new(collection.clone()),
+                    span,
+                },
+                then_branch: body.clone(),
+                else_branch: None,
+                span,
+            };
+            return self.compile_statement(&Statement::For {
+                var: var.to_string(),
+                from: Expr::IntLit(lo, span),
+                to: Expr::IntLit(hi.min(lo + 255), span),
+                downto: false,
+                body: Block {
+                    statements: vec![test],
+                    span,
+                    end_span: span,
+                },
+                span,
+            });
+        }
         // This loop's hidden locals are the ones added from here on.
         let first_local = self.for_in_locals.len();
         let var_expr = |name: &str| Expr::Var(name.to_string(), span);

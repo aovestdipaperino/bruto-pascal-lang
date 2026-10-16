@@ -6769,6 +6769,160 @@ end.
     }
 
     #[test]
+    fn enum_sizes_match_fpc_objfpc() {
+        let (ok, out) = build_and_run_source(
+            "program es;
+{$mode objfpc}
+uses TypInfo;
+type
+  TA = (a1, a2);
+  TNeg = (n1 = -5, n2 = 3);
+  TBig = (b1, b2 = 70000);
+{$packenum 1}
+  TP1 = (p1, p2);
+  TP1w = (q1, q2 = 300);
+{$packenum 2}
+  TP2 = (r1, r2);
+{$Z4}
+  TZ4 = (z1, z2);
+{$Z1}
+  TZ1 = (y1, y2);
+{$packenum default}
+  TD = (d1, d2);
+  TRec = record B: Byte; E: TA; C: Byte; end;
+begin
+  WriteLn(SizeOf(TA), SizeOf(TNeg), SizeOf(TBig), SizeOf(TP1), SizeOf(TP1w), SizeOf(TP2), SizeOf(TZ4), SizeOf(TZ1), SizeOf(TD), ' ', SizeOf(TRec));
+  WriteLn(Ord(GetTypeData(TypeInfo(TA))^.OrdType), Ord(GetTypeData(TypeInfo(TP1))^.OrdType), Ord(GetTypeData(TypeInfo(TP2))^.OrdType), Ord(GetTypeData(TypeInfo(Boolean))^.OrdType));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "444122414 12\n5131\n");
+    }
+
+    #[test]
+    fn enum_sizes_match_fpc_delphi() {
+        let (ok, out) = build_and_run_source(
+            "program es;
+{$mode delphi}
+uses TypInfo;
+type
+  TA = (a1, a2);
+  TNeg = (n1 = -5, n2 = 3);
+  TBig = (b1, b2 = 70000);
+{$packenum 1}
+  TP1 = (p1, p2);
+  TP1w = (q1, q2 = 300);
+{$packenum 2}
+  TP2 = (r1, r2);
+{$Z4}
+  TZ4 = (z1, z2);
+{$Z1}
+  TZ1 = (y1, y2);
+{$packenum default}
+  TD = (d1, d2);
+  TRec = record B: Byte; E: TA; C: Byte; end;
+begin
+  WriteLn(SizeOf(TA), SizeOf(TNeg), SizeOf(TBig), SizeOf(TP1), SizeOf(TP1w), SizeOf(TP2), SizeOf(TZ4), SizeOf(TZ1), SizeOf(TD), ' ', SizeOf(TRec));
+  WriteLn(Ord(GetTypeData(TypeInfo(TA))^.OrdType), Ord(GetTypeData(TypeInfo(TP1))^.OrdType), Ord(GetTypeData(TypeInfo(TP2))^.OrdType), Ord(GetTypeData(TypeInfo(Boolean))^.OrdType));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "114122414 3\n1131\n");
+    }
+
+    #[test]
+    fn enums_records_and_sets_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program ew;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes;
+type
+  TColor = (clRed, clGreen, clBlue, clYellow);
+  TSmall = (s0, s1);
+  TColors = set of TColor;
+  TRec = packed record
+    A: Byte;
+    C: TColor;
+    B: Word;
+  end;
+  TObj = class
+    Color: TColor;
+    function Next(C: TColor): TColor;
+  end;
+const
+  Names: array[TColor] of string = ('red', 'green', 'blue', 'yellow');
+  Fav: TColor = clBlue;
+var
+  C, D: TColor;
+  Counts: array[TColor] of Integer;
+  R: TRec;
+  Arr: array[0..2] of TColor;
+  S: TColors;
+  O: TObj;
+  F: file of TRec;
+  M: TMemoryStream;
+  P: PByte;
+  I: Integer;
+
+function TObj.Next(C: TColor): TColor;
+begin
+  if C = High(TColor) then Result := Low(TColor) else Result := Succ(C);
+end;
+
+procedure Bump(var X: TColor);
+begin
+  Inc(X);
+end;
+
+begin
+  for C := Low(TColor) to High(TColor) do
+    Counts[C] := Ord(C) * 10;
+  for C in TColor do Write(Names[C], ':', Counts[C], ' ');
+  WriteLn;
+  C := clGreen;
+  Bump(C);
+  WriteLn(C, ' ', Pred(C), ' ', Fav, ' ', TColor(3), ' ', C > clRed, ' ', C = clBlue);
+  case C of
+    clRed: WriteLn('r');
+    clGreen, clBlue: WriteLn('gb');
+  else
+    WriteLn('other');
+  end;
+  S := [clRed, clYellow];
+  Include(S, C);
+  for D in S do Write(D, ' ');
+  WriteLn(clGreen in S);
+  O := TObj.Create;
+  O.Color := clYellow;
+  WriteLn(O.Next(O.Color), ' ', O.Next(clRed));
+  O.Free;
+  R.A := 1; R.C := clYellow; R.B := $BEEF;
+  WriteLn(SizeOf(R), ' ', SizeOf(TColor), ' ', SizeOf(TSmall), ' ', SizeOf(Arr));
+  M := TMemoryStream.Create;
+  M.WriteBuffer(R, SizeOf(R));
+  P := M.Memory;
+  for I := 0 to M.Size - 1 do Write(IntToHex(P[I], 2));
+  WriteLn;
+  M.Free;
+  Arr[0] := clBlue; Arr[1] := clRed; Arr[2] := Arr[0];
+  WriteLn(Arr[2], ' ', Ord(Arr[1]));
+  C := clRed;
+  Inc(C, 2);
+  Dec(C);
+  WriteLn(C, ' ', Ord(High(TSmall)));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "red:0 green:10 blue:20 yellow:30 \nclBlue clGreen clBlue clYellow TRUE TRUE\ngb\nclRed clBlue clYellow FALSE\nclRed clGreen\n7 4 4 12\n0103000000EFBE\nclBlue 0\nclGreen 1\n"
+        );
+    }
+
+    #[test]
     fn generic_routines_delphi_syntax() {
         let (ok, out) = build_and_run_source(
             "program T;

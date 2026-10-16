@@ -309,6 +309,9 @@ struct Lexer {
     corba: bool,
     /// `{$M+}`: classes declared here have published members.
     type_info: bool,
+    /// `{$PACKENUM}`: the fewest bytes an enumeration value takes (4 in
+    /// FPC's own modes, 1 in Delphi's and TP's).
+    packenum: u8,
     /// `{$DEFINE NAME := text}` macros: upper-case name -> replacement.
     macros: std::collections::HashMap<String, String>,
     conditions: Vec<Condition>,
@@ -402,6 +405,7 @@ impl Lexer {
             int32: false,
             corba: false,
             type_info: false,
+            packenum: 4,
             conditions: Vec::new(),
             include_dirs: options.include_dirs.clone(),
             error: None,
@@ -537,20 +541,39 @@ impl Lexer {
                 "OBJFPC" => {
                     self.short_strings = true;
                     self.int32 = true;
+                    self.packenum = 4;
                 }
-                "FPC" | "TP" | "MACPAS" | "ISO" => {
+                "FPC" | "MACPAS" | "ISO" => {
                     self.short_strings = true;
                     self.int32 = false;
+                    self.packenum = 4;
+                }
+                "TP" => {
+                    self.short_strings = true;
+                    self.int32 = false;
+                    self.packenum = 1;
                 }
                 "DELPHI" | "DELPHIUNICODE" => {
                     self.short_strings = false;
                     self.int32 = true;
+                    self.packenum = 1;
                 }
                 _ => {}
             },
             "longstrings" => self.short_strings = first_word(rest) == "OFF",
             "interfaces" => self.corba = first_word(rest) == "CORBA",
             "typeinfo" => self.type_info = first_word(rest) == "ON",
+            "packenum" | "minenumsize" => {
+                self.packenum = match first_word(rest).as_str() {
+                    "1" => 1,
+                    "2" => 2,
+                    _ => 4,
+                }
+            }
+            // `{$Z1}`, `{$Z2}`, `{$Z4}`: the same.
+            "z1" => self.packenum = 1,
+            "z2" => self.packenum = 2,
+            "z4" => self.packenum = 4,
             "codepage" => self.cp437 = matches!(first_word(rest).as_str(), "CP437" | "437"),
             "include" => self.include(rest, span),
             "i" if !rest.starts_with(['+', '-']) => self.include(rest, span),
@@ -568,6 +591,7 @@ impl Lexer {
                         b'Q' => self.directives.overflow_check = on,
                         b'I' => self.directives.io_check = on,
                         b'M' => self.type_info = on,
+                        b'Z' => self.packenum = if on { 4 } else { 1 },
                         _ => {}
                     }
                 }
@@ -1282,6 +1306,8 @@ pub struct Parser {
     corba: Vec<bool>,
     /// For each token, whether `{$M+}` was on there.
     type_info: Vec<bool>,
+    /// For each token, the `{$PACKENUM}` there.
+    packenum: Vec<u8>,
     /// Aliases for the specializations written in expressions.
     hidden_types: Vec<TypeDecl>,
     pos: usize,
@@ -1318,6 +1344,7 @@ impl Parser {
         let mut int32 = Vec::new();
         let mut corba = Vec::new();
         let mut type_info = Vec::new();
+        let mut packenum = Vec::new();
         loop {
             let (tok, span) = lexer.next_token();
             let is_eof = tok == Tok::Eof;
@@ -1334,6 +1361,7 @@ impl Parser {
             int32.push(lexer.int32);
             corba.push(lexer.corba);
             type_info.push(lexer.type_info);
+            packenum.push(lexer.packenum);
             if is_eof {
                 break;
             }
@@ -1344,6 +1372,7 @@ impl Parser {
             int32,
             corba,
             type_info,
+            packenum,
             hidden_types: Vec::new(),
             pos: 0,
             directives: lexer.directives,
@@ -2166,9 +2195,13 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<PascalType, ParseError> {
-        // `packed` is accepted but ignored (no special layout).
+        // `packed record`: no padding (`packed` arrays and sets are laid
+        // out as usual).
         if *self.peek() == Tok::KwPacked {
             self.advance();
+            let mut ty = self.parse_type()?;
+            mark_packed(&mut ty);
+            return Ok(ty);
         }
         if *self.peek() == Tok::Caret {
             self.advance();
@@ -2839,6 +2872,7 @@ impl Parser {
             fields,
             variant,
             object: None,
+            packed: false,
         })
     }
 
@@ -2877,6 +2911,7 @@ impl Parser {
                             fields: Vec::new(),
                             variant: Some(Box::new(nested)),
                             object: None,
+                            packed: false,
                         },
                     ));
                     continue;
@@ -2908,10 +2943,12 @@ impl Parser {
             tag_name,
             tag_type,
             variants,
+            packed: false,
         })
     }
 
     fn parse_enum_type(&mut self) -> Result<PascalType, ParseError> {
+        let packenum = self.packenum[self.pos];
         self.expect(&Tok::LParen)?;
         let mut values = Vec::new();
         let mut ordinals: Vec<i64> = Vec::new();
@@ -2937,10 +2974,27 @@ impl Parser {
             self.advance();
         }
         self.expect(&Tok::RParen)?;
+        // At least the `{$PACKENUM}` size, more if the values need it.
+        let lo = ordinals.iter().copied().min().unwrap_or(0);
+        let hi = ordinals.iter().copied().max().unwrap_or(0);
+        let needed = if lo >= 0 {
+            match hi {
+                0..=255 => 1,
+                256..=65535 => 2,
+                _ => 4,
+            }
+        } else if lo >= -128 && hi <= 127 {
+            1
+        } else if lo >= -32768 && hi <= 32767 {
+            2
+        } else {
+            4
+        };
         Ok(PascalType::Enum {
             name: String::new(),
             values,
             ordinals,
+            size: packenum.max(needed),
         })
     }
 
@@ -4812,5 +4866,25 @@ end.
         let mut parser = Parser::new(source);
         let prog = parser.parse_program().expect("should parse");
         assert_eq!(prog.body.statements.len(), 2);
+    }
+}
+
+/// Make a record type (and its variant parts) packed.
+fn mark_packed(ty: &mut PascalType) {
+    if let PascalType::Record {
+        packed, variant, ..
+    } = ty
+    {
+        *packed = true;
+        if let Some(v) = variant {
+            v.packed = true;
+            for (_, fields) in &mut v.variants {
+                for (_, t) in fields {
+                    if matches!(t, PascalType::Record { .. }) {
+                        mark_packed(t);
+                    }
+                }
+            }
+        }
     }
 }

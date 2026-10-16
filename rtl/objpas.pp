@@ -327,7 +327,7 @@ type
 
 function BrutoTypeData(Info: PTypeInfo): PTypeData;
 begin
-  BrutoTypeData := PTypeData(Pointer(Info) + SizeOf(TTypeInfo));
+  BrutoTypeData := PTypeData(Pointer(Info) + ((SizeOf(TTypeInfo) + 7) and not 7));
 end;
 
 function BrutoSameName(const A, B: ShortString): Boolean;

@@ -622,6 +622,7 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
             fields: vec![("handle".to_string(), PascalType::Integer)],
             variant: None,
             object: None,
+            packed: false,
         },
         "bytebool" | "wordbool" | "longbool" => PascalType::Boolean,
         "shortint" | "int8" => sized(8, true),
@@ -642,7 +643,7 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
 
 impl ConstEnv {
     fn add_enum_values(&mut self, ty: &PascalType) {
-        ty.for_each_enum(&mut |values, ordinals| {
+        ty.for_each_enum(&mut |values, ordinals, _| {
             for (i, name) in values.iter().enumerate() {
                 self.values
                     .insert(name.clone(), ordinals.get(i).copied().unwrap_or(i as i64));
