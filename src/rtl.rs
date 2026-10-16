@@ -101,7 +101,7 @@ pub(crate) fn add_string_runtime(program: &mut Program) -> Result<(), String> {
         || program
             .type_decls
             .iter()
-            .any(|t| matches!(&t.ty, PascalType::Object(o) if o.is_class));
+            .any(|t| matches!(&t.ty, PascalType::Object(o) if o.is_class || o.is_interface));
     if has_classes {
         // A program with a TObject of its own (Free Vision's object type)
         // gets the root class as BrutoTObject.

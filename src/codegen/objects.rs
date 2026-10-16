@@ -30,9 +30,10 @@ use std::collections::HashMap;
 /// Name of the hidden VMT pointer field.
 pub(super) const VMT_FIELD: &str = "__vmt";
 /// Words before the first slot in a class's VMT: size, -size, parent
-/// link, class name (a short string), and the routine that releases the
-/// strings an instance holds (or nil).
-pub(super) const CLASS_VMT_HEADER_WORDS: u64 = 5;
+/// link, class name (a short string), the routine that releases the
+/// strings an instance holds (or nil), and the table of the interfaces
+/// the class implements (or nil).
+pub(super) const CLASS_VMT_HEADER_WORDS: u64 = 6;
 
 /// What code generation knows about an object type.
 #[derive(Debug, Clone)]
@@ -56,6 +57,14 @@ pub(super) struct ObjectInfo {
     pub default_property: Option<String>,
     /// Class variables, own and inherited: name -> the global holding it.
     pub class_vars: HashMap<String, String>,
+    /// An interface rather than a class or object. Its `slots` hold the
+    /// keys of its methods, in method table order.
+    pub is_interface: bool,
+    /// The interfaces a class implements, with the class that declares
+    /// each, own first and then inherited.
+    pub interfaces: Vec<(String, String)>,
+    /// An interface's GUID.
+    pub guid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +133,17 @@ impl<'ctx> CodeGen<'ctx> {
         let root = ["tobject", "brutotobject"]
             .into_iter()
             .find(|r| self.objects.get(*r).is_some_and(|o| o.is_class));
-        let parent_name = match (&decl.parent, root) {
+        // `class(IFoo, ...)`: no parent but TObject, implementing IFoo.
+        let mut listed = decl.interfaces.clone();
+        let mut decl_parent = decl.parent.clone();
+        if decl.is_class
+            && let Some(p) = &decl.parent
+            && self.interface_of(&PascalType::Named(p.clone())).is_some()
+        {
+            listed.insert(0, p.clone());
+            decl_parent = None;
+        }
+        let parent_name = match (&decl_parent, root) {
             (None, Some(root)) if decl.is_class => Some(root.to_string()),
             // `class(TObject)` where TObject is the program's own object
             // type (Free Vision's): in FPC the unit declaring the class
@@ -253,6 +272,25 @@ impl<'ctx> CodeGen<'ctx> {
             class_vars.insert(vname.clone(), global);
         }
 
+        let mut interfaces = Vec::new();
+        for i in &listed {
+            let resolved = self
+                .interface_of(&PascalType::Named(i.clone()))
+                .filter(|r| self.objects.get(r).is_some_and(|o| o.is_interface));
+            let Some(i) = resolved else {
+                return Err(CodeGenError::new(
+                    format!("'{}' is not an interface", self.display(i)),
+                    Some(span),
+                ));
+            };
+            interfaces.push((i, name.to_string()));
+        }
+        for inherited in parent.iter().flat_map(|p| p.interfaces.iter()) {
+            if !interfaces.iter().any(|(i, _)| *i == inherited.0) {
+                interfaces.push(inherited.clone());
+            }
+        }
+
         let record = PascalType::Record {
             fields,
             variant: None,
@@ -276,6 +314,9 @@ impl<'ctx> CodeGen<'ctx> {
             properties,
             default_property,
             class_vars,
+            is_interface: false,
+            interfaces,
+            guid: None,
         };
 
         // Declare this type's own methods so calls and VMTs can refer to
@@ -341,13 +382,13 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Emit every object type's VMT. Called once all object types are
     /// registered, so parent links and method functions all exist.
-    pub(super) fn emit_vmts(&mut self) {
+    pub(super) fn emit_vmts(&mut self) -> Result<(), CodeGenError> {
         let ptr = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let mut names: Vec<String> = self
             .objects
             .keys()
-            .filter(|n| !self.class_aliases.contains_key(*n))
+            .filter(|n| !self.class_aliases.contains_key(*n) && !self.objects[*n].is_interface)
             .cloned()
             .collect();
         names.sort();
@@ -384,10 +425,12 @@ impl<'ctx> CodeGen<'ctx> {
             let slots_ty = ptr.array_type(slot_values.len() as u32);
             let (vmt_ty, init) = if info.is_class {
                 let [class_name, cleanup] = self.class_header_words(name);
+                let interfaces = self.interface_table(name)?;
                 let vmt_ty = self.context.struct_type(
                     &[
                         i64_ty.into(),
                         i64_ty.into(),
+                        ptr.into(),
                         ptr.into(),
                         ptr.into(),
                         ptr.into(),
@@ -401,6 +444,7 @@ impl<'ctx> CodeGen<'ctx> {
                     parent_link.into(),
                     class_name.into(),
                     cleanup.into(),
+                    interfaces.into(),
                     ptr.const_array(&slot_values).into(),
                 ]);
                 (vmt_ty, init)
@@ -424,6 +468,7 @@ impl<'ctx> CodeGen<'ctx> {
             let cell = self.module.get_global(&format!("vmtref.{name}")).unwrap();
             cell.set_initializer(&vmt.as_pointer_value());
         }
+        Ok(())
     }
 
     /// The VMT of an object type.
@@ -816,6 +861,10 @@ impl<'ctx> CodeGen<'ctx> {
         args: &[Expr],
         span: Span,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodeGenError> {
+        // Through an interface reference.
+        if let Some(intf) = self.interface_of(&self.infer_declared_type(object)) {
+            return self.compile_interface_call(&intf, object, method, args, span);
+        }
         // `TAncestor.Method(...)` inside a method: that type's
         // implementation, called on Self without virtual dispatch.
         // `TFoo.Create(...)`, `TFoo.ClassName`: a call on the class.

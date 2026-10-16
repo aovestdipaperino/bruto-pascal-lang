@@ -183,6 +183,9 @@ pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
             for a in &mut obj.parent_args {
                 rewrite_type(a, n);
             }
+            for i in &mut obj.interfaces {
+                *i = n.rename(i);
+            }
             for (vname, vty) in &mut obj.class_vars {
                 *vname = n.rename_member(vname);
                 rewrite_type(vty, n);
@@ -208,7 +211,7 @@ pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
                 }
             }
         }
-        PascalType::ClassOf(name) => *name = n.rename(name),
+        PascalType::ClassOf(name) | PascalType::Interface(name) => *name = n.rename(name),
         PascalType::Specialize { name, args } => {
             *name = n.rename(name);
             for a in args {

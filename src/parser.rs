@@ -2181,7 +2181,7 @@ impl Parser {
         if *self.peek() == Tok::KwRecord {
             return self.parse_record_type();
         }
-        if *self.peek() == Tok::KwObject {
+        if matches!(self.peek(), Tok::KwObject | Tok::KwInterface) {
             return self.parse_object_type();
         }
         if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("class")) {
@@ -2417,10 +2417,12 @@ impl Parser {
     /// or declared with no members (`EFoo = class(Exception);`), and may
     /// have class methods and properties.
     fn parse_object_type(&mut self) -> Result<PascalType, ParseError> {
-        let is_class = *self.peek() != Tok::KwObject;
+        let is_interface = *self.peek() == Tok::KwInterface;
+        let is_class = !is_interface && *self.peek() != Tok::KwObject;
         self.advance();
         let mut parent = None;
         let mut parent_args = Vec::new();
+        let mut interfaces = Vec::new();
         if *self.peek() == Tok::LParen {
             self.advance();
             if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("specialize")) {
@@ -2431,12 +2433,34 @@ impl Parser {
             if *self.peek() == Tok::Lt {
                 parent_args = self.parse_type_args()?;
             }
-            // Implemented interfaces are accepted and ignored.
+            // The interfaces it implements (`IBox<Integer>` by a hidden
+            // alias).
             while *self.peek() == Tok::Comma {
                 self.advance();
-                self.expect_ident()?;
+                if matches!(self.peek(), Tok::Ident(w) if w.eq_ignore_ascii_case("specialize")) {
+                    self.advance();
+                }
+                let (name, span) = self.expect_ident()?;
+                if *self.peek() == Tok::Lt {
+                    let args = self.parse_type_args()?;
+                    interfaces.push(self.hidden_specialization(name, args, span));
+                } else {
+                    interfaces.push(name);
+                }
             }
             self.expect(&Tok::RParen)?;
+        }
+        // An interface's GUID: `['{...}']`.
+        let mut guid = None;
+        if is_interface && *self.peek() == Tok::LBracket {
+            self.advance();
+            if let Tok::StrLit(text) = self.peek().clone() {
+                guid = Some(text);
+                self.advance();
+            } else {
+                self.parse_expr()?;
+            }
+            self.expect(&Tok::RBracket)?;
         }
         let mut obj = ObjectType {
             parent,
@@ -2447,11 +2471,14 @@ impl Parser {
             properties: Vec::new(),
             class_vars: Vec::new(),
             parent_args,
+            is_interface,
+            interfaces,
+            guid,
         };
         // After `class var`, fields are class variables until the next
         // section.
         let mut in_class_vars = false;
-        if is_class && *self.peek() == Tok::Semi {
+        if (is_class || is_interface) && *self.peek() == Tok::Semi {
             obj.is_forward = obj.parent.is_none();
             return Ok(PascalType::Object(Box::new(obj)));
         }
@@ -2507,7 +2534,7 @@ impl Parser {
                 }
                 Tok::Ident(word)
                     if word.eq_ignore_ascii_case("property")
-                        && is_class
+                        && (is_class || is_interface)
                         && matches!(self.tokens.get(self.pos + 1), Some((Tok::Ident(_), _))) =>
                 {
                     self.advance();
@@ -2839,6 +2866,7 @@ impl Parser {
             let (pname, _) = self.expect_ident()?;
             let ty = self.parse_proc_signature(is_func)?;
             return Ok(ParamGroup {
+                is_const: false,
                 mode: ParamMode::Value,
                 names: vec![pname],
                 ty,
@@ -2878,6 +2906,7 @@ impl Parser {
                 names,
                 ty: PascalType::Untyped,
                 default: None,
+                is_const: false,
             });
         }
         self.expect(&Tok::Colon)?;
@@ -2904,6 +2933,7 @@ impl Parser {
             names,
             ty,
             default,
+            is_const: keyword == Some("const"),
         })
     }
 

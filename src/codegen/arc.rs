@@ -35,7 +35,10 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn holds_counted_string(&self, ty: &PascalType) -> bool {
         match self.resolve_type(ty) {
-            PascalType::String | PascalType::UnicodeString | PascalType::DynArray(_) => true,
+            PascalType::String
+            | PascalType::UnicodeString
+            | PascalType::DynArray(_)
+            | PascalType::Interface(_) => true,
             PascalType::Array { elem, .. } => self.holds_counted_string(&elem),
             PascalType::Record { fields, .. } => {
                 fields.iter().any(|(_, t)| self.holds_counted_string(t))
@@ -67,6 +70,11 @@ impl<'ctx> CodeGen<'ctx> {
                 self.arc_call("bruto_astr_addref", p, span)
             }
             PascalType::UnicodeString => Ok(()),
+            PascalType::Interface(_) => {
+                let (obj, itable) = self.interface_parts(val, span)?;
+                self.call_ustr_runtime("bruto_intf_addref", &[obj.into(), itable.into()], span)?;
+                Ok(())
+            }
             resolved => {
                 // An aggregate: from a temporary copy.
                 let temp = self
@@ -124,6 +132,18 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?
                     .into_pointer_value();
                 self.arc_call(op, s, span)
+            }
+            // A record result's interfaces pass to the caller as they are.
+            PascalType::Interface(_) if op == "bruto_astr_return" => Ok(()),
+            PascalType::Interface(_) => {
+                let value = self
+                    .builder
+                    .build_load(self.method_pointer_type(), slot, "arc_intf")
+                    .map_err(err)?;
+                let (obj, itable) = self.interface_parts(value, span)?;
+                let op = op.replace("bruto_astr_", "bruto_intf_");
+                self.call_ustr_runtime(&op, &[obj.into(), itable.into()], span)?;
+                Ok(())
             }
             PascalType::Record { ref fields, .. } => {
                 let record_ty = self.llvm_type_for(&self.resolve_type(ty));

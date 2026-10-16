@@ -28,6 +28,7 @@ mod closures;
 mod dynarrays;
 mod exceptions;
 mod forin;
+mod interfaces;
 mod layout;
 mod objects;
 mod strings;
@@ -186,6 +187,16 @@ pub struct CodeGen<'ctx> {
     // Whether the program declares classes, so statements are rewritten
     // (see `classes.rs`).
     has_classes: bool,
+    /// The current routine's hidden slots holding interface references
+    /// that calls returned or `as` made, released when it returns (as
+    /// FPC's temps), in the order they were made.
+    intf_temps: Vec<PointerValue<'ctx>>,
+    /// Those of `intf_temps` that calls' results share.
+    intf_pool: Vec<PointerValue<'ctx>>,
+    /// How many of `intf_pool` the statements being compiled use; the
+    /// rest are free for the next statement, which releases what they
+    /// still hold when it reuses them.
+    intf_temps_used: usize,
     // Classes whose instance cleanup routines still need bodies.
     class_cleanups: Vec<String>,
     // Other names of object types and classes: alias -> the type.
@@ -298,6 +309,9 @@ impl<'ctx> CodeGen<'ctx> {
             debug_pointer_depth: std::cell::Cell::new(0),
             objects: HashMap::new(),
             has_classes: false,
+            intf_temps: Vec::new(),
+            intf_pool: Vec::new(),
+            intf_temps_used: 0,
             class_cleanups: Vec::new(),
             class_aliases: HashMap::new(),
             runtime_error_stubs: std::cell::RefCell::new(Vec::new()),
@@ -576,6 +590,14 @@ impl<'ctx> CodeGen<'ctx> {
         // declaration order, so their fields can use any other type and
         // each one's parent is ready before it.
         for td in &program.type_decls {
+            // An interface's name means a reference to one.
+            if let PascalType::Object(decl) = &td.ty
+                && decl.is_interface
+            {
+                self.has_classes = true;
+                self.type_defs
+                    .insert(td.name.clone(), PascalType::Interface(td.name.clone()));
+            }
             // A class's name means a reference to an instance.
             if let PascalType::Object(decl) = &td.ty
                 && decl.is_class
@@ -607,9 +629,20 @@ impl<'ctx> CodeGen<'ctx> {
             self.register_enum_values(ty);
         }
 
+        // Interfaces first: a class may implement a specialization made
+        // after it.
+        for td in &program.type_decls {
+            if let PascalType::Object(decl) = &td.ty
+                && decl.is_interface
+                && !decl.is_forward
+            {
+                self.register_interface(&td.name, decl, td.span)?;
+            }
+        }
         for td in &program.type_decls {
             if let PascalType::Object(decl) = &td.ty
                 && !decl.is_forward
+                && !decl.is_interface
             {
                 self.register_object(&td.name, decl, td.span)?;
             }
@@ -627,7 +660,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
         }
-        self.emit_vmts();
+        self.emit_vmts()?;
 
         self.declare_system_variables();
         self.register_exit_procs();
@@ -732,6 +765,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.begin_exit_block(main_fn);
         self.compile_block(&program.body)?;
         self.enter_exit_block(program.body.end_span)?;
+        self.release_interface_temps(program.body.end_span)?;
 
         // Return 0 — debug-loc on `end.` so the ret instruction is associated
         // with that source line. When the user steps past `end.`, lldb
@@ -1134,6 +1168,7 @@ impl<'ctx> CodeGen<'ctx> {
                 | PascalType::DynArray(_)
                 | PascalType::OpenArray(_)
                 | PascalType::Specialize { .. }
+                | PascalType::Interface(_)
                 | PascalType::ShortString { .. } => {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
@@ -1676,6 +1711,17 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_routine(&mut self, proc: &ProcDecl) -> Result<(), CodeGenError> {
+        let saved_temps = std::mem::take(&mut self.intf_temps);
+        let saved_pool = std::mem::take(&mut self.intf_pool);
+        let saved_used = std::mem::replace(&mut self.intf_temps_used, 0);
+        let result = self.compile_routine_body(proc);
+        self.intf_temps = saved_temps;
+        self.intf_pool = saved_pool;
+        self.intf_temps_used = saved_used;
+        result
+    }
+
+    fn compile_routine_body(&mut self, proc: &ProcDecl) -> Result<(), CodeGenError> {
         // A method implementation, `procedure TFoo.Bar`, belongs to a
         // method declared in TFoo's type.
         let method = match &proc.owner {
@@ -1895,6 +1941,13 @@ impl<'ctx> CodeGen<'ctx> {
         let proc_name = proc.name.clone();
         self.emit_prof_enter(&proc_name, proc.span.line)?;
 
+        // `const` interface parameters, which aren't counted.
+        let uncounted: Vec<&String> = proc
+            .params
+            .iter()
+            .filter(|g| g.is_const && self.interface_of(&g.ty).is_some())
+            .flat_map(|g| g.names.iter())
+            .collect();
         // Create allocas for parameters
         for (i, (name, mode, ty)) in param_info.iter().enumerate() {
             let param_val = func.get_nth_param(i as u32).unwrap();
@@ -1912,7 +1965,13 @@ impl<'ctx> CodeGen<'ctx> {
                     .entry_alloca(llvm_ty, name)
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
                 // (A short string arrives as a C string and is copied in.)
-                self.store_value_init(alloca, param_val, &resolved_ty, proc.span)?;
+                if uncounted.contains(&name) {
+                    self.builder
+                        .build_store(alloca, param_val)
+                        .map_err(|e| CodeGenError::new(e.to_string(), Some(proc.span)))?;
+                } else {
+                    self.store_value_init(alloca, param_val, &resolved_ty, proc.span)?;
+                }
                 self.variables.insert(name.clone(), alloca);
                 self.var_types.insert(name.clone(), resolved_ty);
             }
@@ -2264,6 +2323,7 @@ impl<'ctx> CodeGen<'ctx> {
             self.pop_frame(frame, proc.body.end_span)?;
         }
 
+        self.release_interface_temps(proc.body.end_span)?;
         // Release the strings held by locals and value parameters.
         if self.arc && !self.in_runtime {
             let mut locals: Vec<(String, PascalType)> = proc
@@ -2274,7 +2334,9 @@ impl<'ctx> CodeGen<'ctx> {
             locals.extend(
                 param_info
                     .iter()
-                    .filter(|(_, mode, _)| *mode == ParamMode::Value)
+                    .filter(|(name, mode, _)| {
+                        *mode == ParamMode::Value && !uncounted.contains(&name)
+                    })
                     .map(|(name, _, ty)| (name.clone(), ty.clone())),
             );
             locals.retain(|(_, ty)| self.needs_arc(ty));
@@ -2325,6 +2387,7 @@ impl<'ctx> CodeGen<'ctx> {
                         let p = self.ustr_ptr(ret_val, proc.span)?;
                         self.call_ustr_runtime("bruto_astr_return", &[p.into()], proc.span)?;
                     }
+                    // An interface's reference passes to the caller's temp.
                     _ => {}
                 }
             }
@@ -2498,6 +2561,9 @@ impl<'ctx> CodeGen<'ctx> {
         expr: &Expr,
         target: &PascalType,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        if let Some(intf) = self.interface_of(target) {
+            return self.compile_interface_value(expr, &intf);
+        }
         if matches!(
             self.resolve_type(target),
             PascalType::Proc {
@@ -2558,6 +2624,20 @@ impl<'ctx> CodeGen<'ctx> {
             )
         {
             return Ok(self.resolve_array_base(expr, expr.span())?.0.into());
+        }
+        self.compile_expr(expr)
+    }
+
+    /// `expr`, to be stored into `place`: converted for it when it holds an
+    /// interface reference.
+    fn compile_value_for(
+        &mut self,
+        place: &Expr,
+        expr: &Expr,
+    ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let ty = self.infer_declared_type(place);
+        if self.interface_of(&ty).is_some() {
+            return self.compile_expr_for(expr, &ty);
         }
         self.compile_expr(expr)
     }
@@ -2782,7 +2862,10 @@ impl<'ctx> CodeGen<'ctx> {
             return self.compile_statement_inner(stmt);
         }
         let mark = self.pool_mark(stmt.span())?;
-        self.compile_statement_inner(stmt)?;
+        let temps_used = self.intf_temps_used;
+        let result = self.compile_statement_inner(stmt);
+        self.intf_temps_used = temps_used;
+        result?;
         if self.block_is_open() {
             self.pool_drain(mark, stmt.span())?;
         }
@@ -2823,7 +2906,8 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Statement::DerefAssignment { target, expr, span } => {
                 self.set_debug_loc(*span);
-                let val = self.compile_expr(expr)?;
+                let place = Expr::Deref(Box::new(Expr::Var(target.clone(), *span)), *span);
+                let val = self.compile_value_for(&place, expr)?;
                 let alloca = *self.lookup_var(target.as_str()).ok_or_else(|| {
                     CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
                 })?;
@@ -2915,7 +2999,12 @@ impl<'ctx> CodeGen<'ctx> {
             } => {
                 self.set_debug_loc(*span);
                 let idx_val = self.compile_expr(index)?;
-                let val = self.compile_expr(expr)?;
+                let place = Expr::Index {
+                    array: Box::new(Expr::Var(target.clone(), *span)),
+                    index: Box::new(index.clone()),
+                    span: *span,
+                };
+                let val = self.compile_value_for(&place, expr)?;
                 let alloca = *self.lookup_var(target.as_str()).ok_or_else(|| {
                     CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
                 })?;
@@ -2943,7 +3032,15 @@ impl<'ctx> CodeGen<'ctx> {
                 span,
             } => {
                 self.set_debug_loc(*span);
-                let val = self.compile_expr(expr)?;
+                let mut place = Expr::Var(target.clone(), *span);
+                for index in indices {
+                    place = Expr::Index {
+                        array: Box::new(place),
+                        index: Box::new(index.clone()),
+                        span: *span,
+                    };
+                }
+                let val = self.compile_value_for(&place, expr)?;
                 let alloca = *self.lookup_var(target.as_str()).ok_or_else(|| {
                     CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
                 })?;
@@ -2993,7 +3090,12 @@ impl<'ctx> CodeGen<'ctx> {
                 span,
             } => {
                 self.set_debug_loc(*span);
-                let val = self.compile_expr(expr)?;
+                let place = Expr::FieldAccess {
+                    record: Box::new(Expr::Var(target.clone(), *span)),
+                    field: field.clone(),
+                    span: *span,
+                };
+                let val = self.compile_value_for(&place, expr)?;
                 let alloca = *self.lookup_var(target.as_str()).ok_or_else(|| {
                     CodeGenError::new(format!("undefined variable '{target}'"), Some(*span))
                 })?;
@@ -3578,7 +3680,23 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let val = self.compile_expr(expr)?;
+        let mut place = Expr::Var(target.to_string(), span);
+        for access in chain {
+            place = match access {
+                LValueAccess::Field(f) => Expr::FieldAccess {
+                    record: Box::new(place),
+                    field: f.clone(),
+                    span,
+                },
+                LValueAccess::Index(i) => Expr::Index {
+                    array: Box::new(place),
+                    index: Box::new(i.clone()),
+                    span,
+                },
+                LValueAccess::Deref => Expr::Deref(Box::new(place), span),
+            };
+        }
+        let val = self.compile_value_for(&place, expr)?;
 
         let mut ptr = *self.lookup_var(target).ok_or_else(|| {
             CodeGenError::new(format!("undefined variable '{target}'"), Some(span))
@@ -3746,7 +3864,7 @@ impl<'ctx> CodeGen<'ctx> {
             // Object declarations are lowered to records when registered.
             PascalType::Object(_) => 0,
             PascalType::ClassOf(_) | PascalType::VarParam(_) | PascalType::DynArray(_) => 8,
-            PascalType::OpenArray(_) => 16,
+            PascalType::OpenArray(_) | PascalType::Interface(_) => 16,
             // Replaced by the generics pass before code generation.
             PascalType::Specialize { .. } => 8,
             PascalType::ShortString { max } => *max as u64 + 1,
@@ -5851,6 +5969,23 @@ impl<'ctx> CodeGen<'ctx> {
     // ── expressions ──────────────────────────────────────
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        let value = self.compile_expr_inner(expr)?;
+        // An interface a function returned is held until the routine ends.
+        if matches!(
+            expr,
+            Expr::Call { .. }
+                | Expr::MethodCall { .. }
+                | Expr::IndirectCall { .. }
+                | Expr::Inherited { .. }
+        ) && value.is_struct_value()
+            && self.interface_of(&self.infer_declared_type(expr)).is_some()
+        {
+            self.hold_interface_temp(value, true, expr.span())?;
+        }
+        Ok(value)
+    }
+
+    fn compile_expr_inner(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         match expr {
             // Length/High/Low/Copy of a dynamic or open array.
             Expr::Call { name, args, span }
@@ -6311,6 +6446,15 @@ impl<'ctx> CodeGen<'ctx> {
                             .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                         return self.widen_loaded(loaded, &target, *span);
                     }
+                    // `IFoo(Obj)`, `IFoo(Other)`: a reference to IFoo.
+                    if let PascalType::Interface(intf) = &target {
+                        let intf = self
+                            .class_aliases
+                            .get(intf)
+                            .cloned()
+                            .unwrap_or(intf.clone());
+                        return self.interface_cast(&args[0], &intf, *span);
+                    }
                     // `ShortString(Buf)` with an untyped `Buf`: the short
                     // string stored there.
                     if let PascalType::ShortString { .. } = target
@@ -6437,6 +6581,11 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 if name == "typeof" && args.len() == 1 {
                     return self.compile_typeof(&args[0], *span);
+                }
+                if name == "supports"
+                    && let Some(found) = self.compile_supports(args, *span)?
+                {
+                    return Ok(found);
                 }
                 if name == "assigned" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
@@ -7732,6 +7881,8 @@ impl<'ctx> CodeGen<'ctx> {
             // `{ first element's address, highest index }`.
             PascalType::OpenArray(_) => self.open_array_type().as_basic_type_enum(),
             PascalType::Specialize { .. } => self.context.i64_type().as_basic_type_enum(),
+            // `{ instance, method table }`.
+            PascalType::Interface(_) => self.method_pointer_type().as_basic_type_enum(),
             // Constant-expression types are folded by the semantic pass;
             // `ArrayExpr` can't reach here.
             PascalType::Integer
@@ -7924,9 +8075,10 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         // `Ev = nil`, `Ev <> Other`: method pointers compare by their code.
         if matches!(op, BinOp::Eq | BinOp::Neq)
-            && [left, right]
-                .iter()
-                .any(|e| Self::is_method_pointer(&self.resolve_type(&self.infer_declared_type(e))))
+            && [left, right].iter().any(|e| {
+                let ty = self.resolve_type(&self.infer_declared_type(e));
+                Self::is_method_pointer(&ty) || matches!(ty, PascalType::Interface(_))
+            })
         {
             let l = self.compile_expr(left)?;
             let l = self.code_part(l, span)?;
@@ -9248,6 +9400,22 @@ impl<'ctx> CodeGen<'ctx> {
                 method,
                 args,
                 ..
+            } if self
+                .interface_of(&self.infer_declared_type(object))
+                .is_some() =>
+            {
+                let intf = self
+                    .interface_of(&self.infer_declared_type(object))
+                    .unwrap();
+                let method = self.method_overload(&intf, method, args);
+                self.method_result_type(&intf, &method)
+                    .unwrap_or(PascalType::Integer)
+            }
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
             } => {
                 let ty = self.infer_declared_type(object);
                 self.object_name_of(&ty)
@@ -9407,7 +9575,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 // Built-in functions
                 match name.as_str() {
-                    "assigned" => PascalType::Boolean,
+                    "assigned" | "supports" => PascalType::Boolean,
                     "integer" => PascalType::Integer,
                     "real" => PascalType::Real,
                     "char" => PascalType::Char,

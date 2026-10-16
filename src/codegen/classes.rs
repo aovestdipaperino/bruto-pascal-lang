@@ -48,7 +48,15 @@ struct ArrayProperty {
 }
 
 /// Built-ins whose arguments name a type rather than give a value.
-const TYPE_ARG_BUILTINS: &[&str] = &["sizeof", "typeof", "bitsizeof", "high", "low", "default"];
+const TYPE_ARG_BUILTINS: &[&str] = &[
+    "sizeof",
+    "typeof",
+    "bitsizeof",
+    "high",
+    "low",
+    "default",
+    "supports",
+];
 
 impl<'ctx> CodeGen<'ctx> {
     /// Whether `name` is a class type (not hidden by a variable).
@@ -351,6 +359,18 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        // With an interface on either side.
+        if let Expr::Var(name, _) = right
+            && (self.is_interface_name(name)
+                || self.interface_of(&self.infer_declared_type(left)).is_some())
+        {
+            let name = self
+                .class_aliases
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            return self.compile_interface_test(op, left, &name, span);
+        }
         let class = match right {
             Expr::Var(name, _) if self.is_class_name(name) => name.clone(),
             _ => {
@@ -458,6 +478,29 @@ impl<'ctx> CodeGen<'ctx> {
                     return self
                         .member_write(recv, &class, field, d(expr)?, *span)
                         .map(Some);
+                }
+                // `I.Prop := X`: the property's setter, through an
+                // interface reference.
+                if let Some(intf) = self.interface_of(&self.infer_declared_type(&recv)) {
+                    let setter = match self.objects[&intf].properties.get(field) {
+                        Some(PropertyDecl { write: Some(s), .. }) => s.clone(),
+                        _ => {
+                            return Err(CodeGenError::new(
+                                format!(
+                                    "'{}' has no property '{}' to assign",
+                                    self.display(&intf),
+                                    self.display(field)
+                                ),
+                                Some(*span),
+                            ));
+                        }
+                    };
+                    return Ok(Some(Statement::MethodCall {
+                        object: recv,
+                        method: setter,
+                        args: vec![d(expr)?],
+                        span: *span,
+                    }));
                 }
                 if self.lookup_var(target).is_none() && self.implicit_property(target).is_some() {
                     let place = Expr::FieldAccess {
@@ -813,6 +856,12 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some((class, prop, recv)) = self.implicit_property(name) {
                     return self.property_read(recv, &class, &prop, vec![], *span);
                 }
+                // An interface's name as a value: its GUID.
+                if self.is_interface_name(name)
+                    && let Some(guid) = self.guid_constant(name)
+                {
+                    return Ok(Expr::Var(guid, *span));
+                }
                 expr.clone()
             }
             Expr::FieldAccess {
@@ -842,6 +891,22 @@ impl<'ctx> CodeGen<'ctx> {
                 let ty = self.infer_declared_type(&rec);
                 if let Some(class) = self.class_instance_of(&ty) {
                     return self.member_read(rec, &class, field, *span);
+                }
+                // `I.Name`: a property's getter or a method, through an
+                // interface reference.
+                if let Some(intf) = self.interface_of(&ty) {
+                    let method = match self.objects[&intf].properties.get(field) {
+                        Some(PropertyDecl {
+                            read: Some(getter), ..
+                        }) => getter.clone(),
+                        _ => field.clone(),
+                    };
+                    return Ok(Expr::MethodCall {
+                        object: Box::new(rec),
+                        method,
+                        args: Vec::new(),
+                        span: *span,
+                    });
                 }
                 if self.class_ref_of(&ty).is_some() {
                     return Ok(Expr::MethodCall {

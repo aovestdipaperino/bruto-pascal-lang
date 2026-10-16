@@ -825,7 +825,7 @@ impl ConstEnv {
                     self.resolve_type(&mut p.ty, p.span)?;
                 }
             }
-            PascalType::ClassOf(_) => {}
+            PascalType::ClassOf(_) | PascalType::Interface(_) => {}
             PascalType::Specialize { args, .. } => {
                 for a in args {
                     self.resolve_type(a, span)?;

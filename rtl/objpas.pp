@@ -6,14 +6,23 @@
   from it.
 
   A class's VMT starts with the instance size, its negation, a link to
-  the parent's VMT, the class name and the routine that releases the
-  strings an instance holds; the virtual methods follow. }
+  the parent's VMT, the class name, the routine that releases the
+  strings an instance holds and the table of the interfaces the class
+  implements; the virtual methods follow. }
 unit ObjPas;
 
 interface
 
 type
   TClass = class of TObject;
+
+  PGUID = ^TGUID;
+  TGUID = record
+    D1: LongWord;
+    D2: Word;
+    D3: Word;
+    D4: array[0..7] of Byte;
+  end;
 
   PExtended = ^Double;
   PInt64 = ^Int64;
@@ -64,7 +73,33 @@ type
     function Equals(Obj: TObject): Boolean; virtual;
     function GetHashCode: PtrInt; virtual;
     function ToString: AnsiString; virtual;
+    { Whether the class implements the interface whose GUID is IID; if
+      so, Obj gets a reference to it. }
+    function GetInterface(const IID: TGUID; out Obj): Boolean;
   end;
+
+  IInterface = interface
+    ['{00000000-0000-0000-C000-000000000046}']
+    function QueryInterface(constref IID: TGUID; out Obj): LongInt;
+    function _AddRef: LongInt;
+    function _Release: LongInt;
+  end;
+  IUnknown = IInterface;
+
+  { An object freed when the last interface reference to it goes. }
+  TInterfacedObject = class(TObject, IUnknown)
+  protected
+    FRefCount: LongInt;
+    function QueryInterface(constref IID: TGUID; out Obj): LongInt;
+    function _AddRef: LongInt;
+    function _Release: LongInt;
+  public
+    property RefCount: LongInt read FRefCount;
+  end;
+
+const
+  S_OK = 0;
+  E_NOINTERFACE = LongInt($80004002);
 
 const
   vtInteger = 0;
@@ -273,6 +308,69 @@ end;
 function TObject.ToString: AnsiString;
 begin
   ToString := ClassName;
+end;
+
+type
+  PBrutoWords = ^TBrutoWords;
+  TBrutoWords = array[0..$FFFFFF] of Pointer;
+  PBrutoGUIDBytes = ^TBrutoGUIDBytes;
+  TBrutoGUIDBytes = array[0..15] of Byte;
+  TBrutoIntfCount = function(Obj: Pointer): LongInt;
+
+function TObject.GetInterface(const IID: TGUID; out Obj): Boolean;
+var
+  Table, Desc, ITable: Pointer;
+  Count, I, J: Int64;
+  Same: Boolean;
+  AddRef: TBrutoIntfCount;
+begin
+  GetInterface := False;
+  Table := PBrutoWords(PBrutoWords(Pointer(Self))^[0])^[5];
+  if Table = nil then
+    Exit;
+  Count := PInt64(Table)^;
+  I := 0;
+  while I < Count do
+  begin
+    Desc := PBrutoWords(Table)^[1 + I * 2];
+    Same := True;
+    for J := 0 to 15 do
+      if PBrutoGUIDBytes(Desc)^[J] <> PBrutoGUIDBytes(@IID)^[J] then
+        Same := False;
+    if Same then
+    begin
+      ITable := PBrutoWords(Table)^[2 + I * 2];
+      PBrutoWords(@Obj)^[0] := Pointer(Self);
+      PBrutoWords(@Obj)^[1] := ITable;
+      AddRef := TBrutoIntfCount(PBrutoWords(ITable)^[1]);
+      AddRef(Pointer(Self));
+      GetInterface := True;
+      Exit;
+    end;
+    I := I + 1;
+  end;
+end;
+
+function TInterfacedObject.QueryInterface(constref IID: TGUID; out Obj): LongInt;
+begin
+  if GetInterface(IID, Obj) then
+    QueryInterface := S_OK
+  else
+    QueryInterface := E_NOINTERFACE;
+end;
+
+function TInterfacedObject._AddRef: LongInt;
+begin
+  FRefCount := FRefCount + 1;
+  _AddRef := FRefCount;
+end;
+
+function TInterfacedObject._Release: LongInt;
+begin
+  FRefCount := FRefCount - 1;
+  _Release := FRefCount;
+  if FRefCount = 0 then
+    Destroy;
 end;
 
 end.

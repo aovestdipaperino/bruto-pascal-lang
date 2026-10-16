@@ -111,6 +111,12 @@ procedure bruto_astr_release(S: Pointer);
 procedure bruto_astr_return(S: Pointer);
 function bruto_pool_mark: Int64;
 procedure bruto_pool_drain(Mark: Int64);
+{ Interface references (Obj, ITable): counted through the itable's
+  _AddRef and _Release. }
+procedure bruto_intf_addref(Obj, ITable: Pointer);
+procedure bruto_intf_release(Obj, ITable: Pointer);
+{ The itable of the interface described by Desc in Obj's class, or nil. }
+function bruto_intf_find(Obj, Desc: Pointer): Pointer;
 { Write S to the console (and the IDE's capture), #0 characters included. }
 procedure bruto_astr_write(S: Pointer);
 
@@ -207,6 +213,54 @@ begin
   BrutoPool^[BrutoPoolCount] := S;
   BrutoPoolCount := BrutoPoolCount + 1;
   PBrutoMarker(S - 16)^ := PBrutoMarker(S - 16)^ or BrutoAStrPooled;
+end;
+
+type
+  TBrutoIntfCount = function(Obj: Pointer): LongInt;
+
+procedure bruto_intf_addref(Obj, ITable: Pointer);
+var
+  F: TBrutoIntfCount;
+begin
+  if Obj = nil then
+    Exit;
+  F := TBrutoIntfCount(PBrutoPointers(ITable)^[1]);
+  F(Obj);
+end;
+
+procedure bruto_intf_release(Obj, ITable: Pointer);
+var
+  F: TBrutoIntfCount;
+begin
+  if Obj = nil then
+    Exit;
+  F := TBrutoIntfCount(PBrutoPointers(ITable)^[2]);
+  F(Obj);
+end;
+
+function bruto_intf_find(Obj, Desc: Pointer): Pointer;
+var
+  Table: Pointer;
+  I, Count: Int64;
+begin
+  bruto_intf_find := nil;
+  if Obj = nil then
+    Exit;
+  { The table is the VMT's sixth word. }
+  Table := PBrutoPointers(PBrutoPointers(Obj)^[0])^[5];
+  if Table = nil then
+    Exit;
+  Count := PBrutoLength(Table)^;
+  I := 0;
+  while I < Count do
+  begin
+    if PBrutoPointers(Table)^[1 + I * 2] = Desc then
+    begin
+      bruto_intf_find := PBrutoPointers(Table)^[2 + I * 2];
+      Exit;
+    end;
+    I := I + 1;
+  end;
 end;
 
 type

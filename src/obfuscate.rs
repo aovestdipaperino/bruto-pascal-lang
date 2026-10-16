@@ -180,7 +180,7 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
                 collect_type(&p.ty, n);
             }
         }
-        PascalType::ClassOf(_) => {}
+        PascalType::ClassOf(_) | PascalType::Interface(_) => {}
         PascalType::Specialize { args, .. } => {
             for a in args {
                 collect_type(a, n);

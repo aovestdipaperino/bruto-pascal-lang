@@ -5232,6 +5232,461 @@ end.
     }
 
     #[test]
+    fn interfaces_com() {
+        let (ok, out) = build_and_run_source(
+            "program Intf1;
+{$mode objfpc}{$H+}
+
+uses SysUtils;
+
+type
+  IGreeter = interface
+    ['{6A1F3C2E-1B2D-4E5F-8A9B-0C1D2E3F4A5B}']
+    function Greet(const Name: string): string;
+    procedure SetPrefix(const P: string);
+    function GetPrefix: string;
+    property Prefix: string read GetPrefix write SetPrefix;
+  end;
+
+  ICounter = interface
+    ['{11111111-2222-3333-4444-555555555555}']
+    function Next: Integer;
+  end;
+
+  ILoudGreeter = interface(IGreeter)
+    ['{22222222-2222-3333-4444-555555555555}']
+    function Shout(const Name: string): string;
+  end;
+
+  TGreeter = class(TInterfacedObject, IGreeter, ILoudGreeter, ICounter)
+  private
+    FPrefix: string;
+    FCount: Integer;
+  public
+    constructor Create(const P: string);
+    destructor Destroy; override;
+    function Greet(const Name: string): string; virtual;
+    procedure SetPrefix(const P: string);
+    function GetPrefix: string;
+    function Shout(const Name: string): string;
+    function Next: Integer;
+  end;
+
+  TPolite = class(TGreeter)
+    function Greet(const Name: string): string; override;
+  end;
+
+  TPlain = class(TInterfacedObject)
+  end;
+
+constructor TGreeter.Create(const P: string);
+begin
+  inherited Create;
+  FPrefix := P;
+  WriteLn('create ', P);
+end;
+
+destructor TGreeter.Destroy;
+begin
+  WriteLn('destroy ', FPrefix);
+  inherited Destroy;
+end;
+
+function TGreeter.Greet(const Name: string): string;
+begin
+  Result := FPrefix + ', ' + Name;
+end;
+
+procedure TGreeter.SetPrefix(const P: string);
+begin
+  FPrefix := P;
+end;
+
+function TGreeter.GetPrefix: string;
+begin
+  Result := FPrefix;
+end;
+
+function TGreeter.Shout(const Name: string): string;
+begin
+  Result := UpperCase(Greet(Name)) + '!';
+end;
+
+function TGreeter.Next: Integer;
+begin
+  Inc(FCount);
+  Result := FCount;
+end;
+
+function TPolite.Greet(const Name: string): string;
+begin
+  Result := 'Dear ' + inherited Greet(Name);
+end;
+
+function MakeGreeter(const P: string): IGreeter;
+begin
+  Result := TGreeter.Create(P);
+end;
+
+procedure UseIt(G: IGreeter);
+begin
+  WriteLn(G.Greet('param'));
+end;
+
+var
+  G: IGreeter;
+  L: ILoudGreeter;
+  C: ICounter;
+  Obj: TGreeter;
+  U: IUnknown;
+  P: TPlain;
+begin
+  G := TGreeter.Create('Hello');
+  WriteLn(G.Greet('World'));
+  G.Prefix := 'Hi';
+  WriteLn(G.Prefix);
+  if G is ILoudGreeter then
+    WriteLn('loud');
+  L := G as ILoudGreeter;
+  WriteLn(L.Shout('there'));
+  C := G as ICounter;
+  WriteLn(C.Next, ' ', C.Next);
+  WriteLn('nil before: ', G = nil);
+  G := nil;
+  WriteLn('after G := nil');
+  L := nil;
+  WriteLn('after L := nil');
+  C := nil;
+  WriteLn('after C := nil');
+
+  WriteLn(MakeGreeter('Temp').Greet('x'));
+  WriteLn('after temp');
+
+  G := TPolite.Create('Yo');
+  WriteLn(G.Greet('Sir'));
+  UseIt(G);
+  UseIt(TGreeter.Create('Arg'));
+  WriteLn('after arg');
+
+  Obj := TGreeter.Create('Kept');
+  G := Obj;
+  if Supports(Obj, ICounter, C) then
+    WriteLn('supports counter ', C.Next);
+  WriteLn(Supports(G, ICounter));
+  U := G;
+  WriteLn(Assigned(U));
+  P := TPlain.Create;
+  WriteLn(Supports(P, IGreeter));
+  P.Free;
+  WriteLn((G as TGreeter).GetPrefix);
+  C := nil;
+  U := nil;
+  G := nil;
+  WriteLn('end');
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "create Hello\nHello, World\nHi\nloud\nHI, THERE!\n1 2\nnil before: FALSE\nafter G := nil\nafter L := nil\nafter C := nil\ncreate Temp\nTemp, x\nafter temp\ncreate Yo\nDear Yo, Sir\nDear Yo, param\ncreate Arg\nArg, param\ndestroy Arg\nafter arg\ncreate Kept\ndestroy Yo\nsupports counter 1\nTRUE\nTRUE\nFALSE\nKept\ndestroy Kept\nend\ndestroy Temp\ndestroy Hi\n"
+        );
+    }
+
+    #[test]
+    fn interfaces_temporaries_and_fields() {
+        let (ok, out) = build_and_run_source(
+            "program Intf2;
+{$mode objfpc}{$H+}
+
+uses SysUtils, Classes;
+
+type
+  IShape = interface
+    ['{A0000000-0000-0000-0000-000000000001}']
+    function Area: Double;
+    function Name: string;
+  end;
+
+  INamed = interface
+    ['{A0000000-0000-0000-0000-000000000002}']
+    function Name: string;
+  end;
+
+  TShape = class(TInterfacedObject, IShape, INamed)
+  private
+    FName: string;
+  public
+    constructor Create(const AName: string);
+    destructor Destroy; override;
+    function Area: Double; virtual; abstract;
+    function Name: string;
+    function _AddRef: LongInt; {$IFDEF WINDOWS}stdcall{$ELSE}cdecl{$ENDIF};
+  end;
+
+  TSquare = class(TShape)
+    FSide: Double;
+    constructor Create(ASide: Double);
+    function Area: Double; override;
+  end;
+
+  TCircle = class(TShape)
+    FR: Double;
+    constructor Create(AR: Double);
+    function Area: Double; override;
+  end;
+
+  THolder = class
+    FShape: IShape;
+    destructor Destroy; override;
+  end;
+
+  TRec = record
+    S: IShape;
+    Tag: Integer;
+  end;
+
+  TShapes = array of IShape;
+
+constructor TShape.Create(const AName: string);
+begin
+  inherited Create;
+  FName := AName;
+end;
+
+destructor TShape.Destroy;
+begin
+  WriteLn('bye ', FName);
+  inherited;
+end;
+
+function TShape.Name: string;
+begin
+  Result := FName;
+end;
+
+function TShape._AddRef: LongInt; {$IFDEF WINDOWS}stdcall{$ELSE}cdecl{$ENDIF};
+begin
+  Result := inherited _AddRef;
+end;
+
+constructor TSquare.Create(ASide: Double);
+begin
+  inherited Create('square' + FloatToStr(ASide));
+  FSide := ASide;
+end;
+
+function TSquare.Area: Double;
+begin
+  Result := FSide * FSide;
+end;
+
+constructor TCircle.Create(AR: Double);
+begin
+  inherited Create('circle' + FloatToStr(AR));
+  FR := AR;
+end;
+
+function TCircle.Area: Double;
+begin
+  Result := 3 * FR * FR;
+end;
+
+destructor THolder.Destroy;
+begin
+  WriteLn('holder gone');
+  inherited;
+end;
+
+function Make(I: Integer): IShape;
+begin
+  if Odd(I) then
+    Result := TSquare.Create(I)
+  else
+    Result := TCircle.Create(I);
+end;
+
+procedure Show(const S: IShape);
+begin
+  WriteLn(S.Name, ' ', S.Area:0:1);
+end;
+
+function Total(const A: TShapes): Double;
+var
+  I: Integer;
+begin
+  Result := 0;
+  for I := 0 to High(A) do
+    Result := Result + A[I].Area;
+end;
+
+var
+  Global: IShape;
+  A: TShapes;
+  I: Integer;
+  H: THolder;
+  R: TRec;
+  N: INamed;
+  U: IInterface;
+  Q: IShape;
+begin
+  for I := 1 to 3 do
+    WriteLn(Make(I).Name);
+  WriteLn('loop done');
+
+  SetLength(A, 3);
+  for I := 0 to 2 do
+    A[I] := Make(I + 10);
+  WriteLn(Total(A):0:1);
+  A[1] := nil;
+  WriteLn('slot cleared');
+  SetLength(A, 0);
+  WriteLn('array cleared');
+
+  H := THolder.Create;
+  H.FShape := TSquare.Create(7);
+  Show(H.FShape);
+  H.Free;
+
+  R.S := TCircle.Create(5);
+  R.Tag := 1;
+  Show(R.S);
+  R.S := nil;
+
+  Global := TSquare.Create(2);
+  U := Global;
+  if U.QueryInterface(INamed, N) = S_OK then
+    WriteLn('named: ', N.Name);
+  if Supports(U, IShape, Q) then
+    Show(Q);
+  N := nil;
+  U := nil;
+  Q := nil;
+  try
+    Show(TSquare.Create(9));
+    raise Exception.Create('boom');
+  except
+    on E: Exception do
+      WriteLn('caught ', E.Message);
+  end;
+  WriteLn('end of main');
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "square1\nbye square1\ncircle2\nbye circle2\nsquare3\nloop done\nbye square3\n853.0\nbye square11\nslot cleared\nbye circle10\narray cleared\nsquare7 49.0\nholder gone\nbye square7\ncircle5 75.0\nbye circle5\nnamed: square2\nsquare2 4.0\nsquare9 81.0\ncaught boom\nend of main\nbye circle12\n"
+        );
+    }
+
+    #[test]
+    fn interfaces_casts_overloads_generics() {
+        let (ok, out) = build_and_run_source(
+            "program Intf3;
+{$mode objfpc}{$H+}
+
+type
+  IValue = interface
+    ['{B0000000-0000-0000-0000-000000000001}']
+    function Get: Integer;
+    procedure Put(V: Integer); overload;
+    procedure Put(const S: string); overload;
+  end;
+
+  generic IBox<T> = interface
+    function Value: T;
+  end;
+
+  TIntBox = class(TInterfacedObject, specialize IBox<Integer>)
+    function Value: Integer;
+  end;
+
+  TValue = class(TInterfacedObject, IValue)
+  private
+    FV: Integer;
+  public
+    function Get: Integer;
+    procedure Put(V: Integer); overload;
+    procedure Put(const S: string); overload;
+  end;
+
+  TOwner = class
+  private
+    FVal: IValue;
+  public
+    property Val: IValue read FVal write FVal;
+    function Fresh: IValue;
+  end;
+
+function TIntBox.Value: Integer;
+begin
+  Result := 42;
+end;
+
+function TValue.Get: Integer;
+begin
+  Result := FV;
+end;
+
+procedure TValue.Put(V: Integer);
+begin
+  FV := V;
+end;
+
+procedure TValue.Put(const S: string);
+begin
+  FV := Length(S);
+end;
+
+function TOwner.Fresh: IValue;
+begin
+  Result := TValue.Create;
+  Result.Put(5);
+end;
+
+procedure Swap(var A, B: IValue);
+var
+  T: IValue;
+begin
+  T := A;
+  A := B;
+  B := T;
+end;
+
+var
+  V1, V2: IValue;
+  O: TOwner;
+  Obj: TValue;
+  B: specialize IBox<Integer>;
+begin
+  Obj := TValue.Create;
+  V1 := IValue(Obj);
+  V1.Put(3);
+  WriteLn(V1.Get, ' ', Obj.RefCount);
+  V2 := V1;
+  WriteLn(V1 = V2, ' ', Obj.RefCount);
+  V2 := TValue.Create;
+  V2.Put('hello');
+  WriteLn(V1 = V2, ' ', V2.Get);
+  Swap(V1, V2);
+  WriteLn(V1.Get, ' ', V2.Get);
+  O := TOwner.Create;
+  O.Val := V1;
+  WriteLn(O.Val.Get, ' ', O.Fresh.Get);
+  O.Val := nil;
+  O.Free;
+  B := TIntBox.Create;
+  WriteLn(B.Value);
+  WriteLn(Obj.RefCount);
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "3 1\nTRUE 2\nFALSE 5\n5 3\n5 5\n42\n1\n");
+    }
+
+    #[test]
     fn generic_routines_delphi_syntax() {
         let (ok, out) = build_and_run_source(
             "program T;

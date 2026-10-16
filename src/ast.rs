@@ -117,6 +117,9 @@ pub struct ParamGroup {
     /// `X: T = Value`: the value a call that leaves the parameter out
     /// passes.
     pub default: Option<DefaultValue>,
+    /// Declared `const`: a counted value (an interface) isn't counted
+    /// again for the call, as in FPC.
+    pub is_const: bool,
 }
 
 /// A parameter's default value. Two declarations are the same whatever
@@ -266,6 +269,8 @@ pub enum PascalType {
     /// A `var` / `out` (or untyped `const`) parameter of a procedural
     /// type: passed by reference.
     VarParam(Box<PascalType>),
+    /// A reference to an interface: `{ instance, method table }`.
+    Interface(String),
     /// `specialize TList<Integer>` (or `TList<Integer>`): generic type
     /// `name` with these arguments. The generics pass replaces it with the
     /// name of the instantiation it makes.
@@ -496,6 +501,13 @@ pub struct ObjectType {
     /// The type arguments of a parent that is a specialization
     /// (`class(TBox<T>)`); the generics pass makes it a plain name.
     pub parent_args: Vec<PascalType>,
+    /// An `interface` type: methods (and properties) only.
+    pub is_interface: bool,
+    /// The interfaces a class implements (`class(TInterfacedObject,
+    /// IFoo)`).
+    pub interfaces: Vec<String>,
+    /// An interface's GUID (`['{...}']`), if given.
+    pub guid: Option<String>,
 }
 
 /// A class property: `property Name[Index: T]: T read Getter write
