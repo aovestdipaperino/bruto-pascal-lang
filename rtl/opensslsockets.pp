@@ -3,6 +3,8 @@
   TInetServer and TFPHTTPClient (https://) can talk TLS through OpenSSL. }
 unit opensslsockets;
 
+{$mode objfpc}{$H+}
+
 interface
 
 uses SysUtils, Classes, sslbase, ssockets, sslsockets, openssl;

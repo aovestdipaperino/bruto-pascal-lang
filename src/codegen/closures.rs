@@ -440,4 +440,110 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(err)?;
         Ok(value.as_basic_value_enum())
     }
+
+    /// Routine `func` as a value of the plain procedural type `proc_ty`.
+    /// When their parameters differ only in integer and real widths (a
+    /// unit in `{$mode objfpc}` has 32-bit Integers), an adapter that
+    /// converts the arguments and the result calls it.
+    pub(super) fn routine_as_procedural(
+        &mut self,
+        func: FunctionValue<'ctx>,
+        proc_ty: &PascalType,
+    ) -> Result<PointerValue<'ctx>, CodeGenError> {
+        let address = func.as_global_value().as_pointer_value();
+        let PascalType::Proc {
+            params,
+            return_type,
+            nested: false,
+            of_object: false,
+        } = self.resolve_type(proc_ty)
+        else {
+            return Ok(address);
+        };
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let param_types: Vec<BasicMetadataTypeEnum> = params
+            .iter()
+            .map(|p| match p {
+                PascalType::VarParam(_) => ptr.into(),
+                p => self.abi_type_for(&self.resolve_type(p)).into(),
+            })
+            .collect();
+        let wanted = match &return_type {
+            Some(rt) => self
+                .abi_type_for(&self.resolve_type(rt))
+                .fn_type(&param_types, false),
+            None => self.context.void_type().fn_type(&param_types, false),
+        };
+        let actual = func.get_type();
+        if actual == wanted || actual.count_param_types() != wanted.count_param_types() {
+            return Ok(address);
+        }
+        let name = format!(
+            "bruto.adapt.{}.{}",
+            func.get_name().to_string_lossy(),
+            wanted.print_to_string().to_string_lossy().len()
+        );
+        if let Some(f) = self.module.get_function(&name)
+            && f.get_type() == wanted
+        {
+            return Ok(f.as_global_value().as_pointer_value());
+        }
+        let adapter = self.module.add_function(&name, wanted, None);
+        adapter.set_linkage(Linkage::Internal);
+        let b = self.context.create_builder();
+        let entry = self.context.append_basic_block(adapter, "entry");
+        b.position_at_end(entry);
+        let convert = |v: BasicValueEnum<'ctx>,
+                       to: inkwell::types::BasicTypeEnum<'ctx>|
+         -> BasicValueEnum<'ctx> {
+            match (v, to) {
+                (BasicValueEnum::IntValue(i), inkwell::types::BasicTypeEnum::IntType(t)) => {
+                    let from = i.get_type().get_bit_width();
+                    let to_bits = t.get_bit_width();
+                    if from < to_bits {
+                        if from == 1 {
+                            b.build_int_z_extend(i, t, "adapt").unwrap().into()
+                        } else {
+                            b.build_int_s_extend(i, t, "adapt").unwrap().into()
+                        }
+                    } else if from > to_bits {
+                        b.build_int_truncate(i, t, "adapt").unwrap().into()
+                    } else {
+                        i.into()
+                    }
+                }
+                (BasicValueEnum::FloatValue(f), inkwell::types::BasicTypeEnum::FloatType(t)) => {
+                    b.build_float_cast(f, t, "adapt").unwrap().into()
+                }
+                (BasicValueEnum::IntValue(i), inkwell::types::BasicTypeEnum::FloatType(t)) => {
+                    b.build_signed_int_to_float(i, t, "adapt").unwrap().into()
+                }
+                (other, _) => other,
+            }
+        };
+        let targets = actual.get_param_types();
+        let args: Vec<BasicMetadataValueEnum> = adapter
+            .get_param_iter()
+            .zip(targets.iter())
+            .map(|(p, t)| {
+                let t: inkwell::types::BasicTypeEnum = (*t).try_into().unwrap();
+                convert(p, t).into()
+            })
+            .collect();
+        let result = b
+            .build_call(func, &args, "adapted")
+            .unwrap()
+            .try_as_basic_value()
+            .basic();
+        match (result, wanted.get_return_type()) {
+            (Some(v), Some(rt)) => {
+                let v = convert(v, rt);
+                b.build_return(Some(&v)).unwrap();
+            }
+            _ => {
+                b.build_return(None).unwrap();
+            }
+        }
+        Ok(adapter.as_global_value().as_pointer_value())
+    }
 }

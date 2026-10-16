@@ -4,6 +4,8 @@
   working handler in a program that uses it. }
 unit sslsockets;
 
+{$mode objfpc}{$H+}
+
 interface
 
 uses SysUtils, Classes, ssockets, sslbase;

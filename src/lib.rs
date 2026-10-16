@@ -4865,6 +4865,47 @@ end.
     }
 
     #[test]
+    fn integer_is_32_bits_in_objfpc_mode() {
+        let (ok, out) = build_and_run_source(
+            "program T;
+{$mode objfpc}
+type TRec = record A: Integer; B: Byte; end;
+var I: Integer;
+begin
+  I := MaxInt;
+  writeln(SizeOf(I), SizeOf(Integer), ' ', High(Integer), ' ', SizeOf(TRec));
+  I := I + 1;
+  writeln(I, ' ', Integer(5000000000));
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "44 2147483647 8\n-2147483648 705032704\n");
+        // Without a mode, Integer stays 64-bit, and a callback with such
+        // parameters still works with a unit compiled in objfpc mode.
+        let (ok, out) = build_and_run_source(
+            "program T;
+uses Classes;
+function ByLength(List: TStringList; Index1, Index2: Integer): Integer;
+begin
+  Result := Length(List[Index1]) - Length(List[Index2]);
+end;
+var L: TStringList;
+begin
+  writeln(SizeOf(Integer));
+  L := TStringList.Create;
+  L.CommaText := 'ccc,a,bb';
+  L.CustomSort(@ByLength);
+  writeln(L.CommaText);
+  L.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "8\na,bb,ccc\n");
+    }
+
+    #[test]
     fn class_instances_and_their_strings_are_freed() {
         let (ok, out) = build_and_run_source(
             "program T;

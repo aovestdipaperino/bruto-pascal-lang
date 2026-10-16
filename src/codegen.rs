@@ -2490,6 +2490,22 @@ impl<'ctx> CodeGen<'ctx> {
         ) {
             return self.compile_method_pointer(expr);
         }
+        // `P := @Routine` / `P := Routine`: adapted to P's parameter widths.
+        if let PascalType::Proc {
+            nested: false,
+            of_object: false,
+            ..
+        } = self.resolve_type(target)
+        {
+            let routine = match expr {
+                Expr::AddrOf(inner, _) => self.routine_name(inner),
+                Expr::Var(..) => self.routine_name(expr),
+                _ => None,
+            };
+            if let Some(f) = routine {
+                return Ok(self.routine_as_procedural(f, target)?.into());
+            }
+        }
         match self.resolve_type(target) {
             PascalType::OpenArray(elem) => return self.open_array_arg(expr, &elem, expr.span()),
             PascalType::DynArray(elem) => {
@@ -5098,18 +5114,15 @@ impl<'ctx> CodeGen<'ctx> {
                     Some(r) if matches!(param_ty, PascalType::Proc { nested: true, .. }) => {
                         self.make_closure(&r, &param_ty, span)?.into()
                     }
-                    Some(r) => self
-                        .module
-                        .get_function(&r)
-                        .ok_or_else(|| {
+                    Some(r) => {
+                        let f = self.module.get_function(&r).ok_or_else(|| {
                             CodeGenError::new(
                                 format!("'{r}' is not a procedure or function"),
                                 Some(span),
                             )
-                        })?
-                        .as_global_value()
-                        .as_pointer_value()
-                        .into(),
+                        })?;
+                        self.routine_as_procedural(f, &param_ty)?.into()
+                    }
                     None => self.compile_expr(arg)?,
                 };
                 call_args.push(value.into());

@@ -301,6 +301,9 @@ struct Lexer {
     /// Whether `string` means `ShortString` here: `{$H-}`, or a
     /// `{$mode}` (objfpc, fpc, tp) whose strings are short.
     short_strings: bool,
+    /// Whether `Integer` means a 32-bit LongInt here: `{$mode objfpc}`
+    /// and `{$mode delphi}`, as in FPC.
+    int32: bool,
     /// `{$DEFINE NAME := text}` macros: upper-case name -> replacement.
     macros: std::collections::HashMap<String, String>,
     conditions: Vec<Condition>,
@@ -388,6 +391,7 @@ impl Lexer {
             defines: predefined_symbols().into_iter().map(String::from).collect(),
             macros: std::collections::HashMap::new(),
             short_strings: false,
+            int32: false,
             conditions: Vec::new(),
             include_dirs: options.include_dirs.clone(),
             error: None,
@@ -516,8 +520,18 @@ impl Lexer {
             "error" | "fatal" => self.fail(format!("{{$error}} {rest}"), span),
             // FPC's default modes use short strings; Delphi mode doesn't.
             "mode" => match first_word(rest).as_str() {
-                "OBJFPC" | "FPC" | "TP" | "MACPAS" | "ISO" => self.short_strings = true,
-                "DELPHI" | "DELPHIUNICODE" => self.short_strings = false,
+                "OBJFPC" => {
+                    self.short_strings = true;
+                    self.int32 = true;
+                }
+                "FPC" | "TP" | "MACPAS" | "ISO" => {
+                    self.short_strings = true;
+                    self.int32 = false;
+                }
+                "DELPHI" | "DELPHIUNICODE" => {
+                    self.short_strings = false;
+                    self.int32 = true;
+                }
                 _ => {}
             },
             "longstrings" => self.short_strings = first_word(rest) == "OFF",
@@ -1233,6 +1247,8 @@ pub struct Parser {
     tokens: Vec<(Tok, Span)>,
     /// For each token, whether `string` meant `ShortString` there.
     short_strings: Vec<bool>,
+    /// For each token, whether `Integer` meant a 32-bit LongInt there.
+    int32: Vec<bool>,
     pos: usize,
     pub directives: Directives,
     /// A preprocessing error, reported by the first `parse_*` call.
@@ -1264,11 +1280,21 @@ impl Parser {
         let mut lexer = Lexer::new(source, options);
         let mut tokens = Vec::new();
         let mut short_strings = Vec::new();
+        let mut int32 = Vec::new();
         loop {
             let (tok, span) = lexer.next_token();
             let is_eof = tok == Tok::Eof;
+            // `MaxInt` is High(Integer): a LongInt's in objfpc and delphi
+            // modes.
+            let tok = match tok {
+                Tok::Ident(w) if lexer.int32 && w.eq_ignore_ascii_case("maxint") => {
+                    Tok::IntLit(i32::MAX as i64)
+                }
+                other => other,
+            };
             tokens.push((tok, span));
             short_strings.push(lexer.short_strings);
+            int32.push(lexer.int32);
             if is_eof {
                 break;
             }
@@ -1276,6 +1302,7 @@ impl Parser {
         Self {
             tokens,
             short_strings,
+            int32,
             pos: 0,
             directives: lexer.directives,
             lex_error: lexer.error,
@@ -2020,7 +2047,14 @@ impl Parser {
         }
         match self.peek() {
             Tok::TyInteger => {
+                let int32 = self.int32[self.pos];
                 self.advance();
+                if int32 {
+                    return Ok(PascalType::SizedInt {
+                        bits: 32,
+                        signed: true,
+                    });
+                }
                 Ok(PascalType::Integer)
             }
             Tok::TyReal => {
@@ -4135,7 +4169,9 @@ impl Parser {
                 if !matches!(self.tokens.get(self.pos + 1), Some((Tok::LParen, _))) =>
             {
                 let span = self.span();
+                let int32 = self.int32[self.pos];
                 let name = match self.advance().0 {
+                    Tok::TyInteger if int32 => "longint",
                     Tok::TyInteger => "integer",
                     Tok::TyReal => "real",
                     Tok::TyChar => "char",
@@ -4153,6 +4189,7 @@ impl Parser {
             {
                 let span = self.span();
                 let name = match self.peek() {
+                    Tok::TyInteger if self.int32[self.pos] => "longint",
                     Tok::TyInteger => "integer",
                     Tok::TyReal => "real",
                     Tok::TyChar => "char",

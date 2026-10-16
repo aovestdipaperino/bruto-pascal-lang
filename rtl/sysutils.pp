@@ -2,6 +2,8 @@
   built into the compiler and uses BrutoCFormat from here. }
 unit SysUtils;
 
+{$mode objfpc}{$H+}
+
 interface
 
 uses UnixType;

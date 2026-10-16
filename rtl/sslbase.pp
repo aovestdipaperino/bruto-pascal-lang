@@ -3,6 +3,8 @@
   (FileName) or PEM text (Value). }
 unit sslbase;
 
+{$mode objfpc}{$H+}
+
 interface
 
 uses SysUtils, Classes;

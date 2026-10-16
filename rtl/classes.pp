@@ -4,6 +4,8 @@
   interfaces and messages. }
 unit Classes;
 
+{$mode objfpc}{$H+}
+
 interface
 
 uses SysUtils;

@@ -6,6 +6,8 @@
   200, and certificates are checked only with VerifySSLCertificate. }
 unit fphttpclient;
 
+{$mode objfpc}{$H+}
+
 interface
 
 uses SysUtils, Classes, ssockets, sslsockets;

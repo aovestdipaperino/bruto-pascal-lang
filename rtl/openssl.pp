@@ -5,6 +5,8 @@
   InitSSLInterface returns False. }
 unit OpenSSL;
 
+{$mode objfpc}{$H+}
+
 interface
 
 uses UnixType;

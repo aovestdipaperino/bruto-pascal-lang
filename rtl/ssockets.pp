@@ -4,6 +4,8 @@
   IPv4, macOS and Linux. }
 unit ssockets;
 
+{$mode objfpc}{$H+}
+
 interface
 
 uses SysUtils, Classes, UnixType, Sockets, NetDB;
