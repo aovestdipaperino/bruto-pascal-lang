@@ -121,11 +121,107 @@ type
   protected
     procedure AssignTo(Dest: TPersistent); virtual;
     procedure DefineProperties(Filer: TFiler); virtual;
+    function GetOwner: TPersistent; virtual;
   public
     procedure Assign(Source: TPersistent); virtual;
+    function GetNamePath: string; virtual;
   end;
 {$M-}
   TPersistentClass = class of TPersistent;
+
+  TCollection = class;
+
+  { An item of a collection; a collection's items are of one class. }
+  TCollectionItem = class(TPersistent)
+  private
+    FCollection: TCollection;
+    FID: Integer;
+    function GetIndex: Integer;
+  protected
+    procedure SetCollection(Value: TCollection); virtual;
+    procedure Changed(AllItems: Boolean);
+    function GetOwner: TPersistent; override;
+    function GetDisplayName: string; virtual;
+    procedure SetIndex(Value: Integer); virtual;
+    procedure SetDisplayName(const Value: string); virtual;
+  public
+    constructor Create(ACollection: TCollection); virtual;
+    destructor Destroy; override;
+    function GetNamePath: string; override;
+    property Collection: TCollection read FCollection write SetCollection;
+    property ID: Integer read FID;
+    property Index: Integer read GetIndex write SetIndex;
+    property DisplayName: string read GetDisplayName write SetDisplayName;
+  end;
+
+  TCollectionEnumerator = class
+  private
+    FCollection: TCollection;
+    FPosition: Integer;
+  public
+    constructor Create(ACollection: TCollection);
+    function GetCurrent: TCollectionItem;
+    function MoveNext: Boolean;
+    property Current: TCollectionItem read GetCurrent;
+  end;
+
+  TCollectionItemClass = class of TCollectionItem;
+  TCollectionNotification = (cnAdded, cnExtracting, cnDeleting);
+  TCollectionSortCompare = function(Item1, Item2: TCollectionItem): Integer;
+
+  TCollection = class(TPersistent)
+  private
+    FItemClass: TCollectionItemClass;
+    FItems: TFPList;
+    FUpdateCount: Integer;
+    FNextID: Integer;
+    FPropName: string;
+    function GetCount: Integer;
+    function GetPropName: string;
+    procedure InsertItem(Item: TCollectionItem);
+    procedure RemoveItem(Item: TCollectionItem);
+    procedure DoClear;
+  protected
+    procedure Changed;
+    function GetItem(Index: Integer): TCollectionItem;
+    procedure SetItem(Index: Integer; Value: TCollectionItem);
+    procedure SetItemName(Item: TCollectionItem); virtual;
+    procedure SetPropName; virtual;
+    procedure Update(Item: TCollectionItem); virtual;
+    procedure Notify(Item: TCollectionItem; Action: TCollectionNotification); virtual;
+    property PropName: string read GetPropName write FPropName;
+    property UpdateCount: Integer read FUpdateCount;
+  public
+    constructor Create(AItemClass: TCollectionItemClass);
+    destructor Destroy; override;
+    function Owner: TPersistent;
+    function Add: TCollectionItem;
+    procedure Assign(Source: TPersistent); override;
+    procedure BeginUpdate; virtual;
+    procedure Clear;
+    procedure EndUpdate; virtual;
+    procedure Delete(Index: Integer);
+    function GetEnumerator: TCollectionEnumerator;
+    function GetNamePath: string; override;
+    function Insert(Index: Integer): TCollectionItem;
+    function FindItemID(ID: Integer): TCollectionItem;
+    procedure Exchange(const Index1, Index2: Integer);
+    procedure Move(const Index1, Index2: Integer);
+    procedure Sort(const Compare: TCollectionSortCompare);
+    property Count: Integer read GetCount;
+    property ItemClass: TCollectionItemClass read FItemClass;
+    property Items[Index: Integer]: TCollectionItem read GetItem write SetItem;
+  end;
+
+  { A collection that knows its owner (for GetNamePath, streaming). }
+  TOwnedCollection = class(TCollection)
+  private
+    FOwner: TPersistent;
+  protected
+    function GetOwner: TPersistent; override;
+  public
+    constructor Create(AOwner: TPersistent; AItemClass: TCollectionItemClass);
+  end;
 
   { A component: owned components are freed with their owner. }
   TComponent = class(TPersistent)
@@ -148,6 +244,7 @@ type
     constructor Create(AOwner: TComponent); virtual;
     procedure WriteState(Writer: TWriter); virtual;
     procedure GetChildren(Proc: TGetChildProc; Root: TComponent); virtual;
+    function GetNamePath: string; override;
     property ComponentState: TComponentState read FComponentState;
     destructor Destroy; override;
     procedure InsertComponent(AComponent: TComponent);
@@ -290,6 +387,7 @@ type
     procedure WriteSet(Value: LongInt; SetType: Pointer);
     procedure WriteString(const Value: string);
     procedure WriteMethodName(const Name: string);
+    procedure WriteCollection(Value: TCollection);
     procedure WriteListBegin;
     procedure WriteListEnd;
   end;
@@ -309,6 +407,7 @@ type
     function ReadComponent(Component: TComponent): TComponent;
     procedure ReadData(Instance: TComponent);
     procedure ReadProperty(AInstance: TPersistent);
+    procedure ReadCollection(Collection: TCollection);
     procedure ReadSignature;
     function ReadValue: TValueType;
     function NextValue: TValueType;
@@ -2551,6 +2650,18 @@ begin
           finally
             FPropPath := SavedPath;
           end;
+          { A collection: its items, each a list of properties. }
+          if ObjValue.InheritsFrom(TCollection) then
+          begin
+            WriteStr(FPropPath + PropInfo^.Name);
+            SavedPath := FPropPath;
+            try
+              FPropPath := '';
+              WriteCollection(TCollection(ObjValue));
+            finally
+              FPropPath := SavedPath;
+            end;
+          end;
         end;
       end;
     tkInt64, tkQWord:
@@ -2680,6 +2791,22 @@ begin
   end
   else
     WriteValue(vaNil);
+end;
+
+procedure TWriter.WriteCollection(Value: TCollection);
+var
+  I: Integer;
+begin
+  WriteValue(vaCollection);
+  if Value <> nil then
+    for I := 0 to Value.Count - 1 do
+    begin
+      { Each item between its own list markers. }
+      WriteListBegin;
+      WriteProperties(Value.Items[I]);
+      WriteListEnd;
+    end;
+  WriteListEnd;
 end;
 
 procedure TWriter.WriteListBegin;
@@ -3119,6 +3246,11 @@ begin
         ReadValue;
         SetObjectProp(Instance, PropInfo, nil);
       end
+      else if NextValue = vaCollection then
+      begin
+        ReadValue;
+        ReadCollection(TCollection(GetObjectProp(Instance, PropInfo)));
+      end
       else
       begin
         { A reference, set once every component is read. }
@@ -3133,6 +3265,28 @@ begin
   else
     SkipValue;
   end;
+end;
+
+procedure TReader.ReadCollection(Collection: TCollection);
+var
+  Item: TCollectionItem;
+begin
+  Collection.BeginUpdate;
+  if not EndOfList then
+    Collection.Clear;
+  while not EndOfList do
+  begin
+    { An item may start with its index. }
+    if NextValue in [vaInt8, vaInt16, vaInt32] then
+      ReadInteger;
+    ReadListBegin;
+    Item := Collection.Add;
+    while NextValue <> vaNull do
+      ReadProperty(Item);
+    ReadListEnd;
+  end;
+  Collection.EndUpdate;
+  ReadListEnd;
 end;
 
 procedure TReader.DoFixupReferences;
@@ -3796,6 +3950,376 @@ begin
     Writer.Free;
     Parser.Free;
   end;
+end;
+
+{ ── Collections (FPC's collect.inc) ── }
+
+function TPersistent.GetOwner: TPersistent;
+begin
+  Result := nil;
+end;
+
+function TPersistent.GetNamePath: string;
+var
+  OwnerPath: string;
+begin
+  Result := ClassName;
+  if GetOwner <> nil then
+  begin
+    OwnerPath := GetOwner.GetNamePath;
+    if OwnerPath <> '' then
+      Result := OwnerPath + '.' + Result;
+  end;
+end;
+
+function TComponent.GetNamePath: string;
+begin
+  Result := FName;
+end;
+
+function TCollectionItem.GetIndex: Integer;
+begin
+  if FCollection <> nil then
+    Result := FCollection.FItems.IndexOf(Pointer(Self))
+  else
+    Result := -1;
+end;
+
+procedure TCollectionItem.SetCollection(Value: TCollection);
+begin
+  if Value <> FCollection then
+  begin
+    if FCollection <> nil then
+      FCollection.RemoveItem(Self);
+    if Value <> nil then
+      Value.InsertItem(Self);
+  end;
+end;
+
+procedure TCollectionItem.Changed(AllItems: Boolean);
+begin
+  if (FCollection <> nil) and (FCollection.UpdateCount = 0) then
+  begin
+    if AllItems then
+      FCollection.Update(nil)
+    else
+      FCollection.Update(Self);
+  end;
+end;
+
+function TCollectionItem.GetNamePath: string;
+begin
+  if FCollection <> nil then
+    Result := FCollection.GetNamePath + '[' + IntToStr(Index) + ']'
+  else
+    Result := ClassName;
+end;
+
+function TCollectionItem.GetOwner: TPersistent;
+begin
+  Result := FCollection;
+end;
+
+function TCollectionItem.GetDisplayName: string;
+begin
+  Result := ClassName;
+end;
+
+procedure TCollectionItem.SetIndex(Value: Integer);
+var
+  Temp: LongInt;
+begin
+  Temp := GetIndex;
+  if (Temp > -1) and (Temp <> Value) then
+  begin
+    FCollection.FItems.Move(Temp, Value);
+    Changed(True);
+  end;
+end;
+
+procedure TCollectionItem.SetDisplayName(const Value: string);
+begin
+  Changed(False);
+end;
+
+constructor TCollectionItem.Create(ACollection: TCollection);
+begin
+  inherited Create;
+  SetCollection(ACollection);
+end;
+
+destructor TCollectionItem.Destroy;
+begin
+  SetCollection(nil);
+  inherited Destroy;
+end;
+
+constructor TCollectionEnumerator.Create(ACollection: TCollection);
+begin
+  inherited Create;
+  FCollection := ACollection;
+  FPosition := -1;
+end;
+
+function TCollectionEnumerator.GetCurrent: TCollectionItem;
+begin
+  Result := FCollection.Items[FPosition];
+end;
+
+function TCollectionEnumerator.MoveNext: Boolean;
+begin
+  Inc(FPosition);
+  Result := FPosition < FCollection.Count;
+end;
+
+function TCollection.Owner: TPersistent;
+begin
+  Result := GetOwner;
+end;
+
+function TCollection.GetCount: Integer;
+begin
+  Result := FItems.Count;
+end;
+
+procedure TCollection.SetPropName;
+var
+  TheOwner: TPersistent;
+  PropList: PPropList;
+  I, PropCount: Integer;
+begin
+  FPropName := '';
+  TheOwner := GetOwner;
+  if (TheOwner = nil) or (TheOwner.ClassInfo = nil) then
+    Exit;
+  PropCount := GetPropList(TheOwner, PropList);
+  try
+    for I := 0 to PropCount - 1 do
+      if (PropList^[I]^.PropType^.Kind = tkClass)
+        and (GetObjectProp(TheOwner, PropList^[I]) = Self) then
+      begin
+        FPropName := PropList^[I]^.Name;
+        Exit;
+      end;
+  finally
+    FreeMem(PropList);
+  end;
+end;
+
+function TCollection.GetPropName: string;
+var
+  TheOwner: TPersistent;
+begin
+  Result := FPropName;
+  TheOwner := GetOwner;
+  if (Result <> '') or (TheOwner = nil) or (TheOwner.ClassInfo = nil) then
+    Exit;
+  SetPropName;
+  Result := FPropName;
+end;
+
+procedure TCollection.InsertItem(Item: TCollectionItem);
+begin
+  if not Item.InheritsFrom(FItemClass) then
+    Exit;
+  FItems.Add(Pointer(Item));
+  Item.FCollection := Self;
+  Item.FID := FNextID;
+  Inc(FNextID);
+  SetItemName(Item);
+  Notify(Item, cnAdded);
+  Changed;
+end;
+
+procedure TCollection.RemoveItem(Item: TCollectionItem);
+var
+  I: Integer;
+begin
+  Notify(Item, cnExtracting);
+  I := FItems.IndexOf(Pointer(Item));
+  if I <> -1 then
+    FItems.Delete(I);
+  Item.FCollection := nil;
+  Changed;
+end;
+
+function TCollection.GetEnumerator: TCollectionEnumerator;
+begin
+  Result := TCollectionEnumerator.Create(Self);
+end;
+
+function TCollection.GetNamePath: string;
+var
+  O: TPersistent;
+begin
+  O := GetOwner;
+  if (O <> nil) and (PropName <> '') then
+    Result := O.GetNamePath + '.' + PropName
+  else
+    Result := ClassName;
+end;
+
+procedure TCollection.Changed;
+begin
+  if FUpdateCount = 0 then
+    Update(nil);
+end;
+
+function TCollection.GetItem(Index: Integer): TCollectionItem;
+begin
+  Result := TCollectionItem(FItems[Index]);
+end;
+
+procedure TCollection.SetItem(Index: Integer; Value: TCollectionItem);
+begin
+  TCollectionItem(FItems[Index]).Assign(Value);
+end;
+
+procedure TCollection.SetItemName(Item: TCollectionItem);
+begin
+end;
+
+procedure TCollection.Update(Item: TCollectionItem);
+begin
+end;
+
+procedure TCollection.Notify(Item: TCollectionItem; Action: TCollectionNotification);
+begin
+end;
+
+constructor TCollection.Create(AItemClass: TCollectionItemClass);
+begin
+  inherited Create;
+  FItemClass := AItemClass;
+  FItems := TFPList.Create;
+end;
+
+destructor TCollection.Destroy;
+begin
+  FUpdateCount := 1;
+  try
+    if FItems <> nil then
+      DoClear;
+  finally
+    FUpdateCount := 0;
+  end;
+  FItems.Free;
+  inherited Destroy;
+end;
+
+function TCollection.Add: TCollectionItem;
+begin
+  Result := FItemClass.Create(Self);
+end;
+
+procedure TCollection.Assign(Source: TPersistent);
+var
+  I: LongInt;
+begin
+  if Source is TCollection then
+  begin
+    BeginUpdate;
+    try
+      Clear;
+      for I := 0 to TCollection(Source).Count - 1 do
+        Add.Assign(TCollection(Source).Items[I]);
+    finally
+      EndUpdate;
+    end;
+    Exit;
+  end
+  else
+    inherited Assign(Source);
+end;
+
+procedure TCollection.BeginUpdate;
+begin
+  Inc(FUpdateCount);
+end;
+
+procedure TCollection.Clear;
+begin
+  if FItems.Count = 0 then
+    Exit;
+  BeginUpdate;
+  try
+    DoClear;
+  finally
+    EndUpdate;
+  end;
+end;
+
+procedure TCollection.DoClear;
+begin
+  while FItems.Count > 0 do
+    TCollectionItem(FItems.Last).Free;
+end;
+
+procedure TCollection.EndUpdate;
+begin
+  if FUpdateCount > 0 then
+    Dec(FUpdateCount);
+  if FUpdateCount = 0 then
+    Changed;
+end;
+
+function TCollection.FindItemID(ID: Integer): TCollectionItem;
+var
+  I: LongInt;
+begin
+  for I := 0 to FItems.Count - 1 do
+  begin
+    Result := TCollectionItem(FItems[I]);
+    if Result.ID = ID then
+      Exit;
+  end;
+  Result := nil;
+end;
+
+procedure TCollection.Delete(Index: Integer);
+var
+  Item: TCollectionItem;
+begin
+  Item := TCollectionItem(FItems[Index]);
+  Notify(Item, cnDeleting);
+  Item.Free;
+end;
+
+function TCollection.Insert(Index: Integer): TCollectionItem;
+begin
+  Result := Add;
+  Result.Index := Index;
+end;
+
+procedure TCollection.Sort(const Compare: TCollectionSortCompare);
+begin
+  BeginUpdate;
+  try
+    FItems.Sort(TListSortCompare(Compare));
+  finally
+    EndUpdate;
+  end;
+end;
+
+procedure TCollection.Exchange(const Index1, Index2: Integer);
+begin
+  FItems.Exchange(Index1, Index2);
+end;
+
+procedure TCollection.Move(const Index1, Index2: Integer);
+begin
+  Items[Index1].Index := Index2;
+end;
+
+constructor TOwnedCollection.Create(AOwner: TPersistent; AItemClass: TCollectionItemClass);
+begin
+  FOwner := AOwner;
+  inherited Create(AItemClass);
+end;
+
+function TOwnedCollection.GetOwner: TPersistent;
+begin
+  Result := FOwner;
 end;
 
 end.

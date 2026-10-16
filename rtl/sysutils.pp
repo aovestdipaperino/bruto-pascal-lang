@@ -118,6 +118,8 @@ function StrToInt(const S: string): Int64;
 function StrToIntDef(const S: string; Default: Int64): Int64;
 function StrToInt64(const S: string): Int64;
 function StrToInt64Def(const S: string; Default: Int64): Int64;
+{ Whether the Length bytes at P1 and P2 are the same. }
+function CompareMem(P1, P2: Pointer; Length: PtrUInt): Boolean;
 function StrToFloat(const S: string): Double;
 function StrToFloatDef(const S: string; const Default: Double): Double;
 function TryStrToFloat(const S: string; out Value: Double): Boolean;
@@ -212,6 +214,21 @@ end;
 function StrToInt64Def(const S: string; Default: Int64): Int64;
 begin
   StrToInt64Def := StrToIntDef(S, Default);
+end;
+
+function CompareMem(P1, P2: Pointer; Length: PtrUInt): Boolean;
+var
+  I: PtrUInt;
+begin
+  CompareMem := True;
+  if Length = 0 then
+    Exit;
+  for I := 0 to Length - 1 do
+    if PByte(P1 + I)^ <> PByte(P2 + I)^ then
+    begin
+      CompareMem := False;
+      Exit;
+    end;
 end;
 
 function TryStrToFloat(const S: string; out Value: Double): Boolean;

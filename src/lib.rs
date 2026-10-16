@@ -6923,6 +6923,166 @@ end.
     }
 
     #[test]
+    fn collections_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program co;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes;
+type
+  TColumn = class(TCollectionItem)
+  private
+    FTitle: string;
+    FWidth: Integer;
+    FVisible: Boolean;
+  protected
+    function GetDisplayName: string; override;
+  public
+    procedure Assign(Source: TPersistent); override;
+  published
+    property Title: string read FTitle write FTitle;
+    property Width: Integer read FWidth write FWidth default 50;
+    property Visible: Boolean read FVisible write FVisible default True;
+  end;
+
+  TColumns = class(TOwnedCollection)
+  private
+    function GetColumn(Index: Integer): TColumn;
+  protected
+    procedure Update(Item: TCollectionItem); override;
+  public
+    function AddColumn(const T: string; W: Integer): TColumn;
+    property Columns[Index: Integer]: TColumn read GetColumn; default;
+  end;
+
+  TGrid = class(TComponent)
+  private
+    FColumns: TColumns;
+    FCaption: string;
+    procedure SetColumns(V: TColumns);
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  published
+    property Caption: string read FCaption write FCaption;
+    property Columns: TColumns read FColumns write SetColumns;
+  end;
+
+var
+  Updates: Integer;
+
+function TColumn.GetDisplayName: string;
+begin
+  Result := 'Col ' + FTitle;
+end;
+
+procedure TColumn.Assign(Source: TPersistent);
+begin
+  if Source is TColumn then
+  begin
+    FTitle := TColumn(Source).FTitle;
+    FWidth := TColumn(Source).FWidth;
+    FVisible := TColumn(Source).FVisible;
+  end
+  else
+    inherited Assign(Source);
+end;
+
+function TColumns.GetColumn(Index: Integer): TColumn;
+begin
+  Result := TColumn(Items[Index]);
+end;
+
+procedure TColumns.Update(Item: TCollectionItem);
+begin
+  Inc(Updates);
+end;
+
+function TColumns.AddColumn(const T: string; W: Integer): TColumn;
+begin
+  Result := TColumn(Add);
+  Result.FTitle := T;
+  Result.FWidth := W;
+  Result.FVisible := True;
+end;
+
+constructor TGrid.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FColumns := TColumns.Create(Self, TColumn);
+end;
+
+destructor TGrid.Destroy;
+begin
+  FColumns.Free;
+  inherited Destroy;
+end;
+
+procedure TGrid.SetColumns(V: TColumns);
+begin
+  FColumns.Assign(V);
+end;
+
+var
+  G, G2: TGrid;
+  C: TCollectionItem;
+  Bin, Txt: TMemoryStream;
+  S: TStringStream;
+  I: Integer;
+begin
+  RegisterClass(TGrid);
+  G := TGrid.Create(nil);
+  G.Name := 'Grid1';
+  G.Caption := 'Data';
+  G.Columns.AddColumn('Id', 30);
+  G.Columns.AddColumn('Name', 50);
+  G.Columns.AddColumn('Notes', 200).Visible := False;
+  WriteLn(G.Columns.Count, ' ', G.Columns[1].Title, ' ', G.Columns[2].Index, ' ', G.Columns[2].ID, ' ', Updates);
+  WriteLn(G.Columns[0].DisplayName, ' ', G.Columns.GetNamePath, ' ', G.Columns[1].GetNamePath);
+  G.Columns[2].Index := 0;
+  for C in G.Columns do Write(TColumn(C).Title, ' ');
+  WriteLn;
+  G.Columns.Delete(1);
+  WriteLn(G.Columns.Count, ' ', G.Columns.FindItemID(0) = nil, ' ', TColumn(G.Columns.FindItemID(2)).Title);
+  TColumn(G.Columns.Insert(1)).Title := 'Middle';
+  for I := 0 to G.Columns.Count - 1 do Write(G.Columns[I].Title, ':', G.Columns[I].ID, ' ');
+  WriteLn;
+
+  Bin := TMemoryStream.Create;
+  Bin.WriteComponent(G);
+  Bin.Position := 0;
+  S := TStringStream.Create('');
+  ObjectBinaryToText(Bin, S);
+  Write(S.DataString);
+  WriteLn(Bin.Size);
+
+  Bin.Position := 0;
+  G2 := TGrid(Bin.ReadComponent(nil));
+  WriteLn(G2.Name, ' ', G2.Caption, ' ', G2.Columns.Count);
+  for I := 0 to G2.Columns.Count - 1 do
+    Write(G2.Columns[I].Title, '/', G2.Columns[I].Width, '/', G2.Columns[I].Visible, ' ');
+  WriteLn;
+
+  Txt := TMemoryStream.Create;
+  S.Position := 0;
+  ObjectTextToBinary(S, Txt);
+  WriteLn(Txt.Size, ' ', CompareMem(Txt.Memory, Bin.Memory, Bin.Size));
+  G2.Columns.Clear;
+  G2.Columns.Assign(G.Columns);
+  WriteLn(G2.Columns.Count, ' ', G2.Columns[0].Title);
+  G2.Free;
+  G.Free;
+  Bin.Free; Txt.Free; S.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "3 Name 2 2 3\nCol Id Grid1.Columns Grid1.Columns[1]\nNotes Id Name \n2 TRUE Notes\nNotes:2 Middle:3 Name:1 \nobject Grid1: TGrid\n  Caption = 'Data'\n  Columns = <  \n    item\n      Title = 'Notes'\n      Width = 200\n      Visible = False\n    end  \n    item\n      Title = 'Middle'\n      Width = 0\n      Visible = False\n    end  \n    item\n      Title = 'Name'\n    end>\nend\n122\nGrid1 Data 3\nNotes/200/FALSE Middle/0/FALSE Name/0/FALSE \n122 TRUE\n3 Notes\n"
+        );
+    }
+
+    #[test]
     fn generic_routines_delphi_syntax() {
         let (ok, out) = build_and_run_source(
             "program T;
