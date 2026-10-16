@@ -528,7 +528,7 @@ fn fold_constant_bounds(program: &Program) -> Result<Program, SemaError> {
         if c.ty.is_none() {
             if let Expr::StrLit(text, _) = &c.value {
                 env.string_lengths
-                    .insert(c.name.clone(), text.chars().count() as i64);
+                    .insert(c.name.clone(), literal_bytes(text).len() as i64);
             }
             if let Some(value) = ConstExpr::from_expr(&c.value).and_then(|e| env.eval(&e).ok()) {
                 env.values.insert(c.name.clone(), value);

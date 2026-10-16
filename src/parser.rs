@@ -261,6 +261,7 @@ struct Frame {
     col: u32,
     file: u32,
     dir: Option<PathBuf>,
+    latin1: bool,
 }
 
 /// One open `{$IF...}` / `{$IFDEF...}` group.
@@ -317,6 +318,9 @@ struct Lexer {
     /// `{$codepage cp437}`: the source's characters 128..=255 are code
     /// page 437's.
     cp437: bool,
+    /// The source was read as Latin-1 (it isn't UTF-8): its characters
+    /// 128..=255 in strings are raw bytes.
+    latin1: bool,
 }
 
 /// Code page 437's characters 128..=255, for `{$codepage cp437}`.
@@ -402,6 +406,10 @@ impl Lexer {
             include_dirs: options.include_dirs.clone(),
             error: None,
             cp437: false,
+            latin1: options
+                .file
+                .as_deref()
+                .is_some_and(crate::source_map::is_latin1),
         }
     }
 
@@ -602,6 +610,7 @@ impl Lexer {
             col: std::mem::replace(&mut self.col, 1),
             file: std::mem::replace(&mut self.file, crate::source_map::intern(&path)),
             dir: std::mem::replace(&mut self.dir, path.parent().map(Path::to_path_buf)),
+            latin1: std::mem::replace(&mut self.latin1, crate::source_map::is_latin1(&path)),
         };
         self.suspended.push(frame);
     }
@@ -661,6 +670,7 @@ impl Lexer {
             col: std::mem::replace(&mut self.col, span.column),
             file: self.file,
             dir: self.dir.clone(),
+            latin1: self.latin1,
         };
         self.suspended.push(frame);
     }
@@ -676,6 +686,7 @@ impl Lexer {
         self.col = frame.col;
         self.file = frame.file;
         self.dir = frame.dir;
+        self.latin1 = frame.latin1;
         true
     }
 
@@ -826,7 +837,13 @@ impl Lexer {
                                 break;
                             }
                         } else {
-                            s.push(self.advance());
+                            // A Latin-1 source's characters 128..=255 are
+                            // its bytes.
+                            let c = self.advance();
+                            match u8::try_from(u32::from(c)) {
+                                Ok(b) if self.latin1 && b >= 0x80 => s.push(raw_byte_char(b)),
+                                _ => s.push(c),
+                            }
                         }
                     }
                 }
@@ -844,32 +861,35 @@ impl Lexer {
                         let d = self.advance().to_digit(radix).unwrap_or(0);
                         n = n.wrapping_mul(radix).wrapping_add(d);
                     }
-                    // Codes above 255 are UTF-16 code units (FPC's
-                    // WideChar); a lone surrogate can't be held here.
-                    s.push(char::from_u32(n & 0xFFFF).unwrap_or('\u{FFFD}'));
+                    // Codes 128..=255 are bytes; above 255, UTF-16 code
+                    // units (FPC's WideChar; a lone surrogate can't be
+                    // held here).
+                    if (0x80..=0xFF).contains(&n) {
+                        s.push(raw_byte_char(n as u8));
+                    } else {
+                        s.push(char::from_u32(n & 0xFFFF).unwrap_or('\u{FFFD}'));
+                    }
                 }
                 _ => break,
             }
             pieces += 1;
         }
         if pieces == 1 && only_codes {
-            let code = u32::from(s.chars().next().unwrap_or('\0'));
+            let first = s.chars().next().unwrap_or('\0');
+            let code = raw_byte_of(first).map_or(u32::from(first), u32::from);
             return match u8::try_from(code) {
                 Ok(c) => (Tok::CharLit(c), span),
                 Err(_) => (Tok::WideCharLit(code as u16), span),
             };
         }
-        if self.cp437
-            && s.chars().count() > 1
-            && s.chars().any(|c| ('\u{80}'..='\u{FF}').contains(&c))
-        {
+        if self.cp437 && s.chars().count() > 1 && s.chars().any(|c| raw_byte_of(c).is_some()) {
             let text = s
                 .chars()
-                .map(|c| match u32::from(c) {
-                    n @ 0x80..=0xFF => {
-                        char::from_u32(u32::from(CP437_HIGH[n as usize - 0x80])).unwrap_or(c)
+                .map(|c| match raw_byte_of(c) {
+                    Some(b) => {
+                        char::from_u32(u32::from(CP437_HIGH[b as usize - 0x80])).unwrap_or(c)
                     }
-                    _ => c,
+                    None => c,
                 })
                 .collect();
             return (Tok::CodePageStrLit(s, text), span);
@@ -2584,6 +2604,13 @@ impl Parser {
                         "cdecl",
                     ])?;
                     let has = |m: &str| mods.iter().any(|x| x == m);
+                    if !class_method {
+                        match section.as_deref() {
+                            Some("published") => obj.published.push(heading.name.clone()),
+                            None => obj.default_section.push(heading.name.clone()),
+                            _ => {}
+                        }
+                    }
                     obj.methods.push(MethodHeader {
                         name: heading.name,
                         kind: heading.kind,
@@ -3519,6 +3546,28 @@ impl Parser {
         }
     }
 
+    /// Whether the `(` ahead opens a `WriteStr(S, values)` call: a comma
+    /// at its outer level (a one-argument `WriteStr(X)` is some other
+    /// routine, such as TWriter's).
+    fn writestr_has_values(&self) -> bool {
+        let mut depth = 0;
+        for (tok, _) in &self.tokens[self.pos..] {
+            match tok {
+                Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RParen | Tok::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                Tok::Comma if depth == 1 => return true,
+                Tok::Semi | Tok::Eof => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// The rest of a statement whose start, `value`, is a call's result:
     /// `.Field`, `.Method(args)`, `[index]` and `^` steps, then a method
     /// call or an assignment.
@@ -3612,7 +3661,10 @@ impl Parser {
         // `str(x:width:precision, s)`: the value takes write-style formats.
         // `WriteStr(S, args)`: a `Write` into S, whose target rides on a
         // marker call as the first argument.
-        if name.eq_ignore_ascii_case("writestr") && *self.peek() == Tok::LParen {
+        if name.eq_ignore_ascii_case("writestr")
+            && *self.peek() == Tok::LParen
+            && self.writestr_has_values()
+        {
             self.advance();
             let target = self.parse_expr()?;
             let mut args = vec![WriteArg {

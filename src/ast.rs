@@ -808,6 +808,49 @@ pub struct ExceptHandler {
     pub span: Span,
 }
 
+/// A string literal's text holds the characters written in the source
+/// (encoded in UTF-8 when compiled, as FPC copies a UTF-8 source's bytes),
+/// and raw bytes (`#233`, or the bytes of a source that isn't UTF-8) as
+/// the private-use characters from this one on: byte `b` is U+F780 + `b`.
+pub const RAW_BYTE_BASE: u32 = 0xF780;
+
+/// The character a raw byte 128..=255 travels as in a literal's text.
+pub fn raw_byte_char(b: u8) -> char {
+    char::from_u32(RAW_BYTE_BASE + u32::from(b)).unwrap_or('\u{FFFD}')
+}
+
+/// The raw byte a literal's character stands for, if it is one.
+pub fn raw_byte_of(c: char) -> Option<u8> {
+    let n = u32::from(c);
+    (RAW_BYTE_BASE + 0x80..=RAW_BYTE_BASE + 0xFF)
+        .contains(&n)
+        .then(|| (n - RAW_BYTE_BASE) as u8)
+}
+
+/// A string literal's bytes: its raw bytes as they are, its characters
+/// in UTF-8.
+pub fn literal_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        match raw_byte_of(c) {
+            Some(b) => bytes.push(b),
+            None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    bytes
+}
+
+/// A string literal as Unicode text (for a UnicodeString or WideChar): a
+/// raw byte is the character of that code (`#233` is U+00E9, as in FPC).
+pub fn literal_unicode(text: &str) -> String {
+    text.chars()
+        .map(|c| match raw_byte_of(c) {
+            Some(b) => char::from(b),
+            None => c,
+        })
+        .collect()
+}
+
 /// The marker call `WriteStr(S, ...)`'s target rides on, as the first
 /// argument of a `Write`.
 pub const WRITESTR_TARGET: &str = "writestr$target";

@@ -116,6 +116,11 @@ function UIntToStr(Value: QWord): string;
 function IntToHex(Value: Int64; Digits: Integer): string;
 function StrToInt(const S: string): Int64;
 function StrToIntDef(const S: string; Default: Int64): Int64;
+function StrToInt64(const S: string): Int64;
+function StrToInt64Def(const S: string; Default: Int64): Int64;
+function StrToFloat(const S: string): Double;
+function StrToFloatDef(const S: string; const Default: Double): Double;
+function TryStrToFloat(const S: string; out Value: Double): Boolean;
 function UpperCase(const S: string): string;
 function LowerCase(const S: string): string;
 function Trim(const S: string): string;
@@ -197,6 +202,48 @@ begin
   if Code <> 0 then
     raise EConvertError.Create('"' + S + '" is an invalid integer');
   StrToInt := V;
+end;
+
+function StrToInt64(const S: string): Int64;
+begin
+  StrToInt64 := StrToInt(S);
+end;
+
+function StrToInt64Def(const S: string; Default: Int64): Int64;
+begin
+  StrToInt64Def := StrToIntDef(S, Default);
+end;
+
+function TryStrToFloat(const S: string; out Value: Double): Boolean;
+var
+  Code: Integer;
+  V: Double;
+begin
+  Val(Trim(S), V, Code);
+  TryStrToFloat := (Code = 0) and (Trim(S) <> '');
+  if Code = 0 then
+    Value := V
+  else
+    Value := 0;
+end;
+
+function StrToFloat(const S: string): Double;
+var
+  V: Double;
+begin
+  if not TryStrToFloat(S, V) then
+    raise EConvertError.Create('"' + S + '" is an invalid float');
+  StrToFloat := V;
+end;
+
+function StrToFloatDef(const S: string; const Default: Double): Double;
+var
+  V: Double;
+begin
+  if TryStrToFloat(S, V) then
+    StrToFloatDef := V
+  else
+    StrToFloatDef := Default;
 end;
 
 function UpperCase(const S: string): string;

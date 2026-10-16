@@ -52,6 +52,23 @@ type
     UnitName: ShortString;
     OwnPropCount: LongInt;
     OwnProps: Pointer;
+    { A class's own published fields (of class types) and methods. }
+    OwnFieldCount: LongInt;
+    OwnFields: Pointer;
+    OwnMethodCount: LongInt;
+    OwnMethods: Pointer;
+  end;
+
+  PVmtFieldEntry = ^TVmtFieldEntry;
+  TVmtFieldEntry = record
+    FieldOffset: PtrUInt;
+    Name: ShortString;
+  end;
+
+  PVmtMethodEntry = ^TVmtMethodEntry;
+  TVmtMethodEntry = record
+    Name: PShortString;
+    CodeAddress: Pointer;
   end;
 
   PPropInfo = ^TPropInfo;

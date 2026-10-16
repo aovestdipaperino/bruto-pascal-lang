@@ -1408,15 +1408,9 @@ impl<'ctx> CodeGen<'ctx> {
     /// UTF-8 sequence), with an AnsiString header (see
     /// `rtl/brutostrings.pp`) whose reference count, -1, marks a literal.
     fn string_literal(&self, text: &str) -> PointerValue<'ctx> {
-        // Characters above 255 (from a UTF-8 source, or `#$2500`) are
-        // written in UTF-8, the code page of AnsiStrings on Unix.
-        let mut bytes: Vec<u8> = Vec::with_capacity(text.len());
-        for c in text.chars() {
-            match u8::try_from(u32::from(c)) {
-                Ok(b) => bytes.push(b),
-                Err(_) => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
-            }
-        }
+        // The source's characters in UTF-8 (the code page of AnsiStrings
+        // on Unix), raw bytes as they are.
+        let bytes = literal_bytes(text);
         self.ansi_constant(&bytes, "str_lit")
     }
 
@@ -1629,11 +1623,7 @@ impl<'ctx> CodeGen<'ctx> {
                     && literal_text(value, false).is_some() =>
             {
                 let span = &value.span();
-                let bytes: Vec<u8> = literal_text(value, false)
-                    .unwrap()
-                    .chars()
-                    .map(|c| c as u32 as u8)
-                    .collect();
+                let bytes: Vec<u8> = literal_bytes(&literal_text(value, false).unwrap());
                 let len = (hi - lo + 1) as usize;
                 if bytes.len() > len {
                     return Err(CodeGenError::new(
@@ -2715,16 +2705,38 @@ impl<'ctx> CodeGen<'ctx> {
     /// QWord with another QWord, a smaller unsigned value or a
     /// non-negative literal (unsigned division, remainder and ordering).
     fn is_qword_arith(&self, left: &Expr, right: &Expr) -> bool {
-        let unsigned = |e: &Expr| {
+        let ld = self.infer_declared_type(left);
+        let rd = self.infer_declared_type(right);
+        self.qword_arith_types(left, &ld, right, &rd)
+    }
+
+    /// `is_qword_arith`, with the sides' declared types known.
+    fn qword_arith_types(
+        &self,
+        left: &Expr,
+        ld: &PascalType,
+        right: &Expr,
+        rd: &PascalType,
+    ) -> bool {
+        let qword = |t: &PascalType| {
+            matches!(
+                self.resolve_type(t),
+                PascalType::SizedInt {
+                    bits: 64,
+                    signed: false
+                }
+            )
+        };
+        let unsigned = |e: &Expr, t: &PascalType| {
             matches!(e, Expr::IntLit(v, _) if *v >= 0)
                 || matches!(
-                    self.resolve_type(&self.infer_declared_type(e)),
+                    self.resolve_type(t),
                     PascalType::SizedInt { signed: false, .. }
                         | PascalType::Char
                         | PascalType::Boolean
                 )
         };
-        (self.is_qword(left) || self.is_qword(right)) && unsigned(left) && unsigned(right)
+        (qword(ld) || qword(rd)) && unsigned(left, ld) && unsigned(right, rd)
     }
 
     /// `val` as a string: a char becomes a one-character string, anything
@@ -5362,8 +5374,12 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let s_name = match &args[0] {
-            Expr::Var(name, _) => name.clone(),
+        // A set variable, field or element.
+        let alloca = match &args[0] {
+            Expr::Var(name, _) => *self.lookup_var(name.as_str()).ok_or_else(|| {
+                CodeGenError::new(format!("undefined variable '{name}'"), Some(span))
+            })?,
+            other if self.is_addressable(other) => self.resolve_array_base(other, span)?.0,
             _ => {
                 return Err(CodeGenError::new(
                     "include/exclude requires a set variable",
@@ -5371,9 +5387,6 @@ impl<'ctx> CodeGen<'ctx> {
                 ));
             }
         };
-        let alloca = *self.lookup_var(s_name.as_str()).ok_or_else(|| {
-            CodeGenError::new(format!("undefined variable '{s_name}'"), Some(span))
-        })?;
         let elem_val = self.compile_expr(&args[1])?.into_int_value();
 
         let i64_ty = self.context.i64_type();
@@ -5632,6 +5645,12 @@ impl<'ctx> CodeGen<'ctx> {
         }) = args.first()
             && name == WRITESTR_TARGET
         {
+            // A routine of the program's (or a method) called WriteStr.
+            if self.is_user_routine("writestr") || self.self_method("writestr").is_some() {
+                let mut call_args = vec![target[0].clone()];
+                call_args.extend(args[1..].iter().map(|a| a.expr.clone()));
+                return self.compile_proc_call("writestr", &call_args, span);
+            }
             let target = target[0].clone();
             let (slot, target_ty) = self.resolve_array_base(&target, span)?;
             let mut text = self.empty_string_constant();
@@ -6507,7 +6526,7 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::StrLit(s, _) => {
                 let p = self.string_literal(s);
                 self.literal_texts
-                    .insert(p.as_value_ref() as usize, s.clone());
+                    .insert(p.as_value_ref() as usize, literal_unicode(s));
                 Ok(p.into())
             }
             Expr::CodePageStrLit(bytes, text, _) => {
@@ -9856,7 +9875,13 @@ impl<'ctx> CodeGen<'ctx> {
     /// The type of an expression's *value*. Narrow integers are widened to
     /// 64 bits when loaded, so they report as `integer` here.
     fn infer_expr_type(&self, expr: &Expr) -> PascalType {
-        match self.infer_declared_type(expr) {
+        self.widen_type(self.infer_declared_type(expr))
+    }
+
+    /// A declared type as an expression has it: narrow integers are
+    /// Integers, short strings Strings and Singles Reals.
+    fn widen_type(&self, ty: PascalType) -> PascalType {
+        match ty {
             PascalType::SizedInt { .. } => PascalType::Integer,
             PascalType::ShortString { .. } => PascalType::String,
             PascalType::Single => PascalType::Real,
@@ -9969,26 +9994,6 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::SetConstructor { .. } => PascalType::Set {
                 elem: Box::new(PascalType::Integer),
             },
-            // QWord arithmetic gives a QWord.
-            Expr::BinOp {
-                op:
-                    BinOp::Add
-                    | BinOp::Sub
-                    | BinOp::Mul
-                    | BinOp::Div
-                    | BinOp::Mod
-                    | BinOp::And
-                    | BinOp::Or
-                    | BinOp::Xor
-                    | BinOp::Shl
-                    | BinOp::Shr,
-                left,
-                right,
-                ..
-            } if self.is_qword_arith(left, right) => PascalType::SizedInt {
-                bits: 64,
-                signed: false,
-            },
             Expr::BinOp {
                 op, left, right, ..
             } => {
@@ -10000,14 +10005,29 @@ impl<'ctx> CodeGen<'ctx> {
                     | BinOp::Lte
                     | BinOp::Gte
                     | BinOp::In
-                    | BinOp::Is => PascalType::Boolean,
-                    BinOp::As => match right.as_ref() {
-                        Expr::Var(class, _) => PascalType::Named(class.clone()),
-                        _ => PascalType::Integer,
-                    },
+                    | BinOp::Is => return PascalType::Boolean,
+                    BinOp::As => {
+                        return match right.as_ref() {
+                            Expr::Var(class, _) => PascalType::Named(class.clone()),
+                            _ => PascalType::Integer,
+                        };
+                    }
+                    _ => {}
+                }
+                // Each side's type once (a long `a + b + c...` stays linear).
+                let ld = self.infer_declared_type(left);
+                let rd = self.infer_declared_type(right);
+                // QWord arithmetic gives a QWord.
+                if self.qword_arith_types(left, &ld, right, &rd) {
+                    return PascalType::SizedInt {
+                        bits: 64,
+                        signed: false,
+                    };
+                }
+                match op {
                     // Logical on booleans, bitwise on integers.
                     BinOp::And | BinOp::Or | BinOp::Xor => {
-                        if self.resolve_type(&self.infer_expr_type(left)) == PascalType::Boolean {
+                        if self.resolve_type(&self.widen_type(ld)) == PascalType::Boolean {
                             PascalType::Boolean
                         } else {
                             PascalType::Integer
@@ -10015,23 +10035,18 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     BinOp::Shl | BinOp::Shr => PascalType::Integer,
                     BinOp::Add | BinOp::Sub
-                        if matches!(
-                            self.resolve_type(&self.infer_declared_type(left)),
-                            PascalType::Pointer(_)
-                        ) =>
+                        if matches!(self.resolve_type(&ld), PascalType::Pointer(_)) =>
                     {
-                        let lt = self.infer_declared_type(left);
-                        let rt = self.resolve_type(&self.infer_declared_type(right));
-                        if matches!(rt, PascalType::Pointer(_)) {
+                        if matches!(self.resolve_type(&rd), PascalType::Pointer(_)) {
                             PascalType::Integer
                         } else {
-                            lt
+                            ld
                         }
                     }
                     BinOp::RealDiv => PascalType::Real,
                     _ => {
-                        let lt = self.infer_expr_type(left);
-                        let rt = self.infer_expr_type(right);
+                        let lt = self.widen_type(ld);
+                        let rt = self.widen_type(rd);
                         // Set operations return a set
                         let (lr, rr) = (self.resolve_type(&lt), self.resolve_type(&rt));
                         let textual =
@@ -10762,6 +10777,7 @@ fn collect_captures_expr(
 /// bytes.
 fn literal_text(expr: &Expr, wide: bool) -> Option<String> {
     match expr {
+        Expr::StrLit(text, _) if wide => Some(literal_unicode(text)),
         Expr::StrLit(text, _) => Some(text.clone()),
         Expr::CodePageStrLit(bytes, text, _) => Some(if wide { text } else { bytes }.clone()),
         Expr::CharLit(c, _) => Some(char::from(*c).to_string()),

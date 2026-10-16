@@ -620,6 +620,15 @@ impl<'ctx> CodeGen<'ctx> {
                 args: self.dx_args(name, args)?,
                 span: *span,
             },
+            Statement::Dispose {
+                target,
+                destructor,
+                span,
+            } => Statement::Dispose {
+                target: d(target)?,
+                destructor: destructor.clone(),
+                span: *span,
+            },
             Statement::Inherited { method, args, span } => Statement::Inherited {
                 method: method.clone(),
                 args: args.iter().map(d).collect::<Result<_, _>>()?,
@@ -1137,8 +1146,18 @@ impl<'ctx> CodeGen<'ctx> {
         if matches!(object, Expr::Var(n, _) if self.is_class_name(n)) {
             return Ok(None);
         }
-        let Some(class) = self.class_instance_of(&self.infer_declared_type(object)) else {
-            return Ok(None);
+        // (`Form.Button.OnClick(...)`: the receiver's type once its own
+        // class operations are rewritten.)
+        let class = match self.class_instance_of(&self.infer_declared_type(object)) {
+            Some(c) => c,
+            None => match self
+                .dx(object)
+                .ok()
+                .and_then(|rec| self.class_instance_of(&self.infer_declared_type(&rec)))
+            {
+                Some(c) => c,
+                None => return Ok(None),
+            },
         };
         let info = &self.objects[&class];
         if info.methods.contains_key(name) {

@@ -69,6 +69,12 @@ type
     class function InstanceSize: SizeInt;
     { The class's type information (a PTypeInfo). }
     class function ClassInfo: Pointer;
+    { The address of the published field Name (of a class type), or nil. }
+    function FieldAddress(const Name: ShortString): Pointer;
+    { The code of the published method Name, or nil. }
+    class function MethodAddress(const Name: ShortString): Pointer;
+    { The name of the published method at Address, or ''. }
+    class function MethodName(Address: Pointer): ShortString;
     class function InheritsFrom(AClass: TClass): Boolean;
     function ClassType: TClass;
     procedure AfterConstruction; virtual;
@@ -311,6 +317,93 @@ end;
 function TObject.ToString: AnsiString;
 begin
   ToString := ClassName;
+end;
+
+type
+  PBrutoFieldEntries = ^TBrutoFieldEntries;
+  TBrutoFieldEntries = array[0..65535] of TVmtFieldEntry;
+  PBrutoMethodEntries = ^TBrutoMethodEntries;
+  TBrutoMethodEntries = array[0..65535] of TVmtMethodEntry;
+
+function BrutoTypeData(Info: PTypeInfo): PTypeData;
+begin
+  BrutoTypeData := PTypeData(Pointer(Info) + SizeOf(TTypeInfo));
+end;
+
+function BrutoSameName(const A, B: ShortString): Boolean;
+var
+  I: Integer;
+begin
+  BrutoSameName := False;
+  if Length(A) <> Length(B) then
+    Exit;
+  for I := 1 to Length(A) do
+    if UpCase(A[I]) <> UpCase(B[I]) then
+      Exit;
+  BrutoSameName := True;
+end;
+
+function TObject.FieldAddress(const Name: ShortString): Pointer;
+var
+  Info: PTypeInfo;
+  Data: PTypeData;
+  I: Integer;
+begin
+  FieldAddress := nil;
+  Info := PTypeInfo(ClassInfo);
+  while Info <> nil do
+  begin
+    Data := BrutoTypeData(Info);
+    for I := 0 to Data^.OwnFieldCount - 1 do
+      if BrutoSameName(PBrutoFieldEntries(Data^.OwnFields)^[I].Name, Name) then
+      begin
+        FieldAddress := Pointer(Self) + PBrutoFieldEntries(Data^.OwnFields)^[I].FieldOffset;
+        Exit;
+      end;
+    Info := Data^.ParentInfo;
+  end;
+end;
+
+class function TObject.MethodAddress(const Name: ShortString): Pointer;
+var
+  Info: PTypeInfo;
+  Data: PTypeData;
+  I: Integer;
+begin
+  MethodAddress := nil;
+  Info := PTypeInfo(ClassInfo);
+  while Info <> nil do
+  begin
+    Data := BrutoTypeData(Info);
+    for I := 0 to Data^.OwnMethodCount - 1 do
+      if BrutoSameName(PBrutoMethodEntries(Data^.OwnMethods)^[I].Name^, Name) then
+      begin
+        MethodAddress := PBrutoMethodEntries(Data^.OwnMethods)^[I].CodeAddress;
+        Exit;
+      end;
+    Info := Data^.ParentInfo;
+  end;
+end;
+
+class function TObject.MethodName(Address: Pointer): ShortString;
+var
+  Info: PTypeInfo;
+  Data: PTypeData;
+  I: Integer;
+begin
+  MethodName := '';
+  Info := PTypeInfo(ClassInfo);
+  while Info <> nil do
+  begin
+    Data := BrutoTypeData(Info);
+    for I := 0 to Data^.OwnMethodCount - 1 do
+      if PBrutoMethodEntries(Data^.OwnMethods)^[I].CodeAddress = Address then
+      begin
+        MethodName := PBrutoMethodEntries(Data^.OwnMethods)^[I].Name^;
+        Exit;
+      end;
+    Info := Data^.ParentInfo;
+  end;
 end;
 
 class function TObject.ClassInfo: Pointer;

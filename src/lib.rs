@@ -257,67 +257,91 @@ impl PascalBuildJob {
             return BuildPhase::Failed(format!("Failed to write source: {e}"));
         }
 
-        let mut parser = Parser::with_options(
-            &source,
-            &parser::ParseOptions {
-                file: None,
-                include_dirs: self.search_dirs.clone(),
-            },
-        );
-        let mut program = match parser.parse_program() {
-            Ok(p) => p,
-            Err(e) => return BuildPhase::Failed(format!("Parse error: {e}")),
+        // Parsing and code generation recurse with the program's nesting
+        // (a long `a + b + ...` too), so they run with a large stack,
+        // whatever thread polls the build.
+        let search_dirs = self.search_dirs.clone();
+        let options = self.options;
+        let profile = self.profile;
+        let exe_for_thread = exe_path.clone();
+        let source_for_thread = source_path.clone();
+        let compiled = std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(
+                move || -> Result<(crate::codegen::ObjectArtifacts, Option<String>), String> {
+                    let exe_path = exe_for_thread;
+                    let source_path = source_for_thread;
+                    let mut parser = Parser::with_options(
+                        &source,
+                        &parser::ParseOptions {
+                            file: None,
+                            include_dirs: search_dirs.clone(),
+                        },
+                    );
+                    let mut program = match parser.parse_program() {
+                        Ok(p) => p,
+                        Err(e) => return Err(format!("Parse error: {e}")),
+                    };
+
+                    if let Err(e) = resolve_uses(&mut program, &search_dirs) {
+                        return Err(e);
+                    }
+
+                    // Obfuscation pass 1 (identifier rename) runs on the AST, before
+                    // codegen builds symbol tables from it. Pass 2 (bogus control flow)
+                    // runs on the module after compile(), below.
+                    if options.obfuscation_enabled() {
+                        obfuscate::rename_identifiers(&mut program);
+                    }
+
+                    let context = Context::create();
+                    let mut codegen = CodeGen::new(&context, &source_path);
+                    codegen.set_directives(parser.directives);
+                    codegen.set_build_options(options);
+                    codegen.set_instrument(profile);
+                    if profile {
+                        codegen.set_prof_output(&format!("{exe_path}.bruto-prof"));
+                    }
+                    if let Err(e) = codegen.compile(&program) {
+                        return Err(format!("Codegen error: {e}"));
+                    }
+
+                    // Obfuscation pass 2: bogus control flow over the compiled module,
+                    // after a successful compile and before the object is emitted.
+                    if options.obfuscation_enabled() {
+                        codegen.apply_bogus_control_flow();
+                    }
+
+                    let artifacts = match codegen.emit_object(&exe_path) {
+                        Ok(a) => a,
+                        Err(e) => return Err(e),
+                    };
+                    let _ = codegen.write_metadata(&exe_path);
+                    let prof_map_path = if profile {
+                        Some(codegen.write_prof_map(&exe_path)?)
+                    } else {
+                        None
+                    };
+                    Ok((artifacts, prof_map_path))
+                },
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|t| t.join().map_err(|_| "the compiler crashed".to_string()));
+        let (artifacts, prof_map_path) = match compiled {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) | Err(e) => return BuildPhase::Failed(e),
         };
-
-        if let Err(e) = resolve_uses(&mut program, &self.search_dirs) {
-            return BuildPhase::Failed(e);
-        }
-
-        // Obfuscation pass 1 (identifier rename) runs on the AST, before
-        // codegen builds symbol tables from it. Pass 2 (bogus control flow)
-        // runs on the module after compile(), below.
-        if self.options.obfuscation_enabled() {
-            obfuscate::rename_identifiers(&mut program);
-        }
-
-        let context = Context::create();
-        let mut codegen = CodeGen::new(&context, &source_path);
-        codegen.set_directives(parser.directives);
-        codegen.set_build_options(self.options);
-        codegen.set_instrument(self.profile);
-        if self.profile {
-            codegen.set_prof_output(&format!("{exe_path}.bruto-prof"));
-        }
-        if let Err(e) = codegen.compile(&program) {
-            return BuildPhase::Failed(format!("Codegen error: {e}"));
-        }
-
-        // Obfuscation pass 2: bogus control flow over the compiled module,
-        // after a successful compile and before the object is emitted.
-        if self.options.obfuscation_enabled() {
-            codegen.apply_bogus_control_flow();
-        }
-
-        let artifacts = match codegen.emit_object(&exe_path) {
-            Ok(a) => a,
-            Err(e) => return BuildPhase::Failed(e),
-        };
-        let _ = codegen.write_metadata(&exe_path);
 
         let mut paths = JobPaths {
             source_path,
             exe_path,
             obj_path: artifacts.obj_path,
             runtime_obj_path: None,
-            prof_map_path: None,
+            prof_map_path,
             asm_path: artifacts.asm_path,
         };
 
         if self.profile {
-            paths.prof_map_path = match codegen.write_prof_map(&paths.exe_path) {
-                Ok(p) => Some(p),
-                Err(e) => return BuildPhase::Failed(e),
-            };
             let c_path = match prof_runtime::write_runtime_source(&tmp) {
                 Ok(p) => p,
                 Err(e) => return BuildPhase::Failed(e),
@@ -6468,6 +6492,280 @@ end.
             out,
             "Name: AnsiString stored=FALSE default=0\nTag: Int64 stored=TRUE default=0\nSize: LongInt stored=TRUE default=10\nColor: TColor stored=TRUE default=-2147483648\nThing1 FALSE FALSE\n"
         );
+    }
+
+    #[test]
+    fn component_streaming_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program st1;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, TypInfo;
+type
+  TShape = (shCircle, shSquare, shTriangle);
+  TStyle = (stBold, stItalic, stUnder);
+  TStyles = set of TStyle;
+
+  TFont = class(TPersistent)
+  private
+    FSize: Integer;
+    FName: string;
+  published
+    property Size: Integer read FSize write FSize default 10;
+    property Name: string read FName write FName;
+  end;
+
+  TPanel = class(TComponent)
+  private
+    FWidth: Integer;
+    FShape: TShape;
+    FStyles: TStyles;
+    FRatio: Double;
+    FVisible: Boolean;
+    FCaption: string;
+    FFont: TFont;
+    FBuddy: TPanel;
+    FBig: Int64;
+    FInitial: Char;
+    FTiny: ShortInt;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+    procedure GetChildren(Proc: TGetChildProc; Root: TComponent); override;
+  published
+    property Width: Integer read FWidth write FWidth;
+    property Shape: TShape read FShape write FShape default shCircle;
+    property Styles: TStyles read FStyles write FStyles;
+    property Ratio: Double read FRatio write FRatio;
+    property Visible: Boolean read FVisible write FVisible default True;
+    property Caption: string read FCaption write FCaption;
+    property Font: TFont read FFont write FFont;
+    property Buddy: TPanel read FBuddy write FBuddy;
+    property Big: Int64 read FBig write FBig;
+    property Initial: Char read FInitial write FInitial;
+    property Tiny: ShortInt read FTiny write FTiny;
+  end;
+
+constructor TPanel.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FFont := TFont.Create;
+  FFont.Size := 10;
+  FVisible := True;
+end;
+
+destructor TPanel.Destroy;
+begin
+  FFont.Free;
+  inherited Destroy;
+end;
+
+procedure TPanel.GetChildren(Proc: TGetChildProc; Root: TComponent);
+var
+  I: Integer;
+begin
+  for I := 0 to ComponentCount - 1 do
+    Proc(Components[I]);
+end;
+
+procedure Dump(S: TMemoryStream);
+var
+  I: Integer;
+  B: Byte;
+begin
+  S.Position := 0;
+  for I := 0 to S.Size - 1 do
+  begin
+    S.ReadBuffer(B, 1);
+    Write(IntToHex(B, 2));
+    if I mod 32 = 31 then WriteLn;
+  end;
+  WriteLn;
+end;
+
+var
+  Root, Child, Back: TPanel;
+  Bin: TMemoryStream;
+  Txt: TStringStream;
+begin
+  RegisterClass(TPanel);
+  Root := TPanel.Create(nil);
+  Root.Name := 'Main';
+  Root.Width := 300;
+  Root.Shape := shTriangle;
+  Root.Styles := [stBold, stUnder];
+  Root.Ratio := 1.5;
+  Root.Visible := False;
+  Root.Caption := 'Hello ''world''' + #10 + 'é';
+  Root.Font.Size := 12;
+  Root.Font.Name := 'Mono';
+  Root.Big := 5000000000;
+  Root.Initial := 'Q';
+  Root.Tiny := -5;
+  Child := TPanel.Create(Root);
+  Child.Name := 'Side';
+  Child.Width := 40000;
+  Child.Tag := 7;
+  Root.Buddy := Child;
+
+  Bin := TMemoryStream.Create;
+  Bin.WriteComponent(Root);
+  Dump(Bin);
+  Bin.Position := 0;
+  Txt := TStringStream.Create('');
+  ObjectBinaryToText(Bin, Txt);
+  Write(Txt.DataString);
+
+  Bin.Position := 0;
+  Back := TPanel(Bin.ReadComponent(nil));
+  WriteLn(Back.Name, ' ', Back.Width, ' ', Back.Shape, ' ', Back.Ratio:0:2, ' ', Back.Visible, ' ', Back.Caption);
+  WriteLn(Back.Font.Size, ' ', Back.Font.Name, ' ', Back.Big, ' ', Back.Initial, ' ', Back.Tiny, ' ', Back.ComponentCount);
+  WriteLn(Back.Components[0].Name, ' ', TPanel(Back.Components[0]).Width, ' ', Back.Components[0].Tag, ' ', Back.Buddy = Back.Components[0]);
+  WriteLn(GetSetProp(Back, 'Styles', True));
+  Back.Free;
+  Root.Free;
+  Bin.Free;
+  Txt.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "54504630065450616E656C044D61696E055769647468032C0105536861706507\n0A7368547269616E676C65065374796C65730B067374426F6C64077374556E64\n65720005526174696F0500000000000000C0FF3F0756697369626C6508074361\n7074696F6E061048656C6C6F2027776F726C64270AC3A909466F6E742E53697A\n65020C09466F6E742E4E616D6506044D6F6E6F05427564647907045369646503\n4269671300F2052A0100000007496E697469616C0601510454696E7902FB0006\n5450616E656C045369646503546167020705576964746804409C000006537479\n6C65730B0003426967020007496E697469616C0601000454696E790200000000\n\nobject Main: TPanel\n  Width = 300\n  Shape = shTriangle\n  Styles = [stBold, stUnder]\n  Ratio =  1.5000000000000000E+000\n  Visible = False\n  Caption = 'Hello ''world'''#10#195#169\n  Font.Size = 12\n  Font.Name = 'Mono'\n  Buddy = Side\n  Big = 5000000000\n  Initial = 'Q'\n  Tiny = -5\n  object Side: TPanel\n    Tag = 7\n    Width = 40000\n    Styles = []\n    Big = 0\n    Initial = #0\n    Tiny = 0\n  end\nend\nMain 300 shTriangle 1.50 FALSE Hello 'world'\né\n12 Mono 5000000000 Q -5 1\nSide 40000 7 TRUE\n[stBold,stUnder]\n"
+        );
+    }
+
+    #[test]
+    fn component_text_streaming_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program st2;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes;
+type
+  TAlign = (alNone, alTop, alClient);
+  TButton = class(TComponent)
+  private
+    FCaption: string;
+    FOnClick: TNotifyEvent;
+    FAlign: TAlign;
+    FTarget: TComponent;
+    FScale: Double;
+  published
+    property Caption: string read FCaption write FCaption;
+    property OnClick: TNotifyEvent read FOnClick write FOnClick;
+    property Align: TAlign read FAlign write FAlign default alNone;
+    property Target: TComponent read FTarget write FTarget;
+    property Scale: Double read FScale write FScale;
+  end;
+
+  TForm = class(TComponent)
+  private
+    FTitle: string;
+    FLoadedCalled: Boolean;
+  protected
+    procedure Loaded; override;
+  public
+    procedure GetChildren(Proc: TGetChildProc; Root: TComponent); override;
+  published
+    OkButton: TButton;
+    CancelButton: TButton;
+    procedure OkClick(Sender: TObject);
+    property Title: string read FTitle write FTitle;
+  end;
+
+procedure TForm.Loaded;
+begin
+  inherited Loaded;
+  FLoadedCalled := True;
+end;
+
+procedure TForm.GetChildren(Proc: TGetChildProc; Root: TComponent);
+var
+  I: Integer;
+begin
+  for I := 0 to ComponentCount - 1 do
+    Proc(Components[I]);
+end;
+
+procedure TForm.OkClick(Sender: TObject);
+begin
+  WriteLn('OK clicked by ', TComponent(Sender).Name);
+end;
+
+const
+  Form1Text =
+    'object Form1: TForm' + LineEnding +
+    '  Title = ''Hello '' + #9 + ''there''' + LineEnding +
+    '  Tag = -70000' + LineEnding +
+    '  object OkButton: TButton' + LineEnding +
+    '    Caption = ''&OK''' + LineEnding +
+    '    OnClick = OkClick' + LineEnding +
+    '    Align = alTop' + LineEnding +
+    '    Target = CancelButton' + LineEnding +
+    '    Scale = 2.25' + LineEnding +
+    '  end' + LineEnding +
+    '  object CancelButton: TButton' + LineEnding +
+    '    Caption = ''Cancel''' + LineEnding +
+    '    Scale = -1E-3' + LineEnding +
+    '  end' + LineEnding +
+    'end' + LineEnding;
+
+var
+  Txt, Bin, Out: TStringStream;
+  Form: TForm;
+begin
+  RegisterClasses([TButton, TForm]);
+  Txt := TStringStream.Create(Form1Text);
+  Bin := TStringStream.Create('');
+  ObjectTextToBinary(Txt, Bin);
+  WriteLn(Bin.Size);
+  Bin.Position := 0;
+  Form := TForm.Create(nil);
+  Bin.ReadComponent(Form);
+  WriteLn(Form.Name, ' [', Form.Title, '] ', Form.Tag, ' ', Form.FLoadedCalled, ' ', Form.ComponentCount);
+  WriteLn(Form.OkButton.Caption, ' ', Form.OkButton.Align, ' ', Form.OkButton.Target = Form.CancelButton, ' ', Form.OkButton.Scale:0:3);
+  WriteLn(Form.CancelButton.Caption, ' ', Form.CancelButton.Scale:0:4, ' ', Assigned(Form.CancelButton.OnClick));
+  Form.OkButton.OnClick(Form.OkButton);
+  Out := TStringStream.Create('');
+  Bin.Size := 0;
+  Bin.WriteComponent(Form);
+  Bin.Position := 0;
+  ObjectBinaryToText(Bin, Out);
+  Write(Out.DataString);
+  WriteLn(FindClass('tbutton').ClassName, ' ', GetClass('TNope') = nil);
+  try
+    FindClass('TNope');
+  except
+    on E: Exception do WriteLn(E.ClassName, ': ', E.Message);
+  end;
+  Form.Free;
+  Txt.Free; Bin.Free; Out.Free;
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            "203\nForm1 [Hello 	there] -70000 TRUE 2\n&OK alTop TRUE 2.250\nCancel -0.0010 FALSE\nOK clicked by OkButton\nobject Form1: TForm\n  Tag = -70000\n  Title = 'Hello '#9'there'\n  object OkButton: TButton\n    Caption = '&OK'\n    OnClick = OkClick\n    Align = alTop\n    Target = CancelButton\n    Scale =  2.2500000000000000E+000\n  end\n  object CancelButton: TButton\n    Caption = 'Cancel'\n    Scale = -1.0000000000000000E-003\n  end\nend\nTButton TRUE\nEClassNotFound: Class \"TNope\" not found\n"
+        );
+    }
+
+    #[test]
+    fn utf8_string_literals_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            "program u8;
+{$mode objfpc}{$H+}
+var S: string;
+begin
+  S := 'é';
+  WriteLn(S, ' ', Length(S));
+  WriteLn('é', ' ', Length('é'));
+  WriteLn('naïve €');
+end.
+",
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "é 2\né 2\nnaïve €\n");
     }
 
     #[test]

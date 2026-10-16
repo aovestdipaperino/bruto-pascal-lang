@@ -40,8 +40,27 @@ pub fn read_source(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(match String::from_utf8(bytes) {
         Ok(text) => text,
-        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+        Err(e) => {
+            LATIN1
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_path_buf());
+            e.into_bytes().iter().map(|&b| b as char).collect()
+        }
     })
+}
+
+/// The source files read as Latin-1 (not UTF-8): their characters
+/// 128..=255 are bytes.
+static LATIN1: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether the file at `path` was read as Latin-1.
+pub fn is_latin1(path: &Path) -> bool {
+    LATIN1
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(path)
 }
 
 /// `line L:C`, followed by ` in <file>` when the location is in a unit or

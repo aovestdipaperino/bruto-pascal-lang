@@ -194,6 +194,29 @@ impl<'ctx> CodeGen<'ctx> {
         ty: &PascalType,
         name: Option<&str>,
     ) -> Option<PointerValue<'ctx>> {
+        // An alias (`TComponentName = string`, `TFoo = TBar`) shares its
+        // target's information, as in FPC.
+        if let PascalType::Named(n) = ty
+            && !self.objects.contains_key(n.as_str())
+            && let Some(def) = self.type_defs.get(n.as_str()).cloned()
+        {
+            match def {
+                PascalType::Named(target) if target != *n => {
+                    return self.type_info(&PascalType::Named(target.clone()), Some(&target));
+                }
+                PascalType::Integer
+                | PascalType::SizedInt { .. }
+                | PascalType::Real
+                | PascalType::Single
+                | PascalType::String
+                | PascalType::ShortString { .. }
+                | PascalType::UnicodeString
+                | PascalType::Boolean
+                | PascalType::Char
+                | PascalType::WideChar => return self.type_info(&def, None),
+                _ => {}
+            }
+        }
         // A named type: by its name (an alias of a class: the class).
         let (ty, name) = match (ty, name) {
             (PascalType::Named(n), _) => (self.resolve_type(ty), Some(n.clone())),
@@ -451,6 +474,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .const_int(entries.len() as u64, false)
                 .into(),
         );
+        self.class_field_and_method_tables(class, data);
         if let (Some((prop_ty, _)), false) = (self.rtti_record("tpropinfo"), entries.is_empty()) {
             let values: Vec<_> = entries.iter().map(|e| e.into_struct_value()).collect();
             let array = prop_ty.const_array(&values);
@@ -463,6 +487,82 @@ impl<'ctx> CodeGen<'ctx> {
             data.insert("ownprops", g.as_pointer_value().into());
         } else {
             data.insert("ownprops", ptr.const_null().into());
+        }
+    }
+
+    /// A class's published field table (its class-typed fields, by offset)
+    /// and method table (name and code), for `FieldAddress`,
+    /// `MethodAddress` and `MethodName`.
+    fn class_field_and_method_tables(&mut self, class: &str, data: &mut Fields<'ctx>) {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let info = self.objects[class].clone();
+        let PascalType::Record { fields, .. } = self.resolve_type(&info.record) else {
+            return;
+        };
+        let record_ty = self.llvm_type_for(&info.record);
+        let mut field_entries = Vec::new();
+        let mut method_entries = Vec::new();
+        for name in &info.own_published {
+            if let Some(index) = fields.iter().position(|(n, _)| n == name) {
+                if self.class_instance_of(&fields[index].1).is_none() {
+                    continue;
+                }
+                let offset = unsafe {
+                    ptr.const_null().const_gep(
+                        record_ty,
+                        &[i32_ty.const_zero(), i32_ty.const_int(index as u64, false)],
+                    )
+                }
+                .const_to_int(self.context.i64_type());
+                let mut values: Fields = HashMap::new();
+                values.insert("fieldoffset", offset.into());
+                values.insert("name", self.short_string_const(&self.display(name)));
+                if let Some(v) = self.rtti_const("tvmtfieldentry", &values) {
+                    field_entries.push(v.into_struct_value());
+                }
+            } else if let Some(m) = info.methods.get(name)
+                && m.symbol == format!("{class}.{name}")
+                && let Some(f) = self.module.get_function(&m.symbol)
+            {
+                let mut values: Fields = HashMap::new();
+                values.insert("name", self.short_string_global(&self.display(name)).into());
+                values.insert("codeaddress", f.as_global_value().as_pointer_value().into());
+                if let Some(v) = self.rtti_const("tvmtmethodentry", &values) {
+                    method_entries.push(v.into_struct_value());
+                }
+            }
+        }
+        for (count_field, table_field, record, entries) in [
+            (
+                "ownfieldcount",
+                "ownfields",
+                "tvmtfieldentry",
+                field_entries,
+            ),
+            (
+                "ownmethodcount",
+                "ownmethods",
+                "tvmtmethodentry",
+                method_entries,
+            ),
+        ] {
+            data.insert(
+                count_field,
+                i32_ty.const_int(entries.len() as u64, false).into(),
+            );
+            let table = match (self.rtti_record(record), entries.is_empty()) {
+                (Some((ty, _)), false) => {
+                    let array = ty.const_array(&entries);
+                    let g = self.module.add_global(array.get_type(), None, "rtti.table");
+                    g.set_linkage(Linkage::Internal);
+                    g.set_constant(true);
+                    g.set_initializer(&array);
+                    g.as_pointer_value()
+                }
+                _ => ptr.const_null(),
+            };
+            data.insert(table_field, table.into());
         }
     }
 

@@ -8,7 +8,7 @@ unit Classes;
 
 interface
 
-uses SysUtils;
+uses SysUtils, TypInfo;
 
 type
   TNotifyEvent = procedure(Sender: TObject) of object;
@@ -90,16 +90,42 @@ type
     property Items[Index: Integer]: Pointer read Get write Put; default;
   end;
 
+  { Streaming components (FPC's binary format, 'TPF0'). }
+  TValueType = (vaNull, vaList, vaInt8, vaInt16, vaInt32, vaExtended, vaString,
+    vaIdent, vaFalse, vaTrue, vaBinary, vaSet, vaLString, vaNil, vaCollection,
+    vaSingle, vaCurrency, vaDate, vaWString, vaInt64, vaUTF8String, vaUString,
+    vaQWord);
+  TFilerFlag = (ffInherited, ffChildPos, ffInline);
+  TFilerFlags = set of TFilerFlag;
+  TComponentStateItem = (csLoading, csReading, csWriting, csDestroying, csDesigning,
+    csAncestor, csUpdating, csFixups, csFreeNotification, csInline, csDesignInstance);
+  TComponentState = set of TComponentStateItem;
+  TComponentName = string;
+
+  EFilerError = class(EStreamError);
+  EClassNotFound = class(EFilerError);
+  EComponentError = class(Exception);
+  EParserError = class(Exception);
+
+  TFiler = class;
+  TReader = class;
+  TWriter = class;
+  TComponent = class;
+  PComponent = ^TComponent;
+  TGetChildProc = procedure(Child: TComponent) of object;
+
   { Compiled with type information: its descendants' default sections
     are published, as in FPC. }
 {$M+}
   TPersistent = class(TObject)
   protected
     procedure AssignTo(Dest: TPersistent); virtual;
+    procedure DefineProperties(Filer: TFiler); virtual;
   public
     procedure Assign(Source: TPersistent); virtual;
   end;
 {$M-}
+  TPersistentClass = class of TPersistent;
 
   { A component: owned components are freed with their owner. }
   TComponent = class(TPersistent)
@@ -108,10 +134,21 @@ type
     FName: string;
     FTag: PtrInt;
     FComponents: TFPList;
+    FComponentState: TComponentState;
     function GetComponent(Index: Integer): TComponent;
     function GetComponentCount: Integer;
+  protected
+    procedure Loaded; virtual;
+    procedure ReadState(Reader: TReader); virtual;
+    procedure SetName(const NewName: TComponentName); virtual;
+    procedure SetReference(Enable: Boolean);
+    function GetChildOwner: TComponent; virtual;
+    function GetChildParent: TComponent; virtual;
   public
     constructor Create(AOwner: TComponent); virtual;
+    procedure WriteState(Writer: TWriter); virtual;
+    procedure GetChildren(Proc: TGetChildProc; Root: TComponent); virtual;
+    property ComponentState: TComponentState read FComponentState;
     destructor Destroy; override;
     procedure InsertComponent(AComponent: TComponent);
     procedure RemoveComponent(AComponent: TComponent);
@@ -120,7 +157,7 @@ type
     property Components[Index: Integer]: TComponent read GetComponent;
     property ComponentCount: Integer read GetComponentCount;
   published
-    property Name: string read FName write FName stored False;
+    property Name: TComponentName read FName write SetName stored False;
     property Tag: PtrInt read FTag write FTag default 0;
   end;
   TComponentClass = class of TComponent;
@@ -144,6 +181,17 @@ type
     procedure WriteByte(B: Byte);
     function ReadAnsiString: AnsiString;
     procedure WriteAnsiString(const S: AnsiString);
+    function ReadWord: Word;
+    function ReadDWord: LongWord;
+    function ReadQWord: QWord;
+    procedure WriteWord(W: Word);
+    procedure WriteDWord(D: LongWord);
+    procedure WriteQWord(Q: QWord);
+    { A component (its published properties and children) in FPC's binary
+      format, and back. }
+    procedure WriteComponent(Instance: TComponent);
+    procedure WriteDescendent(Instance, Ancestor: TComponent);
+    function ReadComponent(Instance: TComponent): TComponent;
     property Position: Int64 read GetPosition write SetPosition;
     property Size: Int64 read GetSize write SetSize;
   end;
@@ -207,6 +255,78 @@ type
     function ReadString(Count: LongInt): string;
     procedure WriteString(const AString: string);
     property DataString: string read GetDataString;
+  end;
+
+  TFiler = class(TObject)
+  protected
+    FStream: TStream;
+    FRoot: TComponent;
+    FLookupRoot: TComponent;
+  public
+    constructor Create(Stream: TStream; BufSize: Integer);
+    property Root: TComponent read FRoot write FRoot;
+    property LookupRoot: TComponent read FLookupRoot;
+  end;
+
+  TWriter = class(TFiler)
+  private
+    FPropPath: string;
+    procedure WriteStr(const S: string);
+    procedure WriteChildren(Component: TComponent);
+  public
+    procedure WriteValue(Value: TValueType);
+    procedure WriteSignature;
+    procedure WriteDescendent(ARoot: TComponent; AAncestor: TComponent);
+    procedure WriteRootComponent(ARoot: TComponent);
+    procedure WriteComponent(Component: TComponent);
+    procedure WriteComponentData(Instance: TComponent);
+    procedure WriteProperties(Instance: TPersistent);
+    procedure WriteProperty(Instance: TPersistent; PropInfo: PPropInfo);
+    procedure WriteBoolean(Value: Boolean);
+    procedure WriteChar(Value: Char);
+    procedure WriteFloat(const Value: Double);
+    procedure WriteIdent(const Ident: string);
+    procedure WriteInteger(Value: Int64);
+    procedure WriteSet(Value: LongInt; SetType: Pointer);
+    procedure WriteString(const Value: string);
+    procedure WriteMethodName(const Name: string);
+    procedure WriteListBegin;
+    procedure WriteListEnd;
+  end;
+
+  TReader = class(TFiler)
+  private
+    FOwner: TComponent;
+    FParent: TComponent;
+    FLoaded: TFPList;
+    FFixups: TFPList;
+    procedure ReadPrefix(var Flags: TFilerFlags; var ChildPos: Integer);
+    procedure ReadPropValue(Instance: TPersistent; PropInfo: PPropInfo);
+    procedure DoFixupReferences;
+  public
+    destructor Destroy; override;
+    function ReadRootComponent(ARoot: TComponent): TComponent;
+    function ReadComponent(Component: TComponent): TComponent;
+    procedure ReadData(Instance: TComponent);
+    procedure ReadProperty(AInstance: TPersistent);
+    procedure ReadSignature;
+    function ReadValue: TValueType;
+    function NextValue: TValueType;
+    function EndOfList: Boolean;
+    procedure ReadListBegin;
+    procedure ReadListEnd;
+    function ReadStr: string;
+    function ReadInteger: LongInt;
+    function ReadInt64: Int64;
+    function ReadString: string;
+    function ReadIdent: string;
+    function ReadBoolean: Boolean;
+    function ReadFloat: Double;
+    function ReadChar: Char;
+    function ReadSet(SetType: Pointer): LongInt;
+    procedure SkipValue;
+    property Owner: TComponent read FOwner write FOwner;
+    property Parent: TComponent read FParent write FParent;
   end;
 
   { String lists. }
@@ -354,6 +474,18 @@ type
 
 const
   fmCreate = $FF00;
+
+{ The classes ReadComponent can make, by name. }
+procedure RegisterClass(AClass: TPersistentClass);
+procedure RegisterClasses(AClasses: array of TPersistentClass);
+procedure UnRegisterClass(AClass: TPersistentClass);
+function GetClass(const AClassName: string): TPersistentClass;
+function FindClass(const AClassName: string): TPersistentClass;
+
+{ A stream of components in FPC's binary format as text (`object Name:
+  TClass ... end`), and back. }
+procedure ObjectBinaryToText(Input, Output: TStream);
+procedure ObjectTextToBinary(Input, Output: TStream);
 
 implementation
 
@@ -1954,6 +2086,1715 @@ begin
     FCaseSensitive := Value;
     if FSorted then
       Sort;
+  end;
+end;
+
+{ ── Streaming components ── }
+
+const
+  FilerSignature: array[1..4] of Char = ('T', 'P', 'F', '0');
+  NoDefault = Low(LongInt);
+
+type
+  PBrutoFixup = ^TBrutoFixup;
+  TBrutoFixup = record
+    Instance: TPersistent;
+    PropInfo: PPropInfo;
+    Name: string;
+  end;
+
+var
+  BrutoClassList: TFPList;
+
+procedure RegisterClass(AClass: TPersistentClass);
+begin
+  if BrutoClassList = nil then
+    BrutoClassList := TFPList.Create;
+  if BrutoClassList.IndexOf(Pointer(AClass)) < 0 then
+    BrutoClassList.Add(Pointer(AClass));
+end;
+
+procedure RegisterClasses(AClasses: array of TPersistentClass);
+var
+  I: Integer;
+begin
+  for I := 0 to High(AClasses) do
+    RegisterClass(AClasses[I]);
+end;
+
+procedure UnRegisterClass(AClass: TPersistentClass);
+begin
+  if BrutoClassList <> nil then
+    BrutoClassList.Remove(Pointer(AClass));
+end;
+
+function GetClass(const AClassName: string): TPersistentClass;
+var
+  I: Integer;
+  Name: string;
+begin
+  Result := nil;
+  if BrutoClassList = nil then
+    Exit;
+  for I := 0 to BrutoClassList.Count - 1 do
+  begin
+    Name := TPersistentClass(BrutoClassList[I]).ClassName;
+    if CompareText(Name, AClassName) = 0 then
+      Exit(TPersistentClass(BrutoClassList[I]));
+  end;
+end;
+
+function FindClass(const AClassName: string): TPersistentClass;
+begin
+  Result := GetClass(AClassName);
+  if Result = nil then
+    raise EClassNotFound.CreateFmt('Class "%s" not found', [AClassName]);
+end;
+
+{ A Double as the 10-byte extended FPC's binary format holds. }
+procedure DoubleToExtended(D: Double; var Ext: array of Byte);
+var
+  Bits, Mant: QWord;
+  Exp: Integer;
+  Sign: Boolean;
+  I: Integer;
+begin
+  Bits := PQWord(@D)^;
+  Sign := (Bits shr 63) <> 0;
+  Exp := (Bits shr 52) and $7FF;
+  Mant := Bits and $FFFFFFFFFFFFF;
+  if (Exp = 0) and (Mant = 0) then
+  begin
+    for I := 0 to 9 do
+      Ext[I] := 0;
+  end
+  else
+  begin
+    if Exp = $7FF then
+      Exp := $7FFF
+    else if Exp = 0 then
+    begin
+      { A denormal: normalize it. }
+      Exp := 1;
+      while (Mant and (QWord(1) shl 52)) = 0 do
+      begin
+        Mant := Mant shl 1;
+        Dec(Exp);
+      end;
+      Exp := Exp - 1023 + 16383;
+    end
+    else
+      Exp := Exp - 1023 + 16383;
+    Mant := (QWord(1) shl 63) or ((Mant and $FFFFFFFFFFFFF) shl 11);
+    for I := 0 to 7 do
+      Ext[I] := (Mant shr (8 * I)) and $FF;
+    Ext[8] := Exp and $FF;
+    Ext[9] := (Exp shr 8) and $7F;
+  end;
+  if Sign then
+    Ext[9] := Ext[9] or $80;
+end;
+
+function ExtendedToDouble(const Ext: array of Byte): Double;
+var
+  Mant, D: QWord;
+  Exp, I: Integer;
+  Sign: Boolean;
+begin
+  Mant := 0;
+  for I := 7 downto 0 do
+    Mant := (Mant shl 8) or Ext[I];
+  Exp := Ext[8] or (Ext[9] shl 8);
+  Sign := (Exp and $8000) <> 0;
+  Exp := Exp and $7FFF;
+  case Exp of
+    0: Mant := 0;
+    $7FFF: Exp := 2047;
+  else
+    begin
+      Exp := Exp - (16383 - 1023);
+      if (Exp >= -51) and (Exp <= 0) then
+      begin
+        Mant := Mant shr (-Exp);
+        Exp := 0;
+      end
+      else if (Exp < -51) or (Exp > 2046) then
+        Exit(0)
+      else
+        Mant := Mant shl 1;
+    end;
+  end;
+  D := QWord(Exp) shl 52;
+  Mant := Mant shr 12;
+  D := D or Mant;
+  if Sign then
+    D := D or (QWord(1) shl 63);
+  Result := PDouble(@D)^;
+end;
+
+{ TPersistent / TComponent }
+
+procedure TPersistent.DefineProperties(Filer: TFiler);
+begin
+end;
+
+procedure TComponent.Loaded;
+begin
+  Exclude(FComponentState, csLoading);
+end;
+
+procedure TComponent.ReadState(Reader: TReader);
+begin
+  Reader.ReadData(Self);
+end;
+
+procedure TComponent.WriteState(Writer: TWriter);
+begin
+  Writer.WriteComponentData(Self);
+end;
+
+procedure TComponent.GetChildren(Proc: TGetChildProc; Root: TComponent);
+begin
+end;
+
+function TComponent.GetChildOwner: TComponent;
+begin
+  Result := nil;
+end;
+
+function TComponent.GetChildParent: TComponent;
+begin
+  Result := Self;
+end;
+
+{ The owner's published field of this component's name refers to it. }
+procedure TComponent.SetReference(Enable: Boolean);
+var
+  Field: PComponent;
+begin
+  if (FOwner <> nil) and (FName <> '') then
+  begin
+    Field := PComponent(FOwner.FieldAddress(FName));
+    if Field <> nil then
+      if Enable then
+        Field^ := Self
+      else
+        Field^ := nil;
+  end;
+end;
+
+procedure TComponent.SetName(const NewName: TComponentName);
+begin
+  if FName = NewName then
+    Exit;
+  if (NewName <> '') and (FOwner <> nil) and (FOwner.FindComponent(NewName) <> nil) then
+    raise EComponentError.CreateFmt('Duplicate name: A component named "%s" already exists',
+      [NewName]);
+  SetReference(False);
+  FName := NewName;
+  SetReference(True);
+end;
+
+{ TStream: words and components }
+
+function TStream.ReadWord: Word;
+begin
+  ReadBuffer(Result, 2);
+end;
+
+function TStream.ReadDWord: LongWord;
+begin
+  ReadBuffer(Result, 4);
+end;
+
+function TStream.ReadQWord: QWord;
+begin
+  ReadBuffer(Result, 8);
+end;
+
+procedure TStream.WriteWord(W: Word);
+begin
+  WriteBuffer(W, 2);
+end;
+
+procedure TStream.WriteDWord(D: LongWord);
+begin
+  WriteBuffer(D, 4);
+end;
+
+procedure TStream.WriteQWord(Q: QWord);
+begin
+  WriteBuffer(Q, 8);
+end;
+
+procedure TStream.WriteComponent(Instance: TComponent);
+begin
+  WriteDescendent(Instance, nil);
+end;
+
+procedure TStream.WriteDescendent(Instance, Ancestor: TComponent);
+var
+  Writer: TWriter;
+begin
+  Writer := TWriter.Create(Self, 4096);
+  try
+    Writer.WriteDescendent(Instance, Ancestor);
+  finally
+    Writer.Free;
+  end;
+end;
+
+function TStream.ReadComponent(Instance: TComponent): TComponent;
+var
+  Reader: TReader;
+begin
+  Reader := TReader.Create(Self, 4096);
+  try
+    Result := Reader.ReadRootComponent(Instance);
+  finally
+    Reader.Free;
+  end;
+end;
+
+{ TFiler }
+
+constructor TFiler.Create(Stream: TStream; BufSize: Integer);
+begin
+  inherited Create;
+  FStream := Stream;
+end;
+
+{ TWriter }
+
+procedure TWriter.WriteValue(Value: TValueType);
+begin
+  FStream.WriteByte(Ord(Value));
+end;
+
+procedure TWriter.WriteStr(const S: string);
+var
+  Len: Integer;
+begin
+  Len := Length(S);
+  if Len > 255 then
+    Len := 255;
+  FStream.WriteByte(Len);
+  if Len > 0 then
+    FStream.WriteBuffer(S[1], Len);
+end;
+
+procedure TWriter.WriteSignature;
+begin
+  FStream.WriteBuffer(FilerSignature, 4);
+end;
+
+procedure TWriter.WriteDescendent(ARoot: TComponent; AAncestor: TComponent);
+begin
+  FRoot := ARoot;
+  FLookupRoot := ARoot;
+  WriteSignature;
+  WriteComponent(ARoot);
+end;
+
+procedure TWriter.WriteRootComponent(ARoot: TComponent);
+begin
+  WriteDescendent(ARoot, nil);
+end;
+
+procedure TWriter.WriteComponent(Component: TComponent);
+begin
+  Include(Component.FComponentState, csWriting);
+  try
+    Component.WriteState(Self);
+    WriteListEnd;
+  finally
+    Exclude(Component.FComponentState, csWriting);
+  end;
+end;
+
+procedure TWriter.WriteChildren(Component: TComponent);
+begin
+  Component.GetChildren(@WriteComponent, FRoot);
+end;
+
+procedure TWriter.WriteComponentData(Instance: TComponent);
+var
+  ClassText: string;
+begin
+  ClassText := Instance.ClassName;
+  WriteStr(ClassText);
+  WriteStr(Instance.Name);
+  WriteProperties(Instance);
+  WriteListEnd;
+  WriteChildren(Instance);
+end;
+
+procedure TWriter.WriteProperties(Instance: TPersistent);
+var
+  PropCount, I: Integer;
+  PropList: PPropList;
+begin
+  PropCount := GetPropList(Instance, PropList);
+  if PropCount > 0 then
+    try
+      for I := 0 to PropCount - 1 do
+        if IsStoredProp(Instance, PropList^[I]) then
+          WriteProperty(Instance, PropList^[I]);
+    finally
+      FreeMem(PropList);
+    end;
+  Instance.DefineProperties(Self);
+end;
+
+procedure TWriter.WriteProperty(Instance: TPersistent; PropInfo: PPropInfo);
+var
+  PropType: PTypeInfo;
+  Value, DefValue: LongInt;
+  Int64Value: Int64;
+  FloatValue, DefFloat: Double;
+  StrValue, Name, SavedPath: string;
+  ObjValue: TObject;
+  C: TComponent;
+  Method: TMethod;
+begin
+  { Only properties that can be read and written are streamed. }
+  if PropInfo^.GetProc = nil then
+    Exit;
+  PropType := PropInfo^.PropType;
+  if (PropInfo^.SetProc = nil) and (PropType^.Kind <> tkClass) then
+    Exit;
+  case PropType^.Kind of
+    tkInteger, tkChar, tkEnumeration, tkSet, tkWChar:
+      begin
+        Value := GetOrdProp(Instance, PropInfo);
+        DefValue := PropInfo^.Default;
+        if (Value <> DefValue) or (DefValue = NoDefault) then
+        begin
+          WriteStr(FPropPath + PropInfo^.Name);
+          case PropType^.Kind of
+            tkInteger: WriteInteger(Value);
+            tkChar, tkWChar: WriteChar(Chr(Value and $FF));
+            tkSet: WriteSet(Value, GetTypeData(PropType)^.CompType);
+            tkEnumeration: WriteIdent(GetEnumName(PropType, Value));
+          end;
+        end;
+      end;
+    tkFloat:
+      begin
+        FloatValue := GetFloatProp(Instance, PropInfo);
+        DefValue := PropInfo^.Default;
+        DefFloat := PSingle(@DefValue)^;
+        if (FloatValue <> DefFloat) or (DefValue = NoDefault) then
+        begin
+          WriteStr(FPropPath + PropInfo^.Name);
+          WriteFloat(FloatValue);
+        end;
+      end;
+    tkMethod:
+      begin
+        Method := GetMethodProp(Instance, PropInfo);
+        if (Method.Code <> nil) and (FLookupRoot.MethodName(Method.Code) <> '') then
+        begin
+          WriteStr(FPropPath + PropInfo^.Name);
+          WriteMethodName(FLookupRoot.MethodName(Method.Code));
+        end;
+      end;
+    tkSString, tkLString, tkAString, tkUString:
+      begin
+        StrValue := GetStrProp(Instance, PropInfo);
+        if (StrValue <> '') or (PropInfo^.Default = NoDefault) then
+        begin
+          WriteStr(FPropPath + PropInfo^.Name);
+          WriteString(StrValue);
+        end;
+      end;
+    tkClass:
+      begin
+        ObjValue := GetObjectProp(Instance, PropInfo);
+        if (ObjValue <> nil) and ObjValue.InheritsFrom(TComponent) then
+        begin
+          { A reference to a component, by its path from the root. }
+          Name := '';
+          C := TComponent(ObjValue);
+          while (C <> nil) and (C.Name <> '') do
+          begin
+            if Name <> '' then
+              Name := '.' + Name;
+            if C.Owner = FLookupRoot then
+            begin
+              Name := C.Name + Name;
+              Break;
+            end
+            else if C = FLookupRoot then
+            begin
+              Name := 'Owner' + Name;
+              Break;
+            end;
+            Name := C.Name + Name;
+            C := C.Owner;
+          end;
+          if (C = nil) and (TComponent(ObjValue).Owner = nil) and (Name <> '') then
+            Name := Name + '.Owner';
+          if Name <> '' then
+          begin
+            WriteStr(FPropPath + PropInfo^.Name);
+            WriteIdent(Name);
+          end;
+        end
+        else if (ObjValue <> nil) and ObjValue.InheritsFrom(TPersistent) then
+        begin
+          { A persistent object: its properties, as Prop.Sub. }
+          SavedPath := FPropPath;
+          try
+            FPropPath := FPropPath + PropInfo^.Name + '.';
+            WriteProperties(TPersistent(ObjValue));
+          finally
+            FPropPath := SavedPath;
+          end;
+        end;
+      end;
+    tkInt64, tkQWord:
+      begin
+        Int64Value := GetInt64Prop(Instance, PropInfo);
+        if (Int64Value <> PropInfo^.Default) or (PropInfo^.Default = NoDefault) then
+        begin
+          WriteStr(FPropPath + PropInfo^.Name);
+          WriteInteger(Int64Value);
+        end;
+      end;
+    tkBool:
+      begin
+        Value := GetOrdProp(Instance, PropInfo);
+        DefValue := PropInfo^.Default;
+        if ((Value <> 0) <> (DefValue <> 0)) or (DefValue = NoDefault) then
+        begin
+          WriteStr(FPropPath + PropInfo^.Name);
+          WriteBoolean(Value <> 0);
+        end;
+      end;
+  end;
+end;
+
+procedure TWriter.WriteBoolean(Value: Boolean);
+begin
+  if Value then
+    WriteValue(vaTrue)
+  else
+    WriteValue(vaFalse);
+end;
+
+procedure TWriter.WriteChar(Value: Char);
+begin
+  WriteString(Value);
+end;
+
+procedure TWriter.WriteFloat(const Value: Double);
+var
+  Ext: array[0..9] of Byte;
+begin
+  WriteValue(vaExtended);
+  DoubleToExtended(Value, Ext);
+  FStream.WriteBuffer(Ext, 10);
+end;
+
+procedure TWriter.WriteIdent(const Ident: string);
+var
+  U: string;
+begin
+  U := UpperCase(Ident);
+  if U = 'NIL' then
+    WriteValue(vaNil)
+  else if U = 'FALSE' then
+    WriteValue(vaFalse)
+  else if U = 'TRUE' then
+    WriteValue(vaTrue)
+  else if U = 'NULL' then
+    WriteValue(vaNull)
+  else
+  begin
+    WriteValue(vaIdent);
+    WriteStr(Ident);
+  end;
+end;
+
+procedure TWriter.WriteInteger(Value: Int64);
+begin
+  if (Value >= -128) and (Value <= 127) then
+  begin
+    WriteValue(vaInt8);
+    FStream.WriteByte(Value and $FF);
+  end
+  else if (Value >= -32768) and (Value <= 32767) then
+  begin
+    WriteValue(vaInt16);
+    FStream.WriteWord(Value and $FFFF);
+  end
+  else if (Value >= -2147483648) and (Value <= 2147483647) then
+  begin
+    WriteValue(vaInt32);
+    FStream.WriteDWord(Value and $FFFFFFFF);
+  end
+  else
+  begin
+    WriteValue(vaInt64);
+    FStream.WriteQWord(QWord(Value));
+  end;
+end;
+
+procedure TWriter.WriteSet(Value: LongInt; SetType: Pointer);
+var
+  I: Integer;
+begin
+  WriteValue(vaSet);
+  for I := 0 to 31 do
+    if (Value and (LongInt(1) shl I)) <> 0 then
+      WriteStr(GetEnumName(PTypeInfo(SetType), I));
+  WriteStr('');
+end;
+
+procedure TWriter.WriteString(const Value: string);
+var
+  Len: Integer;
+begin
+  Len := Length(Value);
+  if Len <= 255 then
+  begin
+    WriteValue(vaString);
+    FStream.WriteByte(Len);
+  end
+  else
+  begin
+    WriteValue(vaLString);
+    FStream.WriteDWord(Len);
+  end;
+  if Len > 0 then
+    FStream.WriteBuffer(Value[1], Len);
+end;
+
+procedure TWriter.WriteMethodName(const Name: string);
+begin
+  if Name <> '' then
+  begin
+    WriteValue(vaIdent);
+    WriteStr(Name);
+  end
+  else
+    WriteValue(vaNil);
+end;
+
+procedure TWriter.WriteListBegin;
+begin
+  WriteValue(vaList);
+end;
+
+procedure TWriter.WriteListEnd;
+begin
+  WriteValue(vaNull);
+end;
+
+{ TReader }
+
+destructor TReader.Destroy;
+var
+  I: Integer;
+begin
+  if FFixups <> nil then
+  begin
+    for I := 0 to FFixups.Count - 1 do
+      Dispose(PBrutoFixup(FFixups[I]));
+    FFixups.Free;
+  end;
+  inherited Destroy;
+end;
+
+function TReader.ReadValue: TValueType;
+begin
+  Result := TValueType(FStream.ReadByte);
+end;
+
+function TReader.NextValue: TValueType;
+begin
+  Result := ReadValue;
+  FStream.Seek(-1, soCurrent);
+end;
+
+function TReader.EndOfList: Boolean;
+begin
+  Result := NextValue = vaNull;
+end;
+
+procedure TReader.ReadListBegin;
+begin
+  if ReadValue <> vaList then
+    raise EReadError.Create('Invalid stream format');
+end;
+
+procedure TReader.ReadListEnd;
+begin
+  if ReadValue <> vaNull then
+    raise EReadError.Create('Invalid stream format');
+end;
+
+function TReader.ReadStr: string;
+var
+  Len: Byte;
+begin
+  Len := FStream.ReadByte;
+  SetLength(Result, Len);
+  if Len > 0 then
+    FStream.ReadBuffer(Result[1], Len);
+end;
+
+procedure TReader.ReadSignature;
+var
+  Sig: array[1..4] of Char;
+begin
+  FStream.ReadBuffer(Sig, 4);
+  if (Sig[1] <> 'T') or (Sig[2] <> 'P') or (Sig[3] <> 'F') or (Sig[4] <> '0') then
+    raise EReadError.Create('Invalid stream format');
+end;
+
+procedure TReader.ReadPrefix(var Flags: TFilerFlags; var ChildPos: Integer);
+var
+  B: Byte;
+begin
+  Flags := [];
+  B := FStream.ReadByte;
+  if (B and $F0) = $F0 then
+  begin
+    if (B and 1) <> 0 then
+      Include(Flags, ffInherited);
+    if (B and 2) <> 0 then
+    begin
+      Include(Flags, ffChildPos);
+      ChildPos := ReadInteger;
+    end;
+    if (B and 4) <> 0 then
+      Include(Flags, ffInline);
+  end
+  else
+    FStream.Seek(-1, soCurrent);
+end;
+
+function TReader.ReadInt64: Int64;
+begin
+  case ReadValue of
+    vaInt8: Result := ShortInt(FStream.ReadByte);
+    vaInt16: Result := SmallInt(FStream.ReadWord);
+    vaInt32: Result := LongInt(FStream.ReadDWord);
+    vaInt64, vaQWord: Result := Int64(FStream.ReadQWord);
+  else
+    raise EReadError.Create('Invalid property value');
+  end;
+end;
+
+function TReader.ReadInteger: LongInt;
+begin
+  Result := ReadInt64;
+end;
+
+function TReader.ReadString: string;
+var
+  Len: LongWord;
+  W: UnicodeString;
+begin
+  case ReadValue of
+    vaString:
+      begin
+        Len := FStream.ReadByte;
+        SetLength(Result, Len);
+        if Len > 0 then
+          FStream.ReadBuffer(Result[1], Len);
+      end;
+    vaLString, vaUTF8String:
+      begin
+        Len := FStream.ReadDWord;
+        SetLength(Result, Len);
+        if Len > 0 then
+          FStream.ReadBuffer(Result[1], Len);
+      end;
+    vaWString, vaUString:
+      begin
+        Len := FStream.ReadDWord;
+        SetLength(W, Len);
+        if Len > 0 then
+          FStream.ReadBuffer(W[1], Len * 2);
+        Result := W;
+      end;
+  else
+    raise EReadError.Create('Invalid property value');
+  end;
+end;
+
+function TReader.ReadIdent: string;
+begin
+  case ReadValue of
+    vaIdent: Result := ReadStr;
+    vaFalse: Result := 'False';
+    vaTrue: Result := 'True';
+    vaNil: Result := 'nil';
+    vaNull: Result := 'Null';
+  else
+    raise EReadError.Create('Invalid property value');
+  end;
+end;
+
+function TReader.ReadBoolean: Boolean;
+begin
+  case ReadValue of
+    vaTrue: Result := True;
+    vaFalse: Result := False;
+  else
+    raise EReadError.Create('Invalid property value');
+  end;
+end;
+
+function TReader.ReadFloat: Double;
+var
+  Ext: array[0..9] of Byte;
+begin
+  if NextValue = vaExtended then
+  begin
+    ReadValue;
+    FStream.ReadBuffer(Ext, 10);
+    Result := ExtendedToDouble(Ext);
+  end
+  else
+    Result := ReadInt64;
+end;
+
+function TReader.ReadChar: Char;
+var
+  S: string;
+begin
+  S := ReadString;
+  if Length(S) = 1 then
+    Result := S[1]
+  else
+    raise EReadError.Create('Invalid property value');
+end;
+
+function TReader.ReadSet(SetType: Pointer): LongInt;
+var
+  Name: string;
+  N: Integer;
+begin
+  Result := 0;
+  if ReadValue <> vaSet then
+    raise EReadError.Create('Invalid property value');
+  while True do
+  begin
+    Name := ReadStr;
+    if Name = '' then
+      Break;
+    N := GetEnumValue(PTypeInfo(SetType), Name);
+    if N < 0 then
+      raise EReadError.Create('Invalid property value');
+    Result := Result or (LongInt(1) shl N);
+  end;
+end;
+
+procedure TReader.SkipValue;
+var
+  Len: LongWord;
+begin
+  case ReadValue of
+    vaNull, vaFalse, vaTrue, vaNil: ;
+    vaList:
+      begin
+        while not EndOfList do
+          SkipValue;
+        ReadListEnd;
+      end;
+    vaInt8: FStream.Seek(1, soCurrent);
+    vaInt16: FStream.Seek(2, soCurrent);
+    vaInt32, vaSingle: FStream.Seek(4, soCurrent);
+    vaInt64, vaQWord, vaCurrency, vaDate: FStream.Seek(8, soCurrent);
+    vaExtended: FStream.Seek(10, soCurrent);
+    vaString, vaIdent: ReadStr;
+    vaLString, vaUTF8String, vaBinary:
+      begin
+        Len := FStream.ReadDWord;
+        FStream.Seek(Len, soCurrent);
+      end;
+    vaWString, vaUString:
+      begin
+        Len := FStream.ReadDWord;
+        FStream.Seek(Len * 2, soCurrent);
+      end;
+    vaSet:
+      while ReadStr <> '' do ;
+  else
+    raise EReadError.Create('Invalid stream format');
+  end;
+end;
+
+function TReader.ReadRootComponent(ARoot: TComponent): TComponent;
+var
+  Flags: TFilerFlags;
+  ChildPos, I: Integer;
+  CompClassName, CompName: string;
+begin
+  ReadSignature;
+  ReadPrefix(Flags, ChildPos);
+  CompClassName := ReadStr;
+  CompName := ReadStr;
+  if ARoot = nil then
+  begin
+    Result := TComponentClass(FindClass(CompClassName)).Create(nil);
+    Result.Name := CompName;
+  end
+  else
+  begin
+    Result := ARoot;
+    Result.FComponentState := Result.FComponentState + [csLoading, csReading];
+    Result.Name := CompName;
+  end;
+  FRoot := Result;
+  FLookupRoot := Result;
+  FLoaded := TFPList.Create;
+  try
+    FLoaded.Add(FRoot);
+    FOwner := FRoot;
+    FRoot.FComponentState := FRoot.FComponentState + [csLoading, csReading];
+    FRoot.ReadState(Self);
+    Exclude(FRoot.FComponentState, csReading);
+    for I := 0 to FLoaded.Count - 1 do
+      TComponent(FLoaded[I]).Loaded;
+  finally
+    FLoaded.Free;
+    FLoaded := nil;
+  end;
+end;
+
+function TReader.ReadComponent(Component: TComponent): TComponent;
+var
+  Flags: TFilerFlags;
+  ChildPos: Integer;
+  CompClassName, CompName: string;
+  SavedParent, SavedLookupRoot: TComponent;
+begin
+  ReadPrefix(Flags, ChildPos);
+  CompClassName := ReadStr;
+  CompName := ReadStr;
+  SavedParent := FParent;
+  SavedLookupRoot := FLookupRoot;
+  try
+    Result := Component;
+    if Result = nil then
+    begin
+      if ffInherited in Flags then
+      begin
+        Result := FLookupRoot.FindComponent(CompName);
+        if Result = nil then
+          raise EReadError.CreateFmt('Ancestor for "%s" not found', [CompName]);
+      end
+      else
+      begin
+        Result := TComponentClass(FindClass(CompClassName)).Create(FOwner);
+        Include(Result.FComponentState, csLoading);
+        Result.Name := CompName;
+      end;
+    end;
+    Include(Result.FComponentState, csLoading);
+    Include(Result.FComponentState, csReading);
+    Result.ReadState(Self);
+    Exclude(Result.FComponentState, csReading);
+    if FLoaded.IndexOf(Result) < 0 then
+      FLoaded.Add(Result);
+  finally
+    FParent := SavedParent;
+    FLookupRoot := SavedLookupRoot;
+  end;
+end;
+
+procedure TReader.ReadData(Instance: TComponent);
+var
+  SavedOwner, SavedParent: TComponent;
+begin
+  while not EndOfList do
+    ReadProperty(Instance);
+  ReadListEnd;
+  SavedOwner := FOwner;
+  SavedParent := FParent;
+  try
+    FOwner := Instance.GetChildOwner;
+    if FOwner = nil then
+      FOwner := FRoot;
+    FParent := Instance.GetChildParent;
+    while not EndOfList do
+      ReadComponent(nil);
+    ReadListEnd;
+  finally
+    FOwner := SavedOwner;
+    FParent := SavedParent;
+  end;
+  if Instance = FRoot then
+    DoFixupReferences;
+end;
+
+procedure TReader.ReadProperty(AInstance: TPersistent);
+var
+  PropName, Part: string;
+  Instance: TPersistent;
+  PropInfo: PPropInfo;
+  P: Integer;
+  Obj: TObject;
+begin
+  PropName := ReadStr;
+  Instance := AInstance;
+  Part := PropName;
+  { `Font.Size`: a property of an object property. }
+  P := Pos('.', Part);
+  while P > 0 do
+  begin
+    PropInfo := GetPropInfo(Instance, Copy(Part, 1, P - 1));
+    if PropInfo = nil then
+      raise EReadError.CreateFmt('Unknown property: "%s"', [PropName]);
+    Obj := GetObjectProp(Instance, PropInfo);
+    if not (Obj is TPersistent) then
+      raise EReadError.CreateFmt('Unknown property: "%s"', [PropName]);
+    Instance := TPersistent(Obj);
+    Delete(Part, 1, P);
+    P := Pos('.', Part);
+  end;
+  PropInfo := GetPropInfo(Instance, Part);
+  if PropInfo = nil then
+    raise EReadError.CreateFmt('Unknown property: "%s"', [PropName]);
+  ReadPropValue(Instance, PropInfo);
+end;
+
+procedure TReader.ReadPropValue(Instance: TPersistent; PropInfo: PPropInfo);
+var
+  PropType: PTypeInfo;
+  Ident: string;
+  N: Integer;
+  Method: TMethod;
+  Fixup: PBrutoFixup;
+begin
+  PropType := PropInfo^.PropType;
+  case PropType^.Kind of
+    tkInteger:
+      SetOrdProp(Instance, PropInfo, ReadInteger);
+    tkInt64, tkQWord:
+      SetInt64Prop(Instance, PropInfo, ReadInt64);
+    tkBool:
+      SetOrdProp(Instance, PropInfo, Ord(ReadBoolean));
+    tkChar, tkWChar:
+      SetOrdProp(Instance, PropInfo, Ord(ReadChar));
+    tkEnumeration:
+      begin
+        Ident := ReadIdent;
+        N := GetEnumValue(PropType, Ident);
+        if N < 0 then
+          raise EReadError.Create('Invalid property value');
+        SetOrdProp(Instance, PropInfo, N);
+      end;
+    tkSet:
+      SetOrdProp(Instance, PropInfo, ReadSet(GetTypeData(PropType)^.CompType));
+    tkFloat:
+      SetFloatProp(Instance, PropInfo, ReadFloat);
+    tkSString, tkLString, tkAString, tkUString:
+      SetStrProp(Instance, PropInfo, ReadString);
+    tkMethod:
+      if NextValue = vaNil then
+      begin
+        ReadValue;
+        Method.Code := nil;
+        Method.Data := nil;
+        SetMethodProp(Instance, PropInfo, Method);
+      end
+      else
+      begin
+        Ident := ReadIdent;
+        Method.Code := FLookupRoot.MethodAddress(Ident);
+        Method.Data := FLookupRoot;
+        if Method.Code = nil then
+          raise EReadError.CreateFmt('Invalid value for property "%s"', [PropInfo^.Name]);
+        SetMethodProp(Instance, PropInfo, Method);
+      end;
+    tkClass:
+      if NextValue = vaNil then
+      begin
+        ReadValue;
+        SetObjectProp(Instance, PropInfo, nil);
+      end
+      else
+      begin
+        { A reference, set once every component is read. }
+        New(Fixup);
+        Fixup^.Instance := Instance;
+        Fixup^.PropInfo := PropInfo;
+        Fixup^.Name := ReadIdent;
+        if FFixups = nil then
+          FFixups := TFPList.Create;
+        FFixups.Add(Fixup);
+      end;
+  else
+    SkipValue;
+  end;
+end;
+
+procedure TReader.DoFixupReferences;
+var
+  I, P: Integer;
+  Fixup: PBrutoFixup;
+  Path, Part: string;
+  C: TComponent;
+begin
+  if FFixups = nil then
+    Exit;
+  for I := 0 to FFixups.Count - 1 do
+  begin
+    Fixup := PBrutoFixup(FFixups[I]);
+    Path := Fixup^.Name;
+    C := FRoot;
+    while (C <> nil) and (Path <> '') do
+    begin
+      P := Pos('.', Path);
+      if P = 0 then
+      begin
+        Part := Path;
+        Path := '';
+      end
+      else
+      begin
+        Part := Copy(Path, 1, P - 1);
+        Delete(Path, 1, P);
+      end;
+      if CompareText(Part, 'Owner') = 0 then
+        C := C.Owner
+      else
+        C := C.FindComponent(Part);
+    end;
+    if C <> nil then
+      SetObjectProp(Fixup^.Instance, Fixup^.PropInfo, C);
+    Dispose(Fixup);
+  end;
+  FFixups.Clear;
+end;
+
+{ ── The binary format as text, and back ── }
+
+procedure OutStr(Output: TStream; const S: string);
+begin
+  if Length(S) > 0 then
+    Output.WriteBuffer(S[1], Length(S));
+end;
+
+procedure OutLn(Output: TStream; const S: string);
+begin
+  OutStr(Output, S + LineEnding);
+end;
+
+{ A string as FPC's text form writes it: printable characters quoted,
+  the others as #N. }
+function QuotedText(const S: string): string;
+var
+  I, C: Integer;
+  InString: Boolean;
+begin
+  Result := '';
+  InString := False;
+  for I := 1 to Length(S) do
+  begin
+    C := Ord(S[I]);
+    if C = Ord('''') then
+    begin
+      if not InString then
+      begin
+        Result := Result + '''';
+        InString := True;
+      end;
+      Result := Result + '''''';
+    end
+    else if (C >= 32) and (C < 127) then
+    begin
+      if not InString then
+      begin
+        Result := Result + '''';
+        InString := True;
+      end;
+      Result := Result + S[I];
+    end
+    else
+    begin
+      if InString then
+      begin
+        Result := Result + '''';
+        InString := False;
+      end;
+      Result := Result + '#' + IntToStr(C);
+    end;
+  end;
+  if InString then
+    Result := Result + ''''
+  else if S = '' then
+    Result := '''''';
+end;
+
+procedure ObjectBinaryToText(Input, Output: TStream);
+
+  function ReadSStr: string;
+  var
+    Len: Byte;
+  begin
+    Len := Input.ReadByte;
+    SetLength(Result, Len);
+    if Len > 0 then
+      Input.ReadBuffer(Result[1], Len);
+  end;
+
+  function ReadLStr: string;
+  var
+    Len: LongWord;
+  begin
+    Len := Input.ReadDWord;
+    SetLength(Result, Len);
+    if Len > 0 then
+      Input.ReadBuffer(Result[1], Len);
+  end;
+
+  function ReadUStr: string;
+  var
+    Len: LongWord;
+    W: UnicodeString;
+  begin
+    Len := Input.ReadDWord;
+    SetLength(W, Len);
+    if Len > 0 then
+      Input.ReadBuffer(W[1], Len * 2);
+    Result := W;
+  end;
+
+  function ReadInt(ValueType: TValueType): Int64;
+  begin
+    case ValueType of
+      vaInt8: Result := ShortInt(Input.ReadByte);
+      vaInt16: Result := SmallInt(Input.ReadWord);
+      vaInt32: Result := LongInt(Input.ReadDWord);
+      vaInt64: Result := Int64(Input.ReadQWord);
+    else
+      Result := 0;
+    end;
+  end;
+
+  procedure ReadPropList(const Indent: string); forward;
+
+  procedure ProcessValue(ValueType: TValueType; const Indent: string);
+  var
+    S: string;
+    IsFirst: Boolean;
+    Ext: array[0..9] of Byte;
+    ToDo, DoNow, I: LongInt;
+    Buf: array[0..31] of Byte;
+  begin
+    case ValueType of
+      vaList:
+        begin
+          OutStr(Output, '(');
+          IsFirst := True;
+          while True do
+          begin
+            ValueType := TValueType(Input.ReadByte);
+            if ValueType = vaNull then
+              Break;
+            if IsFirst then
+            begin
+              OutLn(Output, '');
+              IsFirst := False;
+            end;
+            OutStr(Output, Indent + '  ');
+            ProcessValue(ValueType, Indent + '  ');
+          end;
+          OutLn(Output, Indent + ')');
+        end;
+      vaInt8, vaInt16, vaInt32, vaInt64:
+        OutLn(Output, IntToStr(ReadInt(ValueType)));
+      vaExtended:
+        begin
+          Input.ReadBuffer(Ext, 10);
+          Str(ExtendedToDouble(Ext), S);
+          OutLn(Output, S);
+        end;
+      vaString:
+        OutLn(Output, QuotedText(ReadSStr));
+      vaLString, vaUTF8String:
+        OutLn(Output, QuotedText(ReadLStr));
+      vaWString, vaUString:
+        OutLn(Output, QuotedText(ReadUStr));
+      vaIdent:
+        OutLn(Output, ReadSStr);
+      vaFalse:
+        OutLn(Output, 'False');
+      vaTrue:
+        OutLn(Output, 'True');
+      vaNil:
+        OutLn(Output, 'nil');
+      vaBinary:
+        begin
+          ToDo := Input.ReadDWord;
+          OutLn(Output, '{');
+          while ToDo > 0 do
+          begin
+            DoNow := ToDo;
+            if DoNow > 32 then
+              DoNow := 32;
+            Dec(ToDo, DoNow);
+            S := Indent + '  ';
+            Input.ReadBuffer(Buf, DoNow);
+            for I := 0 to DoNow - 1 do
+              S := S + IntToHex(Buf[I], 2);
+            OutLn(Output, S);
+          end;
+          OutLn(Output, Indent + '}');
+        end;
+      vaSet:
+        begin
+          OutStr(Output, '[');
+          IsFirst := True;
+          while True do
+          begin
+            S := ReadSStr;
+            if Length(S) = 0 then
+              Break;
+            if not IsFirst then
+              OutStr(Output, ', ');
+            IsFirst := False;
+            OutStr(Output, S);
+          end;
+          OutLn(Output, ']');
+        end;
+      vaCollection:
+        begin
+          OutStr(Output, '<');
+          while Input.ReadByte <> 0 do
+          begin
+            OutLn(Output, Indent);
+            Input.Seek(-1, soCurrent);
+            OutStr(Output, Indent + '  item');
+            ValueType := TValueType(Input.ReadByte);
+            if ValueType <> vaList then
+              OutStr(Output, '[' + IntToStr(ReadInt(ValueType)) + ']');
+            OutLn(Output, '');
+            ReadPropList(Indent + '    ');
+            OutStr(Output, Indent + '  end');
+          end;
+          OutLn(Output, '>');
+        end;
+      vaCurrency:
+        OutLn(Output, IntToStr(Int64(Input.ReadQWord)) + 'c');
+    else
+      raise EReadError.CreateFmt('Invalid property type %d', [Ord(ValueType)]);
+    end;
+  end;
+
+  procedure ReadPropList(const Indent: string);
+  begin
+    while Input.ReadByte <> 0 do
+    begin
+      Input.Seek(-1, soCurrent);
+      OutStr(Output, Indent + ReadSStr + ' = ');
+      ProcessValue(TValueType(Input.ReadByte), Indent);
+    end;
+  end;
+
+  procedure ReadObject(const Indent: string);
+  var
+    B: Byte;
+    ObjClassName, ObjName: string;
+    ChildPos: LongInt;
+  begin
+    ChildPos := 0;
+    B := Input.ReadByte;
+    if (B and $F0) = $F0 then
+    begin
+      if (B and 2) <> 0 then
+        ChildPos := ReadInt(TValueType(Input.ReadByte));
+    end
+    else
+    begin
+      B := 0;
+      Input.Seek(-1, soCurrent);
+    end;
+    ObjClassName := ReadSStr;
+    ObjName := ReadSStr;
+    OutStr(Output, Indent);
+    if (B and 1) <> 0 then
+      OutStr(Output, 'inherited')
+    else if (B and 4) <> 0 then
+      OutStr(Output, 'inline')
+    else
+      OutStr(Output, 'object');
+    OutStr(Output, ' ');
+    if ObjName <> '' then
+      OutStr(Output, ObjName + ': ');
+    OutStr(Output, ObjClassName);
+    if (B and 2) <> 0 then
+      OutStr(Output, '[' + IntToStr(ChildPos) + ']');
+    OutLn(Output, '');
+    ReadPropList(Indent + '  ');
+    while Input.ReadByte <> 0 do
+    begin
+      Input.Seek(-1, soCurrent);
+      ReadObject(Indent + '  ');
+    end;
+    OutLn(Output, Indent + 'end');
+  end;
+
+var
+  Sig: array[1..4] of Char;
+begin
+  Input.ReadBuffer(Sig, 4);
+  if (Sig[1] <> 'T') or (Sig[2] <> 'P') or (Sig[3] <> 'F') or (Sig[4] <> '0') then
+    raise EReadError.Create('Illegal stream image');
+  ReadObject('');
+end;
+
+{ The text form: tokens. }
+type
+  TBrutoTokenKind = (btEOF, btSymbol, btIdent, btInteger, btFloat, btString);
+
+  TBrutoTextParser = class
+  private
+    FText: string;
+    FPos: Integer;
+  public
+    Kind: TBrutoTokenKind;
+    Token: string;
+    Value: string;
+    constructor Create(const AText: string);
+    procedure Next;
+    function IsIdent(const S: string): Boolean;
+    function IsSymbol(C: Char): Boolean;
+    procedure Expect(C: Char);
+  end;
+
+constructor TBrutoTextParser.Create(const AText: string);
+begin
+  inherited Create;
+  FText := AText;
+  FPos := 1;
+  Next;
+end;
+
+function TBrutoTextParser.IsIdent(const S: string): Boolean;
+begin
+  Result := (Kind = btIdent) and (CompareText(Token, S) = 0);
+end;
+
+function TBrutoTextParser.IsSymbol(C: Char): Boolean;
+begin
+  Result := (Kind = btSymbol) and (Token = C);
+end;
+
+procedure TBrutoTextParser.Expect(C: Char);
+begin
+  if not IsSymbol(C) then
+    raise EParserError.CreateFmt('"%s" expected but "%s" found', [C, Token]);
+  Next;
+end;
+
+procedure TBrutoTextParser.Next;
+var
+  Start, N: Integer;
+  C: Char;
+begin
+  while (FPos <= Length(FText)) and (FText[FPos] <= ' ') do
+    Inc(FPos);
+  Token := '';
+  Value := '';
+  if FPos > Length(FText) then
+  begin
+    Kind := btEOF;
+    Exit;
+  end;
+  C := FText[FPos];
+  Start := FPos;
+  if C in ['A'..'Z', 'a'..'z', '_'] then
+  begin
+    while (FPos <= Length(FText)) and (FText[FPos] in ['A'..'Z', 'a'..'z', '0'..'9', '_', '.']) do
+      Inc(FPos);
+    Kind := btIdent;
+    Token := Copy(FText, Start, FPos - Start);
+  end
+  else if (C in ['0'..'9', '$']) or ((C = '-') and (FPos < Length(FText))
+    and (FText[FPos + 1] in ['0'..'9'])) then
+  begin
+    Inc(FPos);
+    Kind := btInteger;
+    while (FPos <= Length(FText)) and (FText[FPos] in ['0'..'9', 'A'..'F', 'a'..'f', '.', '+', '-']) do
+    begin
+      if FText[FPos] in ['.', 'e', 'E'] then
+        if C <> '$' then
+          Kind := btFloat;
+      if (FText[FPos] in ['+', '-']) and not (FText[FPos - 1] in ['e', 'E']) then
+        Break;
+      Inc(FPos);
+    end;
+    Token := Copy(FText, Start, FPos - Start);
+  end
+  else if C in ['''', '#'] then
+  begin
+    Kind := btString;
+    while (FPos <= Length(FText)) and (FText[FPos] in ['''', '#']) do
+    begin
+      if FText[FPos] = '''' then
+      begin
+        Inc(FPos);
+        while FPos <= Length(FText) do
+        begin
+          if FText[FPos] = '''' then
+          begin
+            if (FPos < Length(FText)) and (FText[FPos + 1] = '''') then
+            begin
+              Value := Value + '''';
+              Inc(FPos, 2);
+            end
+            else
+            begin
+              Inc(FPos);
+              Break;
+            end;
+          end
+          else
+          begin
+            Value := Value + FText[FPos];
+            Inc(FPos);
+          end;
+        end;
+      end
+      else
+      begin
+        Inc(FPos);
+        N := 0;
+        while (FPos <= Length(FText)) and (FText[FPos] in ['0'..'9']) do
+        begin
+          N := N * 10 + Ord(FText[FPos]) - Ord('0');
+          Inc(FPos);
+        end;
+        Value := Value + Chr(N and $FF);
+      end;
+    end;
+    Token := Value;
+  end
+  else
+  begin
+    Kind := btSymbol;
+    Token := C;
+    Inc(FPos);
+  end;
+end;
+
+procedure ObjectTextToBinary(Input, Output: TStream);
+var
+  Text: string;
+  Parser: TBrutoTextParser;
+  Writer: TWriter;
+
+  procedure WriteValue(Kind: TValueType);
+  begin
+    Output.WriteByte(Ord(Kind));
+  end;
+
+  procedure WriteSStr(const S: string);
+  begin
+    Output.WriteByte(Length(S));
+    if Length(S) > 0 then
+      Output.WriteBuffer(S[1], Length(S));
+  end;
+
+  procedure ProcessValue; forward;
+
+  procedure ProcessProperty;
+  var
+    Name: string;
+  begin
+    Name := Parser.Token;
+    Parser.Next;
+    Parser.Expect('=');
+    WriteSStr(Name);
+    ProcessValue;
+  end;
+
+  procedure ProcessValue;
+  var
+    S: string;
+    Len: Integer;
+    Bytes: string;
+    I: Integer;
+  begin
+    case Parser.Kind of
+      btInteger:
+        begin
+          Writer.WriteInteger(StrToInt64(Parser.Token));
+          Parser.Next;
+        end;
+      btFloat:
+        begin
+          Writer.WriteFloat(StrToFloat(Parser.Token));
+          Parser.Next;
+        end;
+      btString:
+        begin
+          S := Parser.Value;
+          Parser.Next;
+          { 'a' + 'b': one string. }
+          while Parser.IsSymbol('+') do
+          begin
+            Parser.Next;
+            S := S + Parser.Value;
+            Parser.Next;
+          end;
+          Writer.WriteString(S);
+        end;
+      btIdent:
+        begin
+          Writer.WriteIdent(Parser.Token);
+          Parser.Next;
+        end;
+      btSymbol:
+        if Parser.IsSymbol('[') then
+        begin
+          Parser.Next;
+          WriteValue(vaSet);
+          while not Parser.IsSymbol(']') do
+          begin
+            WriteSStr(Parser.Token);
+            Parser.Next;
+            if Parser.IsSymbol(',') then
+              Parser.Next;
+          end;
+          Parser.Next;
+          WriteSStr('');
+        end
+        else if Parser.IsSymbol('(') then
+        begin
+          Parser.Next;
+          WriteValue(vaList);
+          while not Parser.IsSymbol(')') do
+            ProcessValue;
+          Parser.Next;
+          WriteValue(vaNull);
+        end
+        else if Parser.IsSymbol('{') then
+        begin
+          Bytes := '';
+          while (Parser.FPos <= Length(Parser.FText)) and (Parser.FText[Parser.FPos] <> '}') do
+          begin
+            if Parser.FText[Parser.FPos] > ' ' then
+              Bytes := Bytes + Parser.FText[Parser.FPos];
+            Inc(Parser.FPos);
+          end;
+          Inc(Parser.FPos);
+          Parser.Next;
+          Len := Length(Bytes) div 2;
+          WriteValue(vaBinary);
+          Output.WriteDWord(Len);
+          for I := 0 to Len - 1 do
+            Output.WriteByte(StrToInt('$' + Copy(Bytes, I * 2 + 1, 2)));
+        end
+        else if Parser.IsSymbol('<') then
+        begin
+          Parser.Next;
+          WriteValue(vaCollection);
+          while Parser.IsIdent('item') do
+          begin
+            Parser.Next;
+            if Parser.IsSymbol('[') then
+            begin
+              Parser.Next;
+              Writer.WriteInteger(StrToInt64(Parser.Token));
+              Parser.Next;
+              Parser.Expect(']');
+            end
+            else
+              WriteValue(vaList);
+            while not Parser.IsIdent('end') do
+              ProcessProperty;
+            Parser.Next;
+            WriteValue(vaNull);
+          end;
+          Parser.Expect('>');
+          WriteValue(vaNull);
+        end
+        else
+          raise EParserError.CreateFmt('Invalid property value "%s"', [Parser.Token]);
+    else
+      raise EParserError.Create('Unexpected end of text');
+    end;
+  end;
+
+  procedure ProcessObject;
+  var
+    Flags: Byte;
+    ObjName, ObjClass: string;
+    ChildPos: Int64;
+    HasPos: Boolean;
+  begin
+    if Parser.IsIdent('inherited') then
+      Flags := 1
+    else if Parser.IsIdent('inline') then
+      Flags := 4
+    else if Parser.IsIdent('object') then
+      Flags := 0
+    else
+      raise EParserError.CreateFmt('"object" expected but "%s" found', [Parser.Token]);
+    Parser.Next;
+    ObjName := Parser.Token;
+    Parser.Next;
+    if Parser.IsSymbol(':') then
+    begin
+      Parser.Next;
+      ObjClass := Parser.Token;
+      Parser.Next;
+    end
+    else
+    begin
+      ObjClass := ObjName;
+      ObjName := '';
+    end;
+    HasPos := False;
+    ChildPos := 0;
+    if Parser.IsSymbol('[') then
+    begin
+      Parser.Next;
+      ChildPos := StrToInt64(Parser.Token);
+      HasPos := True;
+      Parser.Next;
+      Parser.Expect(']');
+      Flags := Flags or 2;
+    end;
+    if Flags <> 0 then
+    begin
+      Output.WriteByte($F0 or Flags);
+      if HasPos then
+        Writer.WriteInteger(ChildPos);
+    end;
+    WriteSStr(ObjClass);
+    WriteSStr(ObjName);
+    while not (Parser.IsIdent('end') or Parser.IsIdent('object')
+      or Parser.IsIdent('inherited') or Parser.IsIdent('inline')) do
+      ProcessProperty;
+    WriteValue(vaNull);
+    while not Parser.IsIdent('end') do
+      ProcessObject;
+    Parser.Next;
+    WriteValue(vaNull);
+  end;
+
+begin
+  SetLength(Text, Input.Size - Input.Position);
+  if Length(Text) > 0 then
+    Input.ReadBuffer(Text[1], Length(Text));
+  Parser := TBrutoTextParser.Create(Text);
+  Writer := TWriter.Create(Output, 4096);
+  try
+    Output.WriteBuffer(FilerSignature, 4);
+    ProcessObject;
+  finally
+    Writer.Free;
+    Parser.Free;
   end;
 end;
 

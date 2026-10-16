@@ -322,6 +322,12 @@ impl<'ctx> CodeGen<'ctx> {
             .iter()
             .map(|(n, _)| n)
             .chain(decl.properties.iter().map(|p| &p.name))
+            .chain(
+                decl.methods
+                    .iter()
+                    .filter(|m| !m.is_class_method)
+                    .map(|m| &m.name),
+            )
             .filter(|n| {
                 decl.published.contains(n) || (type_info && decl.default_section.contains(n))
             })
