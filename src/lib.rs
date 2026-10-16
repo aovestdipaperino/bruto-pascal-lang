@@ -7083,6 +7083,875 @@ end.
     }
 
     #[test]
+    fn variants_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program v1;
+{$mode objfpc}{$H+}
+uses SysUtils, Variants;
+var
+  A, B, C: Variant;
+  I: Integer;
+  D: Double;
+  S: string;
+  Bo: Boolean;
+procedure Show(const Title: string; const V: Variant);
+begin
+  WriteLn(Title, ': ', VarTypeAsText(VarType(V)), ' [', VarToStr(V), ']');
+end;
+begin
+  Show('empty', A);
+  A := 42; Show('int', A);
+  A := Int64(5000000000); Show('int64', A);
+  A := 2.5; Show('double', A);
+  A := 'hello'; Show('string', A);
+  A := True; Show('bool', A);
+  A := Null; Show('null', A);
+  A := 'a'; Show('char', A);
+  A := Byte(7); Show('byte', A);
+  A := 10; B := 3;
+  Show('add', A + B); Show('sub', A - B); Show('mul', A * B); Show('div/', A / B);
+  Show('idiv', A div B); Show('mod', A mod B); Show('neg', -A);
+  A := '10'; B := 5; Show('str+int', A + B);
+  A := 'ab'; B := 'cd'; Show('str+str', A + B);
+  A := 'x'; B := 1;
+  try Show('bad', A + B); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  A := Null; B := 5; Show('null+5', A + B);
+  A := 2.5; B := 2; Show('dbl*int', A * B);
+  A := 7; B := '7'; WriteLn('eq ', A = B, ' lt ', A < 10, ' gt ', B > '6');
+  A := 'abc'; WriteLn('cmp ', A = 'abc', ' ', A <> 'abd');
+  A := 3.75; I := A; D := A; S := A; WriteLn(I, ' ', D:0:2, ' ', S);
+  A := '123'; I := A; WriteLn(I + 1);
+  A := 'zz';
+  try I := A; except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  A := True; Bo := A; I := A; WriteLn(Bo, ' ', I);
+  A := 'True'; Bo := A; WriteLn(Bo);
+  A := 1; WriteLn(A);
+  A := 2.5; WriteLn(A);
+  A := 'str'; WriteLn(A);
+  A := Null; WriteLn(VarIsNull(A), ' ', VarIsEmpty(A), ' ', VarIsEmpty(Unassigned));
+  A := VarArrayOf([1, 'two', 3.5]);
+  WriteLn(VarIsArray(A), ' ', VarArrayLowBound(A, 1), ' ', VarArrayHighBound(A, 1), ' ', A[1], ' ', A[2] + 1);
+  A[0] := 100; WriteLn(A[0] + A[2]);
+  C := A; C[0] := 5; WriteLn(A[0], ' ', C[0]);
+  A := 5; B := A; A := 6; WriteLn(B);
+  A := 'x'; B := A; A := A + 'y'; WriteLn(A, B);
+  WriteLn(VarToStrDef(Null, 'def'), ' ', VarToStr(Null), '|');
+  A := VarAsType('42', varInteger); Show('astype', A);
+  WriteLn(VarIsNumeric(A), ' ', VarIsStr('x'), ' ', VarType(A) = varInteger);
+  A := 1; A := A + 0.5; Show('promote', A);
+  A := High(Integer); A := A + 1; Show('overflow', A);
+  A := 7; B := 2; Show('and', A and B); Show('or', A or B); Show('xor', A xor B); Show('not', not A);
+  A := True; B := False; Show('band', A and B); Show('bnot', not A);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"empty: Empty []
+int: ShortInt [42]
+int64: Int64 [5000000000]
+double: Double [2.5]
+string: String [hello]
+bool: Boolean [True]
+null: Null []
+char: String [a]
+byte: Byte [7]
+add: Integer [13]
+sub: Integer [7]
+mul: Integer [30]
+div/: Double [3.33333333333333]
+idiv: Integer [3]
+mod: Integer [1]
+neg: ShortInt [-10]
+str+int: Double [15]
+str+str: String [abcd]
+EVariantError: Invalid variant type cast
+null+5: Null []
+dbl*int: Double [5]
+eq TRUE lt TRUE gt TRUE
+cmp TRUE TRUE
+4 3.75 3.75
+124
+EVariantError: Invalid variant type cast
+TRUE -1
+TRUE
+1
+2.5
+str
+TRUE FALSE TRUE
+TRUE 0 2 two 4.5
+103.5
+100 5
+5
+xyx
+def |
+astype: Integer [42]
+TRUE TRUE TRUE
+promote: Double [1.5]
+overflow: Int64 [2147483648]
+and: Integer [2]
+or: Integer [7]
+xor: Integer [5]
+not: ShortInt [-8]
+band: Boolean [False]
+bnot: Boolean [False]
+"#
+        );
+    }
+
+    #[test]
+    fn variant_types_and_conversions() {
+        let (ok, out) = build_and_run_source(
+            r#"program v2;
+{$mode objfpc}{$H+}
+uses SysUtils, Variants;
+var
+  A, B: Variant;
+  I: Integer; L: LongInt; W: Word; Q: QWord; I6: Int64; Sg: Single; U: UnicodeString; WC: WideChar; Ch: Char;
+procedure T(const V: Variant);
+begin
+  Write(VarTypeAsText(VarType(V)), ' ');
+end;
+begin
+  T(200); T(1000); T(40000); T(100000); T(3000000000); T(-200); T(-100000); T(10000000000);
+  WriteLn;
+  I := 5; L := 5; W := 5; Q := 5; I6 := 5; Sg := 1.5; U := 'u'; WC := 'w'; Ch := 'c';
+  T(I); T(L); T(W); T(Q); T(I6); T(Sg); T(U); T(WC); T(Ch); T(I + 1); T(I * 2.0); T(L + L);
+  WriteLn;
+  A := 5; B := 10; T(A + B); A := Byte(200); B := Byte(100); T(A + B); A := Int64(5); T(A + 1);
+  A := Sg; T(A * 2); A := 'x'; T(A + 'y'); A := U; T(A + 'z'); T(A + A);
+  WriteLn;
+  A := Null;
+  WriteLn(A = Null, ' ', A = 5, ' ', A <> 5, ' ', VarIsNull(A + 1));
+  try I := A; WriteLn('null->int ', I); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try WriteLn('null->str [', string(A), ']'); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  A := Unassigned;
+  try I := A; WriteLn('empty->int ', I); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  WriteLn('empty->str [', string(A), ']');
+  A := 2.5; I := A; WriteLn(I); A := 3.5; I := A; WriteLn(I); A := -2.5; I := A; WriteLn(I);
+  A := 'abc';
+  try A := A * 2; except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  A := 1.0; WriteLn(A); A := 1e20; WriteLn(A); A := 0.1; WriteLn(A); A := Sg; WriteLn(A);
+  A := 5; B := 5.0; WriteLn(A = B); A := 'B'; B := 'a'; WriteLn(A < B);
+  A := VarArrayCreate([0, 2], varInteger); A[1] := 7; WriteLn(A[1], ' ', A[0], ' ', VarTypeAsText(VarType(A)));
+  WriteLn(VarTypeAsText(VarType(VarArrayOf([1, 2]))));
+  A := 10; Inc(I); WriteLn(I);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"Byte Smallint Word Integer DWord Smallint Integer Int64 
+Integer Integer Word QWord Int64 Double OleStr OleStr String Int64 Double Int64 
+Integer Integer Int64 Double String OleStr OleStr 
+TRUE FALSE TRUE TRUE
+EVariantTypeCastError: Could not convert variant of type (Null) into type (Int64)
+null->str [EVariantTypeCastError: Could not convert variant of type (Null) into type (String)
+empty->int 0
+empty->str []
+2
+4
+-2
+EVariantError: Invalid variant type cast
+1
+1E20
+0.1
+1.5
+TRUE
+TRUE
+7 0 Array of Integer
+Array of Variant
+-1
+"#
+        );
+    }
+
+    #[test]
+    fn variant_reference_counting() {
+        let (ok, out) = build_and_run_source(
+            r#"program v5;
+{$mode objfpc}{$H+}
+uses SysUtils, Variants;
+type
+  TRec = record
+    Name: string;
+    V: Variant;
+  end;
+  TObj = class
+    F: Variant;
+  end;
+var
+  A, B: Variant;
+  R: TRec;
+  Arr: array of Variant;
+  Fixed: array[1..3] of Variant;
+  O: TObj;
+  I: Integer;
+  S: string;
+
+function MakeV(N: Integer): Variant;
+begin
+  Result := 'v' + IntToStr(N);
+end;
+
+procedure ByVal(V: Variant);
+begin
+  V := V + '!';
+  S := V;
+end;
+
+procedure ByRef(var V: Variant);
+begin
+  V := V + '?';
+end;
+
+procedure ByConst(const V: Variant);
+begin
+  S := VarToStr(V);
+end;
+
+begin
+  for I := 1 to 2000 do
+  begin
+    A := 'x' + IntToStr(I);
+    B := A + A;
+    R.V := B;
+    R.Name := A;
+    SetLength(Arr, 3);
+    Arr[0] := A; Arr[1] := I; Arr[2] := MakeV(I);
+    Fixed[I mod 3 + 1] := Arr[2];
+    ByVal(A); ByRef(A); ByConst(B);
+    A := VarArrayOf([A, B, I]);
+    B := A;
+    B[0] := 'changed';
+    O := TObj.Create;
+    O.F := B;
+    O.Free;
+  end;
+  WriteLn(VarToStr(A[0]), ' ', VarToStr(B[0]), ' ', R.V, ' ', Arr[2], ' ', Fixed[1], ' ', S);
+  WriteLn(VarToStr(MakeV(3)));
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"x2000? changed x2000x2000 v2000 v1998 x2000x2000
+v3
+"#
+        );
+    }
+
+    #[test]
+    fn variant_conditions_casts_and_banker_rounding() {
+        let (ok, out) = build_and_run_source(
+            r#"program tc;
+{$mode objfpc}{$H+}
+uses Variants;
+var A: Variant; D: Double;
+begin
+  A := True;
+  if A then WriteLn('yes');
+  A := 0;
+  while A < 3 do A := A + 1;
+  WriteLn(A);
+  repeat A := A - 1 until A = 0;
+  WriteLn(A, ' ', Integer(A) + 1, ' ', string(A) + '!', ' ', Variant(5) * 2);
+  D := 2.5;
+  WriteLn(Round(2.5), ' ', Round(3.5), ' ', Round(-2.5), ' ', Round(D), ' ', Round(0.5));
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"yes
+3
+0 1 0! 10
+2 4 -2 2 0
+"#
+        );
+    }
+
+    #[test]
+    fn variant_properties_stream_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program vs;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, TypInfo, Variants;
+type
+  TThing = class(TComponent)
+  private
+    FA, FB, FC, FD, FE, FF, FG: Variant;
+    function GetB: Variant;
+    procedure SetB(const V: Variant);
+  published
+    property A: Variant read FA write FA;
+    property B: Variant read GetB write SetB;
+    property C: Variant read FC write FC;
+    property D: Variant read FD write FD;
+    property E: Variant read FE write FE;
+    property F: Variant read FF write FF;
+    property G: Variant read FG write FG;
+  end;
+
+function TThing.GetB: Variant;
+begin
+  Result := FB;
+end;
+
+procedure TThing.SetB(const V: Variant);
+begin
+  FB := V;
+end;
+
+procedure Show(T: TThing);
+begin
+  WriteLn(VarTypeAsText(VarType(T.A)), ' ', VarToStr(T.A), ' | ', VarTypeAsText(VarType(T.B)), ' ', VarToStr(T.B),
+    ' | ', VarTypeAsText(VarType(T.C)), ' ', VarToStr(T.C), ' | ', VarTypeAsText(VarType(T.D)), ' ', VarToStr(T.D),
+    ' | ', VarTypeAsText(VarType(T.E)), ' ', VarToStr(T.E), ' | ', VarTypeAsText(VarType(T.F)), ' | ', VarTypeAsText(VarType(T.G)), ' ', VarToStr(T.G));
+end;
+
+var
+  T, T2: TThing;
+  M: TMemoryStream;
+  Txt: TStringStream;
+  I: Integer;
+begin
+  RegisterClass(TThing);
+  T := TThing.Create(nil);
+  T.Name := 'Thing1';
+  T.A := 42;
+  T.B := 'hello';
+  T.C := 2.5;
+  T.D := True;
+  T.E := Int64(10000000000);
+
+  T.G := UnicodeString('wide');
+  WriteLn(PropType(T, 'A') = tkVariant, ' ', GetPropInfo(T, 'B')^.PropType^.Name);
+  WriteLn(VarToStr(GetPropValue(T, 'B')), ' ', VarToStr(GetVariantProp(T, 'A')));
+  SetPropValue(T, 'C', 7);
+  Show(T);
+  M := TMemoryStream.Create;
+  M.WriteComponent(T);
+  for I := 0 to M.Size - 1 do
+    Write(IntToHex(PByte(M.Memory)[I], 2));
+  WriteLn;
+  M.Position := 0;
+  Txt := TStringStream.Create('');
+  ObjectBinaryToText(M, Txt);
+  WriteLn(Txt.DataString);
+  M.Position := 0;
+  T2 := TThing.Create(nil);
+  M.ReadComponent(T2);
+  Show(T2);
+  T.Free; T2.Free; M.Free; Txt.Free;
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"TRUE Variant
+hello 42
+ShortInt 42 | String hello | ShortInt 7 | Boolean True | Int64 10000000000 | Empty | OleStr wide
+5450463006545468696E67065468696E67310141022A01421205000000680065006C006C006F000143020701440901451300E40B54020000000147120400000077006900640065000000
+object Thing1: TThing
+  A = 42
+  B = 'hello'
+  C = 7
+  D = True
+  E = 10000000000
+  G = 'wide'
+end
+
+Integer 42 | OleStr hello | Integer 7 | Boolean True | Int64 10000000000 | Empty | OleStr wide
+"#
+        );
+    }
+
+    #[test]
+    fn currency_matches_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program cu;
+{$mode objfpc}{$H+}
+uses SysUtils, Variants;
+type R = record A: Byte; C: Currency; end;
+var C, D: Currency; X: Double; I: Integer; V: Variant; S: string; Rec: R;
+begin
+  C := 2.5; D := 1/3;
+  WriteLn(C); WriteLn(D); WriteLn(C:0:2, ' ', D:10:4);
+  WriteLn(SizeOf(C), ' ', SizeOf(Rec), ' ', PInt64(@D)^);
+  X := C * D; WriteLn(X:0:6);
+  C := C * 3; WriteLn(C:0:4);
+  C := 123456789.12345; WriteLn(C:0:4);
+  D := 0.00005; WriteLn(D:0:4); D := 0.00015; WriteLn(D:0:4); D := -0.00005; WriteLn(D:0:4);
+  I := Round(C); WriteLn(I); WriteLn(Trunc(C));
+  Str(C:0:2, S); WriteLn(S);
+  WriteLn(CurrToStr(C), ' ', FloatToStr(C), ' ', CurrToStr(D));
+  V := C; WriteLn(VarTypeAsText(VarType(V)), ' ', VarToStr(V));
+  V := V + 1; WriteLn(VarTypeAsText(VarType(V)), ' ', VarToStr(V));
+  V := V * 2.5; WriteLn(VarTypeAsText(VarType(V)), ' ', VarToStr(V));
+  V := C / 3; WriteLn(VarTypeAsText(VarType(V)), ' ', VarToStr(V));
+  C := V; WriteLn(C:0:4);
+  C := 10; D := 3; WriteLn(C / D:0:6, ' ', C > D, ' ', C = 10);
+  C := High(Int64) / 10000 / 2; WriteLn(C:0:0);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#" 2.500000000000000000E+00
+ 3.333000000000000000E-01
+2.50     0.3333
+8 16 3333
+0.833200
+7.5000
+123456789.1234
+0.0000
+0.0001
+0.0000
+123456789
+123456789
+123456789.12
+123456789.1234 123456789.1234 0
+Currency 123456789.1234
+Currency 123456790.1234
+Currency 308641975.3085
+Double 41152263.0411333
+41152263.0411
+3.333333 TRUE TRUE
+461168601842739
+"#
+        );
+    }
+
+    #[test]
+    fn currency_constants_mixing_and_write_widths() {
+        let (ok, out) = build_and_run_source(
+            r#"program cu2;
+{$mode objfpc}{$H+}
+var C: Currency; X: Double; I: Integer;
+const K: Currency = 5; K2: Currency = 1.23456;
+var V: Currency = 7;
+function F(A: Currency): Currency; begin Result := A * 2; end;
+begin
+  C := 2.5; X := 0.33335;
+  WriteLn(C * 0.33335:0:8, ' ', C * X:0:8, ' ', C + 0.00004:0:8);
+  C := C * 0.33335; WriteLn(C:0:4);
+  I := 3; C := I; WriteLn(C:0:4, ' ', K:0:4, ' ', K2:0:4, ' ', V:0:4, ' ', F(1.5):0:4);
+  C := -C; WriteLn(C:0:4, ' ', -C:0:4, ' ', Abs(C):0:4);
+  WriteLn(C:12:2, '|', C:10, '|');
+  C := 1; C := C / 3; WriteLn(C:0:4);
+  C := 7; C := C - 0.00005; WriteLn(C:0:4);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"0.83350000 0.83350000 2.50000000
+0.8335
+3.0000 5.0000 1.2346 7.0000 3.0000
+-3.0000 3.0000 3.0000
+       -3.00|-3.000E+00|
+0.3333
+7.0000
+"#
+        );
+    }
+
+    #[test]
+    fn currency_records_properties_and_variants() {
+        let (ok, out) = build_and_run_source(
+            r#"program cu3;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, TypInfo, Variants;
+type
+  TRec = record Qty: Integer; Price: Currency; end;
+  TItem = class(TComponent)
+  private
+    FPrice: Currency; FV: Variant;
+    function GetTotal: Currency;
+    procedure SetTotal(const C: Currency);
+  published
+    property Price: Currency read FPrice write FPrice;
+    property Total: Currency read GetTotal write SetTotal;
+    property V: Variant read FV write FV;
+  end;
+function TItem.GetTotal: Currency; begin Result := FPrice * 2; end;
+procedure TItem.SetTotal(const C: Currency); begin FPrice := C / 2; end;
+procedure Bump(var C: Currency; By: Currency); begin C := C + By; end;
+var
+  R: TRec; A: array[1..3] of Currency; C, D: Currency; I: Integer; S: string;
+  V, W: Variant; T, T2: TItem; M: TMemoryStream; Txt: TStringStream;
+begin
+  R.Qty := 3; R.Price := 19.99;
+  C := R.Price * R.Qty; WriteLn(C:0:2, ' ', R.Price:8:3);
+  for I := 1 to 3 do A[I] := I / 3;
+  WriteLn(A[1]:0:4, ' ', A[2]:0:4, ' ', A[3]:0:4, ' ', A[1] + A[2] + A[3]:0:4);
+  C := 2; C := C / 3; WriteLn(C:0:4);
+  Bump(C, 0.1); WriteLn(C:0:4); Bump(C, 1); WriteLn(C);
+  if C > 1.7 then WriteLn('big'); if C = 1.7667 then WriteLn('eq');
+  Str(C:10:1, S); WriteLn('[', S, ']');
+  D := -1234567.8901; WriteLn(D:0:2, ' ', D:20, ' ', D:0:0, ' ', Trunc(D), ' ', Round(D));
+  WriteLn(CurrToStr(D), ' ', SizeOf(TRec));
+  V := D; W := V * 2; WriteLn(VarTypeAsText(VarType(W)), ' ', VarToStr(W));
+  W := V + V; C := W; WriteLn(C:0:4, ' ', VarToStr(-V), ' ', V > 0, ' ', V = D);
+  W := V / 3; WriteLn(VarTypeAsText(VarType(W)), ' ', VarToStr(W));
+  T := TItem.Create(nil); T.Name := 'It';
+  T.Price := 12.5; T.V := 42;
+  WriteLn(GetFloatProp(T, 'Total'):0:4, ' ', PropType(T, 'Price') = tkFloat);
+  SetFloatProp(T, 'Total', 7.77); WriteLn(T.Price:0:4);
+  M := TMemoryStream.Create; M.WriteComponent(T);
+  for I := 0 to M.Size - 1 do Write(IntToHex(PByte(M.Memory)[I], 2)); WriteLn;
+  M.Position := 0; T2 := TItem.Create(nil); M.ReadComponent(T2);
+  WriteLn(T2.Price:0:4, ' ', VarTypeAsText(VarType(T2.V)), ' ', VarToStr(T2.V));
+  T.Free; T2.Free; M.Free;
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"59.97   19.990
+0.3333 0.6667 1.0000 2.0000
+0.6667
+0.7667
+ 1.766700000000000000E+00
+big
+eq
+[       1.8]
+-1234567.89 -1.2345678901000E+06 -1234568 -1234567 -1234568
+-1234567.8901 16
+Currency -2469135.7802
+-2469135.7802 1234567.8901 FALSE TRUE
+Currency -411522.63
+25.0000 TRUE
+3.8850
+5450463005544974656D0249740550726963650500A0703D0AD7A3F8004005546F74616C0500A0703D0AD7A3F801400156022A0000
+3.8850 Integer 42
+"#
+        );
+    }
+
+    #[test]
+    fn variant_arrays_of_several_dimensions() {
+        let (ok, out) = build_and_run_source(
+            r#"program md;
+{$mode objfpc}{$H+}
+uses SysUtils, Variants;
+var A, B, N: Variant; I, J: Integer;
+begin
+  A := VarArrayCreate([1, 3, -1, 1], varInteger);
+  WriteLn(VarArrayDimCount(A), ' ', VarArrayLowBound(A, 1), ' ', VarArrayHighBound(A, 1), ' ',
+    VarArrayLowBound(A, 2), ' ', VarArrayHighBound(A, 2), ' ', VarTypeAsText(VarType(A)));
+  for I := 1 to 3 do
+    for J := -1 to 1 do
+      A[I, J] := I * 10 + J;
+  for I := 1 to 3 do
+  begin
+    for J := -1 to 1 do Write(A[I, J], ' ');
+    WriteLn;
+  end;
+  B := A; B[2, 0] := 99; WriteLn(A[2, 0], ' ', B[2, 0]);
+  A[3, 1] := '42'; WriteLn(VarTypeAsText(VarType(A[3, 1])), ' ', A[3, 1] + 1);
+  try A[4, 0] := 1; except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try WriteLn(A[1]); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  try WriteLn(VarArrayLowBound(A, 3)); except on E: Exception do WriteLn(E.ClassName, ': ', E.Message); end;
+  N := VarArrayOf([1, VarArrayOf(['x', 'y', 'z']), 3]);
+  WriteLn(N[1][2], ' ', VarArrayHighBound(N[1], 1));
+  B := VarArrayCreate([0, 1, 0, 1, 0, 1], varVariant);
+  B[1, 0, 1] := 'deep'; WriteLn(B[1, 0, 1], ' ', VarIsEmpty(B[0, 0, 0]), ' ', VarArrayDimCount(B));
+  A := VarArrayCreate([0, 2], varInteger); A[2] := 5;
+  VarArrayRedim(A, 4); A[4] := 7;
+  WriteLn(VarArrayHighBound(A, 1), ' ', A[2], ' ', A[3], ' ', A[4]);
+  VarArrayRedim(A, 1); WriteLn(VarArrayHighBound(A, 1), ' ', A[1]);
+  A := VarArrayCreate([0, 1, 0, 1], varInteger);
+  A[1, 0] := 3; VarArrayRedim(A, 2); A[1, 2] := 4;
+  WriteLn(A[1, 0], ' ', A[1, 2], ' ', A[0, 2], ' ', VarArrayHighBound(A, 2));
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"2 1 3 -1 1 Array of Integer
+9 10 11 
+19 20 21 
+29 30 31 
+20 99
+Integer 43
+EVariantBadIndexError: Variant array bounds error
+EVariantInvalidArgError: Invalid argument
+EVariantBadIndexError: Variant array bounds error
+z 2
+deep TRUE 3
+4 5 0 7
+1 0
+0 4 3 2
+"#
+        );
+    }
+
+    #[test]
+    fn var_clear_keeps_number_bytes_as_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program un2;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, Variants;
+type
+  TThing = class(TComponent)
+  private
+    FF, FG, FH: Variant;
+  published
+    property F: Variant read FF write FF;
+    property G: Variant read FG write FG;
+    property H: Variant read FH write FH;
+  end;
+var T: TThing; M: TMemoryStream; I: Integer;
+begin
+  T := TThing.Create(nil);
+  T.FF := 5; VarClear(T.FF);
+  T.FG := 'abc'; VarClear(T.FG);
+
+  M := TMemoryStream.Create; M.WriteComponent(T);
+  for I := 0 to M.Size - 1 do Write(IntToHex(PByte(M.Memory)[I], 2));
+  WriteLn; M.Free; T.Free;
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"5450463006545468696E670001460D0000
+"#
+        );
+    }
+
+    #[test]
+    fn set_sizes_and_layout_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program tsz;
+{$mode objfpc}
+type
+  TSmall = (a, b, c);
+  T31 = 0..31; T32 = 0..32; THi = 24..31; TMid = 30..40; TBig = 200..255; T7 = 8..15; T16 = 0..16;
+  SSmall = set of TSmall; S31 = set of T31; S32 = set of T32; SHi = set of THi; SMid = set of TMid;
+  SBig = set of TBig; TChars = set of Char; SByte = set of Byte; S7 = set of T7; S16 = set of T16;
+  TR = record X: Byte; S: SSmall; Y: Byte; end;
+  TR2 = packed record X: Byte; S: SSmall; end;
+{$packset 1}
+type
+  PSmall = set of TSmall; P32 = set of T32; PMid = set of TMid; PBig = set of TBig;
+{$packset 2}
+type
+  QSmall = set of TSmall; Q32 = set of T32; QBig = set of TBig;
+{$packset 8}
+type
+  ESmall = set of TSmall;
+var
+  M: PMid; G: PBig;
+procedure Dump(const X; N: Integer);
+var P: PByte; I: Integer;
+begin
+  P := @X;
+  for I := 0 to N - 1 do Write(P[I], ' ');
+  WriteLn;
+end;
+begin
+  WriteLn(SizeOf(SSmall), ' ', SizeOf(S31), ' ', SizeOf(S32), ' ', SizeOf(SHi), ' ', SizeOf(SMid), ' ',
+    SizeOf(SBig), ' ', SizeOf(TChars), ' ', SizeOf(SByte), ' ', SizeOf(S7), ' ', SizeOf(S16), ' ', SizeOf(TR), ' ', SizeOf(TR2));
+  WriteLn(SizeOf(PSmall), ' ', SizeOf(P32), ' ', SizeOf(PMid), ' ', SizeOf(PBig), ' ',
+    SizeOf(QSmall), ' ', SizeOf(Q32), ' ', SizeOf(QBig), ' ', SizeOf(ESmall));
+  M := [30, 33, 40]; G := [200, 255]; Include(M, 31);
+  Dump(M, SizeOf(M)); Dump(G, SizeOf(G));
+  WriteLn(31 in M, ' ', 32 in M, ' ', 255 in G);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"4 4 32 4 32 32 32 32 4 4 12 5
+1 5 4 7 2 6 8 8
+192 2 1 0 
+1 0 0 0 0 0 128 
+TRUE FALSE TRUE
+"#
+        );
+    }
+
+    #[test]
+    fn small_sets_in_records_params_and_streaming() {
+        let (ok, out) = build_and_run_source(
+            r#"program s5;
+{$mode objfpc}{$H+}
+uses SysUtils, Classes, TypInfo;
+type
+  TColor = (cRed, cGreen, cBlue, cYellow);
+  TColors = set of TColor;
+  TDigits = set of 0..9;
+  TRec = record A: Byte; C: TColors; B: Byte; D: TDigits; end;
+  TBox = class(TComponent)
+  private
+    FColors: TColors;
+    FDigits: TDigits;
+  public
+    property Digits: TDigits read FDigits write FDigits;
+  published
+    property Colors: TColors read FColors write FColors;
+  end;
+const
+  Warm: TColors = [cRed, cYellow];
+  Primes: TDigits = [2, 3, 5, 7];
+var
+  S, T: TColors; D: TDigits; R: TRec; C: TColor; Chs: set of Char; I: Integer;
+  B, B2: TBox; M: TMemoryStream; Txt: TStringStream;
+  Arr: array[1..3] of TColors;
+procedure AddBlue(var X: TColors); begin Include(X, cBlue); end;
+function Both(A, B: TColors): TColors; begin Result := A * B; end;
+begin
+  S := [cRed, cBlue]; T := Warm;
+  WriteLn(SizeOf(S), ' ', SizeOf(R), ' ', Integer(S), ' ', Integer(S + T), ' ', Integer(S * T), ' ', Integer(S - T));
+  WriteLn(cBlue in S, ' ', cGreen in S, ' ', S <= [cRed, cBlue, cGreen], ' ', S = [cBlue, cRed], ' ', S <> T);
+  Include(S, cGreen); Exclude(S, cRed); WriteLn(Integer(S));
+  AddBlue(T); WriteLn(Integer(T), ' ', Integer(Both(S, T)));
+  R.A := 1; R.B := 2; R.C := [cYellow]; R.D := Primes; Include(R.C, cRed); Include(R.D, 9);
+  WriteLn(Integer(R.C), ' ', Integer(R.D), ' ', R.A, ' ', R.B, ' ', PByte(@R)[4], ' ', PWord(@R.D)^);
+  for C in R.C do Write(Ord(C), ' '); WriteLn;
+  for I in R.D do Write(I, ' '); WriteLn;
+  Arr[2] := [cGreen]; Include(Arr[2], cBlue); Arr[3] := Arr[2] + [cRed]; WriteLn(Integer(Arr[2]), ' ', Integer(Arr[3]));
+  D := []; for I := 0 to 9 do if not Odd(I) then Include(D, I); WriteLn(Integer(D));
+  Chs := ['a'..'c', 'z']; WriteLn(SizeOf(Chs), ' ', 'b' in Chs, ' ', 'y' in Chs);
+  B := TBox.Create(nil); B.Name := 'Box'; B.Colors := [cGreen, cYellow]; B.Digits := [1, 8];
+  WriteLn(GetSetProp(B, 'Colors', True), ' ', Integer(B.Digits));
+  SetSetProp(B, 'Colors', '[cRed,cBlue]'); WriteLn(Integer(B.Colors));
+  M := TMemoryStream.Create; M.WriteComponent(B);
+  for I := 0 to M.Size - 1 do Write(IntToHex(PByte(M.Memory)[I], 2)); WriteLn;
+  M.Position := 0; Txt := TStringStream.Create(''); ObjectBinaryToText(M, Txt); Write(Txt.DataString);
+  M.Position := 0; B2 := TBox.Create(nil); M.ReadComponent(B2); WriteLn(Integer(B2.Colors), ' ', Integer(B2.Digits));
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"4 16 5 13 1 4
+TRUE FALSE TRUE TRUE TRUE
+6
+13 4
+9 684 1 2 9 684
+0 3 
+2 3 5 7 9 
+6 7
+341
+32 TRUE FALSE
+[cGreen,cYellow] 258
+5
+545046300454426F7803426F7806436F6C6F72730B04635265640563426C7565000000
+object Box: TBox
+  Colors = [cRed, cBlue]
+end
+5 0
+"#
+        );
+    }
+
+    #[test]
+    fn delphi_mode_packed_sets_match_fpc() {
+        let (ok, out) = build_and_run_source(
+            r#"program s6;
+{$mode delphi}
+uses SysUtils, Classes, TypInfo;
+type
+  TColor = (cRed, cGreen, cBlue, cYellow);
+  TColors = set of TColor;
+  THigh = 20..30;
+  SHigh = set of THigh;
+  TRec = record A: Byte; C: TColors; H: SHigh; B: Byte; end;
+  TBox = class(TComponent)
+  private
+    FColors: TColors;
+  published
+    property Colors: TColors read FColors write FColors;
+  end;
+const
+  Warm: TColors = [cRed, cYellow];
+var
+  S, T: TColors; R: TRec; H: SHigh; C: TColor; I: Integer;
+  B, B2: TBox; M: TMemoryStream; Txt: TStringStream;
+procedure Dump(const X; N: Integer);
+var P: PByte; I: Integer;
+begin
+  P := @X;
+  for I := 0 to N - 1 do Write(P[I], ' ');
+  WriteLn;
+end;
+procedure Show(const X: TColors);
+var C: TColor;
+begin
+  for C := Low(TColor) to High(TColor) do if C in X then Write(Ord(C)); WriteLn;
+end;
+begin
+  S := [cRed, cBlue]; T := Warm;
+  WriteLn(SizeOf(S), ' ', SizeOf(R), ' ', SizeOf(H));
+  Dump(S, SizeOf(S)); Show(S + T); Show(S * T); Show(S - T);
+  Include(S, cGreen); Exclude(S, cRed); Show(S);
+  H := [20, 25, 30]; Include(H, 23); Dump(H, SizeOf(H));
+  for I in H do Write(I, ' '); WriteLn(25 in H, ' ', 24 in H);
+  R.A := 7; R.B := 9; R.C := [cYellow]; R.H := H; Include(R.C, cGreen); Exclude(R.H, 25);
+  Dump(R, SizeOf(R));
+  B := TBox.Create(nil); B.Name := 'Box'; B.Colors := [cGreen, cYellow];
+  WriteLn(GetSetProp(B, 'Colors', True), ' ', GetOrdProp(B, 'Colors'));
+  M := TMemoryStream.Create; M.WriteComponent(B);
+  for I := 0 to M.Size - 1 do Write(IntToHex(PByte(M.Memory)[I], 2)); WriteLn;
+  M.Position := 0; B2 := TBox.Create(nil); M.ReadComponent(B2); Show(B2.Colors);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(
+            out,
+            r#"1 6 2
+5 
+023
+0
+2
+12
+144 66 
+20 23 25 30 TRUE FALSE
+7 10 144 64 9 0 
+[cGreen,cYellow] 10
+545046300454426F7803426F7806436F6C6F72730B0663477265656E076359656C6C6F77000000
+13
+"#
+        );
+    }
+
+    #[test]
+    fn class_references_compare_by_address() {
+        let (ok, out) = build_and_run_source(
+            r#"program ih4;
+{$mode objfpc}
+type TA = class X: Integer; end; TB = class Y: Integer; end;
+var C, D: TClass; P, Q: TObject;
+begin
+  C := TA; D := TB;
+  WriteLn(C <> D, ' ', C = D, ' ', C = TA, ' ', TA = TB);
+  P := TA.Create; Q := TB.Create;
+  WriteLn(P = Q, ' ', P.ClassType = Q.ClassType);
+end.
+"#,
+        );
+        assert!(ok, "program failed: {out}");
+        assert_eq!(out, "TRUE FALSE TRUE FALSE\nFALSE FALSE\n");
+    }
+
+    #[test]
     fn generic_routines_delphi_syntax() {
         let (ok, out) = build_and_run_source(
             "program T;

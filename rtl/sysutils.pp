@@ -45,6 +45,10 @@ type
   EInvalidPointer = class(EHeapMemoryError);
   EInvalidCast = class(Exception);
   EConvertError = class(Exception);
+  EVariantError = class(Exception)
+    ErrCode: LongInt;
+    constructor CreateCode(Code: LongInt);
+  end;
   EAbstractError = class(Exception);
   EAssertionFailed = class(Exception);
   EOSError = class(Exception)
@@ -140,6 +144,9 @@ function BrutoCFormat(const Fmt: string): string;
   x, s, f, e, g, n, m and p; `*` takes a width or precision from Args. }
 function Format(const Fmt: string; const Args: array of const): string;
 function FloatToStr(Value: Double): string;
+function CurrToStr(Value: Currency): string;
+function StrToCurr(const S: string): Currency;
+function TryStrToCurr(const S: string; out Value: Currency): Boolean;
 function FloatToStrF(Value: Double; Format: TFloatFormat; Precision, Digits: Integer): string;
 
 implementation
@@ -827,6 +834,25 @@ begin
   end;
 end;
 
+function CurrToStr(Value: Currency): string;
+begin
+  Result := FloatToStr(Value);
+end;
+
+function StrToCurr(const S: string): Currency;
+begin
+  Result := StrToFloat(S);
+end;
+
+function TryStrToCurr(const S: string; out Value: Currency): Boolean;
+var
+  D: Double;
+begin
+  Result := TryStrToFloat(S, D);
+  if Result then
+    Value := D;
+end;
+
 function FloatToStr(Value: Double): string;
 begin
   FloatToStr := FormatGeneral(Value, 15);
@@ -1057,6 +1083,21 @@ begin
   inherited Create;
   FMessage := Msg;
   FHelpContext := AHelpContext;
+end;
+
+constructor EVariantError.CreateCode(Code: LongInt);
+begin
+  case Code of
+    LongInt($80020005): Create('Invalid variant type cast');
+    LongInt($80020008): Create('Invalid variant type');
+    LongInt($8002000A): Create('Variant overflow');
+    LongInt($8002000B): Create('Variant array bounds error');
+    LongInt($80004001): Create('Operation not supported');
+    LongInt($80070057): Create('Invalid argument');
+  else
+    Create('Unexpected variant error');
+  end;
+  ErrCode := Code;
 end;
 
 function Exception.ToString: string;

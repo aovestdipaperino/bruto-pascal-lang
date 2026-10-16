@@ -7,8 +7,10 @@
 //! `llvm_type_for` builds with the same rules, so the offsets computed here
 //! are the ones the generated code uses.
 
-use super::CodeGen;
+use super::{CodeGen, CodeGenError};
 use crate::ast::*;
+use inkwell::types::BasicType;
+use inkwell::values::BasicValue;
 
 /// Where a variant part lives in a record's LLVM struct.
 pub(super) struct VariantSlots {
@@ -38,6 +40,11 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Enum { size, .. } => u64::from(*size),
             PascalType::Array { elem, .. } => self.align_of(elem),
             PascalType::Record { packed: true, .. } => 1,
+            PascalType::Set { .. } => match self.set_layout(ty).0 {
+                size @ (1 | 2 | 4 | 8) => size,
+                32 => 8,
+                _ => 1,
+            },
             PascalType::Record {
                 fields, variant, ..
             } => {
@@ -56,6 +63,119 @@ impl<'ctx> CodeGen<'ctx> {
             }
             _ => 8,
         }
+    }
+
+    /// The bytes a set of type `ty` takes and the byte of the 256-bit
+    /// form its first byte holds, as FPC lays sets out: by default 4
+    /// bytes when no element is above 31, else 32; with `{$PACKSET n}`
+    /// (Delphi and TP modes: 1) the bytes from its lowest element's
+    /// (rounded down to n) to its highest's, rounded up to n, and 3 made 4.
+    pub(super) fn set_layout(&self, ty: &PascalType) -> (u64, u64) {
+        let PascalType::Set { elem, pack } = self.resolve_type(ty) else {
+            return (32, 0);
+        };
+        let (lo, hi) = self
+            .ordinal_bounds(&self.resolve_type(&elem))
+            .unwrap_or((0, 255));
+        let (lo, hi) = (lo.clamp(0, 255) as u64, hi.clamp(0, 255) as u64);
+        if pack == 0 {
+            return if hi <= 31 { (4, 0) } else { (32, 0) };
+        }
+        let n = u64::from(pack);
+        let base = lo / 8 / n * n;
+        let mut size = (hi / 8 - base + 1).div_ceil(n) * n;
+        if size == 3 {
+            size = 4;
+        }
+        (size, base.min(32 - size))
+    }
+
+    /// The LLVM type a set of type `ty` is stored as.
+    pub(super) fn set_storage_type(&self, ty: &PascalType) -> inkwell::types::BasicTypeEnum<'ctx> {
+        match self.set_layout(ty).0 {
+            32 => self.context.i64_type().array_type(4).as_basic_type_enum(),
+            size @ (1 | 2 | 4 | 8) => self
+                .context
+                .custom_width_int_type(size as u32 * 8)
+                .as_basic_type_enum(),
+            size => self
+                .context
+                .i8_type()
+                .array_type(size as u32)
+                .as_basic_type_enum(),
+        }
+    }
+
+    /// A set value as stored (`set_storage_type`) made the 256-bit form
+    /// expressions use.
+    pub(super) fn set_from_storage(
+        &self,
+        val: inkwell::values::BasicValueEnum<'ctx>,
+        ty: &PascalType,
+        span: Span,
+    ) -> Result<inkwell::values::BasicValueEnum<'ctx>, CodeGenError> {
+        let wide = self.context.i64_type().array_type(4);
+        let (size, base) = self.set_layout(ty);
+        if size == 32 || val.get_type() == wide.as_basic_type_enum() {
+            return Ok(val);
+        }
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let temp = self.entry_alloca(wide, "set_wide").map_err(err)?;
+        self.builder
+            .build_store(temp, wide.const_zero())
+            .map_err(err)?;
+        let i8_ty = self.context.i8_type();
+        let at = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_ty,
+                    temp,
+                    &[self.context.i64_type().const_int(base, false)],
+                    "set_at",
+                )
+                .map_err(err)?
+        };
+        let store = self.builder.build_store(at, val).map_err(err)?;
+        store
+            .set_alignment(1)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        self.builder.build_load(wide, temp, "set").map_err(err)
+    }
+
+    /// A 256-bit set value made the form a set of type `ty` is stored in.
+    pub(super) fn set_to_storage(
+        &self,
+        val: inkwell::values::BasicValueEnum<'ctx>,
+        ty: &PascalType,
+        span: Span,
+    ) -> Result<inkwell::values::BasicValueEnum<'ctx>, CodeGenError> {
+        let wide = self.context.i64_type().array_type(4);
+        let (size, base) = self.set_layout(ty);
+        if size == 32 || val.get_type() != wide.as_basic_type_enum() {
+            return Ok(val);
+        }
+        let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        let temp = self.entry_alloca(wide, "set_wide").map_err(err)?;
+        self.builder.build_store(temp, val).map_err(err)?;
+        let at = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    self.context.i8_type(),
+                    temp,
+                    &[self.context.i64_type().const_int(base, false)],
+                    "set_at",
+                )
+                .map_err(err)?
+        };
+        let load = self
+            .builder
+            .build_load(self.set_storage_type(ty), at, "set_bytes")
+            .map_err(err)?;
+        load.as_instruction_value()
+            .unwrap()
+            .set_alignment(1)
+            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+        Ok(load)
     }
 
     /// A field's alignment in a record: 1 when the record is packed.

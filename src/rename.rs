@@ -277,7 +277,7 @@ pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
         }
         PascalType::Array { elem, .. }
         | PascalType::Pointer(elem)
-        | PascalType::Set { elem }
+        | PascalType::Set { elem, .. }
         | PascalType::File { elem } => rewrite_type(elem, n),
         PascalType::ConformantArray {
             lo_name,
@@ -307,6 +307,8 @@ pub(crate) fn rewrite_type<R: Rename>(ty: &mut PascalType, n: &R) {
         | PascalType::SizedInt { .. }
         | PascalType::Real
         | PascalType::Single
+        | PascalType::Variant
+        | PascalType::Currency
         | PascalType::String
         | PascalType::Boolean
         | PascalType::Char

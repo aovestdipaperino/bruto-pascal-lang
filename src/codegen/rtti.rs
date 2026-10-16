@@ -40,6 +40,7 @@ const TK_SET: u64 = 5;
 const TK_METHOD: u64 = 6;
 const TK_SSTRING: u64 = 7;
 const TK_ASTRING: u64 = 9;
+const TK_VARIANT: u64 = 11;
 const TK_ARRAY: u64 = 12;
 const TK_RECORD: u64 = 13;
 const TK_INTERFACE: u64 = 14;
@@ -66,6 +67,7 @@ const OT_SQWORD: u64 = 6;
 
 const FT_SINGLE: u64 = 0;
 const FT_DOUBLE: u64 = 1;
+const FT_CURR: u64 = 4;
 
 /// A record's field values by (lower-case) name; the rest are zero.
 type Fields<'ctx> = HashMap<&'static str, BasicValueEnum<'ctx>>;
@@ -215,6 +217,7 @@ impl<'ctx> CodeGen<'ctx> {
                 | PascalType::SizedInt { .. }
                 | PascalType::Real
                 | PascalType::Single
+                | PascalType::Currency
                 | PascalType::String
                 | PascalType::ShortString { .. }
                 | PascalType::UnicodeString
@@ -372,9 +375,15 @@ impl<'ctx> CodeGen<'ctx> {
                 data.insert("namelist", names.into());
                 TK_ENUMERATION
             }
-            PascalType::Set { elem } => {
-                // Ordinal access reads the first 32 elements' bits.
-                ordinal(data, OT_ULONG, 0, 0);
+            PascalType::Set { elem, .. } => {
+                // Ordinal access reads the set's bytes (the first 32
+                // elements' bits of a large one).
+                let ord_type = match self.set_layout(ty).0 {
+                    1 => OT_UBYTE,
+                    2 => OT_UWORD,
+                    _ => OT_ULONG,
+                };
+                ordinal(data, ord_type, 0, 0);
                 let elem = (**elem).clone();
                 let elem_name = match &elem {
                     PascalType::Named(n) => Some(n.clone()),
@@ -393,9 +402,14 @@ impl<'ctx> CodeGen<'ctx> {
                 data.insert("floattype", self.i64_const(FT_SINGLE as i64));
                 TK_FLOAT
             }
+            PascalType::Currency => {
+                data.insert("floattype", self.i64_const(FT_CURR as i64));
+                TK_FLOAT
+            }
             PascalType::String => TK_ASTRING,
             PascalType::ShortString { .. } => TK_SSTRING,
             PascalType::UnicodeString => TK_USTRING,
+            PascalType::Variant => TK_VARIANT,
             PascalType::Proc {
                 of_object: true, ..
             } => TK_METHOD,
@@ -770,6 +784,7 @@ fn builtin_type_name(ty: &PascalType) -> &'static str {
         },
         PascalType::Real => "Double",
         PascalType::Single => "Single",
+        PascalType::Currency => "Currency",
         PascalType::String => "AnsiString",
         PascalType::ShortString { .. } => "ShortString",
         PascalType::UnicodeString => "UnicodeString",
@@ -777,6 +792,7 @@ fn builtin_type_name(ty: &PascalType) -> &'static str {
         PascalType::Char => "Char",
         PascalType::WideChar => "WideChar",
         PascalType::Pointer(_) => "Pointer",
+        PascalType::Variant => "Variant",
         _ => "",
     }
 }

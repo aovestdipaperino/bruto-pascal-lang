@@ -312,6 +312,9 @@ struct Lexer {
     /// `{$PACKENUM}`: the fewest bytes an enumeration value takes (4 in
     /// FPC's own modes, 1 in Delphi's and TP's).
     packenum: u8,
+    /// `{$PACKSET}`: 0 for FPC's fixed sizes (its own modes), else 1, 2,
+    /// 4 or 8 (Delphi and TP modes use 1).
+    packset: u8,
     /// `{$DEFINE NAME := text}` macros: upper-case name -> replacement.
     macros: std::collections::HashMap<String, String>,
     conditions: Vec<Condition>,
@@ -406,6 +409,7 @@ impl Lexer {
             corba: false,
             type_info: false,
             packenum: 4,
+            packset: 0,
             conditions: Vec::new(),
             include_dirs: options.include_dirs.clone(),
             error: None,
@@ -542,21 +546,25 @@ impl Lexer {
                     self.short_strings = true;
                     self.int32 = true;
                     self.packenum = 4;
+                    self.packset = 0;
                 }
                 "FPC" | "MACPAS" | "ISO" => {
                     self.short_strings = true;
                     self.int32 = false;
                     self.packenum = 4;
+                    self.packset = 0;
                 }
                 "TP" => {
                     self.short_strings = true;
                     self.int32 = false;
                     self.packenum = 1;
+                    self.packset = 1;
                 }
                 "DELPHI" | "DELPHIUNICODE" => {
                     self.short_strings = false;
                     self.int32 = true;
                     self.packenum = 1;
+                    self.packset = 1;
                 }
                 _ => {}
             },
@@ -568,6 +576,15 @@ impl Lexer {
                     "1" => 1,
                     "2" => 2,
                     _ => 4,
+                }
+            }
+            "packset" => {
+                self.packset = match first_word(rest).as_str() {
+                    "1" => 1,
+                    "2" => 2,
+                    "4" => 4,
+                    "8" => 8,
+                    _ => 0,
                 }
             }
             // `{$Z1}`, `{$Z2}`, `{$Z4}`: the same.
@@ -1308,6 +1325,8 @@ pub struct Parser {
     type_info: Vec<bool>,
     /// For each token, the `{$PACKENUM}` there.
     packenum: Vec<u8>,
+    /// For each token, the `{$PACKSET}` there.
+    packset: Vec<u8>,
     /// Aliases for the specializations written in expressions.
     hidden_types: Vec<TypeDecl>,
     pos: usize,
@@ -1345,6 +1364,7 @@ impl Parser {
         let mut corba = Vec::new();
         let mut type_info = Vec::new();
         let mut packenum = Vec::new();
+        let mut packset = Vec::new();
         loop {
             let (tok, span) = lexer.next_token();
             let is_eof = tok == Tok::Eof;
@@ -1362,6 +1382,7 @@ impl Parser {
             corba.push(lexer.corba);
             type_info.push(lexer.type_info);
             packenum.push(lexer.packenum);
+            packset.push(lexer.packset);
             if is_eof {
                 break;
             }
@@ -1373,6 +1394,7 @@ impl Parser {
             corba,
             type_info,
             packenum,
+            packset,
             hidden_types: Vec::new(),
             pos: 0,
             directives: lexer.directives,
@@ -2225,11 +2247,13 @@ impl Parser {
             return Ok(Self::make_subrange(lo, hi));
         }
         if *self.peek() == Tok::KwSet {
+            let pack = self.packset[self.pos];
             self.advance();
             self.expect(&Tok::KwOf)?;
             let elem = self.parse_type()?;
             return Ok(PascalType::Set {
                 elem: Box::new(elem),
+                pack,
             });
         }
         if *self.peek() == Tok::KwFile {

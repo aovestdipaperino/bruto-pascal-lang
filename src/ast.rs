@@ -241,6 +241,14 @@ pub enum PascalType {
     /// `Single`: a 32-bit float in memory, widened to `Real` as soon as
     /// it is loaded into an expression.
     Single,
+    /// `Currency`: FPC's fixed point number, an Int64 holding the value
+    /// times 10000. Loaded into an expression it is a `Real`; arithmetic
+    /// whose result is a Currency is done on the Int64s, as FPC does.
+    Currency,
+    /// `Variant`: 16 bytes laid out as FPC's `TVarData` (a type code,
+    /// then the value), its strings and arrays counted. The Variants unit
+    /// gives its conversions and operations.
+    Variant,
     String,
     Boolean,
     Char,
@@ -312,9 +320,13 @@ pub enum PascalType {
         lo: i64,
         hi: i64,
     },
-    /// Set of ordinal type — stored as 256-bit bitmask (4 x i64)
+    /// Set of ordinal type: a 256-bit bitmask (4 x i64) in expressions,
+    /// stored in as many bytes as FPC gives it (see `set_layout`).
     Set {
         elem: Box<PascalType>,
+        /// `{$PACKSET}`: 0 for FPC's default (4 bytes for elements up to
+        /// 31, else 32), or 1, 2, 4 or 8 (Delphi and TP modes use 1).
+        pack: u8,
     },
     /// File of <type> — stored as opaque pointer to bruto_file struct.
     /// `text` is `File { elem: Char }`.
@@ -396,7 +408,7 @@ impl PascalType {
             }
             PascalType::Array { elem, .. }
             | PascalType::ArrayExpr { elem, .. }
-            | PascalType::Set { elem }
+            | PascalType::Set { elem, .. }
             | PascalType::Pointer(elem) => elem.for_each_enum(f),
             _ => {}
         }

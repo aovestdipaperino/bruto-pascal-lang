@@ -24,6 +24,35 @@ type
     otUQWord);
   TFloatType = (ftSingle, ftDouble, ftExtended, ftComp, ftCurr);
 
+  { A Variant's layout, as FPC's: its type, three reserved words and the
+    value. A variant array's data is a dynamic array of variants, its low
+    bound in Reserved1. }
+  TVarType = Word;
+  PVariant = ^Variant;
+  PVarData = ^TVarData;
+  TVarData = packed record
+    VType: TVarType;
+    Reserved1, Reserved2, Reserved3: Word;
+    case Integer of
+      0: (VSmallInt: SmallInt);
+      1: (VInteger: LongInt);
+      2: (VSingle: Single);
+      3: (VDouble: Double);
+      4: (VCurrency: Currency);
+      5: (VDate: Double);
+      6: (VOleStr: Pointer);
+      7: (VBoolean: Boolean);
+      8: (VShortInt: ShortInt);
+      9: (VByte: Byte);
+      10: (VWord: Word);
+      11: (VLongWord: LongWord);
+      12: (VInt64: Int64);
+      13: (VQWord: QWord);
+      14: (VString: Pointer);
+      15: (VArray: Pointer);
+      16: (VPointer: Pointer);
+  end;
+
   PTypeInfo = ^TTypeInfo;
   PPTypeInfo = ^PTypeInfo;
   TTypeInfo = record
@@ -107,6 +136,9 @@ function BrutoRandomFloat: Double;
 { A seed from the clock. }
 procedure Randomize;
 
+{ A Currency's text as Write(C:Len:F) gives it (C its scaled Int64; Len
+  -32767 and F -1 when not given), FPC's fpc_shortstr_currency. }
+function bruto_curr_str(C: Int64; Len, F: Int64): AnsiString;
 { S with ASCII letters in lower case, as FPC's System.LowerCase. }
 function LowerCase(const S: AnsiString): AnsiString;
 { Compare Len bytes: negative, zero or positive, as FPC. }
@@ -114,7 +146,196 @@ function CompareByte(const Buf1, Buf2; Len: SizeInt): SizeInt;
 { The index of the first byte B among Len bytes of Buf, or -1. }
 function IndexByte(const Buf; Len: SizeInt; B: Byte): SizeInt;
 
+const
+  varEmpty = 0;
+  varNull = 1;
+  varSmallInt = 2;
+  varInteger = 3;
+  varSingle = 4;
+  varDouble = 5;
+  varCurrency = 6;
+  varDate = 7;
+  varOleStr = 8;
+  varDispatch = 9;
+  varError = 10;
+  varBoolean = 11;
+  varVariant = 12;
+  varUnknown = 13;
+  varDecimal = 14;
+  varShortInt = 16;
+  varByte = 17;
+  varWord = 18;
+  varLongWord = 19;
+  varInt64 = 20;
+  varQWord = 21;
+  varRecord = 36;
+  varStrArg = $48;
+  varAny = $101;
+  varString = $100;
+  varUString = $102;
+  varTypeMask = $FFF;
+  varArray = $2000;
+  varByRef = $4000;
+
 implementation
+
+function bruto_curr_str(C: Int64; Len, F: Int64): AnsiString;
+const
+  MinLen = 8;
+var
+  Buf: array[1..20] of Char;
+  S: AnsiString;
+  I, J, K, ResLen, TLen, Sign, R, Point: Int64;
+  IC: QWord;
+begin
+  for I := 1 to 20 do
+    Buf[I] := '0';
+  if Len = -32767 then
+    Len := 25;
+  if C >= 0 then
+  begin
+    IC := QWord(C);
+    Sign := 0;
+  end
+  else
+  begin
+    Sign := 1;
+    IC := QWord(-C);
+  end;
+  TLen := 0;
+  repeat
+    Inc(TLen);
+    Buf[TLen] := Chr(IC mod 10 + 48);
+    IC := IC div 10;
+  until IC = 0;
+  ResLen := TLen;
+  if F <> 0 then
+    Inc(ResLen);
+  if F < 0 then
+  begin
+    Inc(ResLen, 5);
+    if Len < MinLen then
+      Len := MinLen;
+    R := ResLen - Len;
+    if ResLen < Len then
+      ResLen := Len;
+    if R > 0 then
+    begin
+      ResLen := Len;
+      Point := TLen - R;
+    end
+    else
+      Point := TLen;
+  end
+  else
+  begin
+    Inc(ResLen, Sign);
+    while TLen < 5 do
+    begin
+      Inc(ResLen);
+      Inc(TLen);
+      Buf[TLen] := '0';
+    end;
+    R := 4 - F;
+    Point := F;
+    if Point <> 0 then
+    begin
+      if Point > 4 then
+        Point := 4;
+      Inc(Point);
+    end;
+    Dec(ResLen, R);
+  end;
+  if R > 0 then
+  begin
+    K := 0;
+    I := R + 2;
+    if I > TLen then
+      I := TLen + 1;
+    if Buf[I - 2] >= '5' then
+    begin
+      if Buf[I - 1] < '9' then
+        Buf[I - 1] := Chr(Ord(Buf[I - 1]) + 1)
+      else
+      begin
+        Buf[I - 1] := '0';
+        K := 1;
+      end;
+    end;
+    if (K = 1) and (Buf[I - 1] = '0') then
+    begin
+      while Buf[I] = '9' do
+      begin
+        Buf[I] := '0';
+        Inc(I);
+      end;
+      Buf[I] := Chr(Ord(Buf[I]) + 1);
+      if I > TLen then
+      begin
+        Inc(ResLen);
+        Inc(TLen);
+      end;
+    end;
+  end;
+  if ResLen < Len then
+    ResLen := Len;
+  if ResLen > 255 then
+  begin
+    if R < 0 then
+      Inc(R, ResLen - 255);
+    ResLen := 255;
+  end;
+  SetLength(S, ResLen);
+  J := ResLen;
+  if F < 0 then
+  begin
+    if C = 0 then
+      K := 0
+    else
+      K := TLen - 5;
+    if K >= 0 then
+      S[J - 2] := '+'
+    else
+    begin
+      S[J - 2] := '-';
+      K := -K;
+    end;
+    S[J] := Chr(K mod 10 + 48);
+    Dec(J);
+    S[J] := Chr(K div 10 + 48);
+    Dec(J, 2);
+    S[J] := 'E';
+    Dec(J);
+  end;
+  while R < 0 do
+  begin
+    S[J] := '0';
+    Dec(J);
+    Inc(R);
+  end;
+  for I := R + 1 to TLen do
+  begin
+    Dec(Point);
+    if Point = 0 then
+    begin
+      S[J] := '.';
+      Dec(J);
+    end;
+    S[J] := Buf[I];
+    Dec(J);
+  end;
+  if Sign = 1 then
+  begin
+    S[J] := '-';
+    Dec(J);
+  end;
+  while J > 0 do
+  begin
+    S[J] := ' ';
+    Dec(J);
+  end;
+  bruto_curr_str := S;
+end;
 
 function Pi: Double;
 begin

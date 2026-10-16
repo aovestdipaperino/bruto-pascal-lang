@@ -59,7 +59,8 @@ impl<'ctx> CodeGen<'ctx> {
             });
         }
         // `for X in S`: the members of a set, in order.
-        if let PascalType::Set { elem } = self.resolve_type(&self.infer_declared_type(collection))
+        if let PascalType::Set { elem, .. } =
+            self.resolve_type(&self.infer_declared_type(collection))
             && let Some((lo, hi)) = self.ordinal_bounds(&self.resolve_type(&elem))
         {
             let test = Statement::If {

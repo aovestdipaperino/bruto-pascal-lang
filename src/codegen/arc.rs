@@ -35,7 +35,10 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn holds_counted_string(&self, ty: &PascalType) -> bool {
         match self.resolve_type(ty) {
-            PascalType::String | PascalType::UnicodeString | PascalType::DynArray(_) => true,
+            PascalType::String
+            | PascalType::UnicodeString
+            | PascalType::DynArray(_)
+            | PascalType::Variant => true,
             PascalType::Interface(name) => self.interface_counted(&name),
             PascalType::Array { elem, .. } => self.holds_counted_string(&elem),
             PascalType::Record { fields, .. } => {
@@ -68,6 +71,15 @@ impl<'ctx> CodeGen<'ctx> {
                 self.arc_call("bruto_astr_addref", p, span)
             }
             PascalType::UnicodeString => Ok(()),
+            PascalType::Variant => {
+                let temp = self
+                    .entry_alloca(self.variant_type(), "var_tmp")
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                self.builder
+                    .build_store(temp, val)
+                    .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                self.arc_call("bruto_var_addref", temp, span)
+            }
             PascalType::Interface(_) => {
                 let (obj, itable) = self.interface_parts(val, span)?;
                 self.call_ustr_runtime("bruto_intf_addref", &[obj.into(), itable.into()], span)?;
@@ -130,6 +142,10 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(err)?
                     .into_pointer_value();
                 self.arc_call(op, s, span)
+            }
+            PascalType::Variant => {
+                let op = op.replace("bruto_astr_", "bruto_var_");
+                self.arc_call(&op, slot, span)
             }
             // A record result's interfaces pass to the caller as they are.
             PascalType::Interface(_) if op == "bruto_astr_return" => Ok(()),

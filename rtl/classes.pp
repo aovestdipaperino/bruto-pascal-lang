@@ -386,6 +386,11 @@ type
     procedure WriteInteger(Value: Int64);
     procedure WriteSet(Value: LongInt; SetType: Pointer);
     procedure WriteString(const Value: string);
+    procedure WriteWideString(const Value: UnicodeString);
+    procedure WriteSingle(const Value: Single);
+    procedure WriteCurrency(const Value: Currency);
+    procedure WriteUInt64(Value: QWord);
+    procedure WriteVariant(const VarValue: Variant);
     procedure WriteMethodName(const Name: string);
     procedure WriteCollection(Value: TCollection);
     procedure WriteListBegin;
@@ -421,6 +426,10 @@ type
     function ReadIdent: string;
     function ReadBoolean: Boolean;
     function ReadFloat: Double;
+    function ReadSingle: Single;
+    function ReadCurrency: Currency;
+    function ReadWideString: UnicodeString;
+    function ReadVariant: Variant;
     function ReadChar: Char;
     function ReadSet(SetType: Pointer): LongInt;
     procedure SkipValue;
@@ -2555,6 +2564,8 @@ var
   ObjValue: TObject;
   C: TComponent;
   Method: TMethod;
+  VarValue: Variant;
+  DefVarData: TVarData;
 begin
   { Only properties that can be read and written are streamed. }
   if PropInfo^.GetProc = nil then
@@ -2683,6 +2694,16 @@ begin
           WriteBoolean(Value <> 0);
         end;
       end;
+    tkVariant:
+      begin
+        VarValue := GetVariantProp(Instance, PropInfo);
+        FillChar(DefVarData, SizeOf(DefVarData), 0);
+        if CompareByte(VarValue, DefVarData, SizeOf(TVarData)) <> 0 then
+        begin
+          WriteStr(FPropPath + PropInfo^.Name);
+          WriteVariant(VarValue);
+        end;
+      end;
   end;
 end;
 
@@ -2780,6 +2801,66 @@ begin
   end;
   if Len > 0 then
     FStream.WriteBuffer(Value[1], Len);
+end;
+
+procedure TWriter.WriteWideString(const Value: UnicodeString);
+var
+  Len: LongWord;
+begin
+  WriteValue(vaWString);
+  Len := Length(Value);
+  FStream.WriteDWord(Len);
+  if Len > 0 then
+    FStream.WriteBuffer(Value[1], Len * 2);
+end;
+
+procedure TWriter.WriteSingle(const Value: Single);
+begin
+  WriteValue(vaSingle);
+  FStream.WriteBuffer(Value, 4);
+end;
+
+procedure TWriter.WriteCurrency(const Value: Currency);
+begin
+  WriteValue(vaCurrency);
+  FStream.WriteBuffer(Value, 8);
+end;
+
+procedure TWriter.WriteUInt64(Value: QWord);
+begin
+  if Value <= $7FFFFFFF then
+    WriteInteger(Value)
+  else
+  begin
+    WriteValue(vaQWord);
+    FStream.WriteQWord(Value);
+  end;
+end;
+
+{ As FPC's binary writer: the variant's value by its type (without the
+  Variants unit, from its TVarData). }
+procedure TWriter.WriteVariant(const VarValue: Variant);
+var
+  D: PVarData;
+begin
+  D := PVarData(@VarValue);
+  case D^.VType and varTypeMask of
+    varEmpty: WriteValue(vaNil);
+    varNull: WriteValue(vaNull);
+    varShortInt: WriteInteger(D^.VShortInt);
+    varSmallInt: WriteInteger(D^.VSmallInt);
+    varInteger: WriteInteger(D^.VInteger);
+    varInt64: WriteInteger(D^.VInt64);
+    varQWord: WriteUInt64(D^.VQWord);
+    varBoolean: WriteBoolean(D^.VBoolean);
+    varSingle: WriteSingle(D^.VSingle);
+    varDouble: WriteFloat(D^.VDouble);
+    varCurrency: WriteCurrency(D^.VCurrency);
+    varOleStr: WriteWideString(UnicodeString(D^.VOleStr));
+    varString: WriteWideString(UnicodeString(AnsiString(D^.VString)));
+  else
+    raise EWriteError.CreateFmt('Unsupported property variant type %d', [D^.VType]);
+  end;
 end;
 
 procedure TWriter.WriteMethodName(const Name: string);
@@ -2988,6 +3069,128 @@ begin
   end
   else
     Result := ReadInt64;
+end;
+
+function TReader.ReadSingle: Single;
+begin
+  case NextValue of
+    vaSingle:
+      begin
+        ReadValue;
+        FStream.ReadBuffer(Result, 4);
+      end;
+    vaExtended: Result := ReadFloat;
+  else
+    Result := ReadInteger;
+  end;
+end;
+
+function TReader.ReadCurrency: Currency;
+begin
+  if NextValue = vaCurrency then
+  begin
+    ReadValue;
+    FStream.ReadBuffer(Result, 8);
+  end
+  else
+    Result := ReadInteger;
+end;
+
+function TReader.ReadWideString: UnicodeString;
+var
+  Len: LongWord;
+begin
+  case NextValue of
+    vaWString, vaUString:
+      begin
+        ReadValue;
+        Len := FStream.ReadDWord;
+        SetLength(Result, Len);
+        if Len > 0 then
+          FStream.ReadBuffer(Result[1], Len * 2);
+      end;
+    vaUTF8String:
+      Result := UTF8Decode(ReadString);
+  else
+    Result := UnicodeString(ReadString);
+  end;
+end;
+
+{ Store the counted pointer P (a string) in the variant D. }
+procedure BrutoSetVarString(D: PVarData; AType: TVarType; P: Pointer);
+begin
+  bruto_astr_addref(P);
+  D^.VType := AType;
+  D^.VString := P;
+end;
+
+{ As FPC's reader: the value as the variant of its type. }
+function TReader.ReadVariant: Variant;
+var
+  D: PVarData;
+  S: string;
+  U: UnicodeString;
+begin
+  D := PVarData(@Result);
+  case NextValue of
+    vaNil:
+      begin
+        ReadValue;
+        D^.VType := varEmpty;
+      end;
+    vaNull:
+      begin
+        ReadValue;
+        D^.VType := varNull;
+      end;
+    vaInt8, vaInt16, vaInt32:
+      begin
+        D^.VType := varInteger;
+        D^.VInteger := ReadInteger;
+      end;
+    vaInt64:
+      begin
+        D^.VType := varInt64;
+        D^.VInt64 := ReadInt64;
+      end;
+    vaQWord:
+      begin
+        D^.VType := varQWord;
+        D^.VInt64 := ReadInt64;
+      end;
+    vaFalse, vaTrue:
+      begin
+        D^.VType := varBoolean;
+        D^.VBoolean := ReadValue = vaTrue;
+      end;
+    vaSingle:
+      begin
+        D^.VType := varDouble;
+        D^.VDouble := ReadSingle;
+      end;
+    vaExtended:
+      begin
+        D^.VType := varDouble;
+        D^.VDouble := ReadFloat;
+      end;
+    vaCurrency:
+      begin
+        D^.VType := varCurrency;
+        D^.VCurrency := ReadCurrency;
+      end;
+    vaWString, vaUTF8String, vaUString:
+      begin
+        U := ReadWideString;
+        BrutoSetVarString(D, varOleStr, Pointer(U));
+      end;
+    vaString, vaLString:
+      begin
+        S := ReadString;
+        BrutoSetVarString(D, varString, Pointer(S));
+      end;
+  else
+    raise EReadError.CreateFmt('Unsupported property variant type %d', [Ord(NextValue)]);
+  end;
 end;
 
 function TReader.ReadChar: Char;
@@ -3223,6 +3426,8 @@ begin
       SetFloatProp(Instance, PropInfo, ReadFloat);
     tkSString, tkLString, tkAString, tkUString:
       SetStrProp(Instance, PropInfo, ReadString);
+    tkVariant:
+      SetVariantProp(Instance, PropInfo, ReadVariant);
     tkMethod:
       if NextValue = vaNil then
       begin
@@ -3539,7 +3744,7 @@ procedure ObjectBinaryToText(Input, Output: TStream);
       vaCurrency:
         OutLn(Output, IntToStr(Int64(Input.ReadQWord)) + 'c');
     else
-      raise EReadError.CreateFmt('Invalid property type %d', [Ord(ValueType)]);
+      raise EReadError.CreateFmt('Invalid property type from streamed property: %d', [Ord(ValueType)]);
     end;
   end;
 

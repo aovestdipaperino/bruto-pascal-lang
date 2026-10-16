@@ -25,6 +25,7 @@ use std::path::Path;
 mod arc;
 mod classes;
 mod closures;
+mod currency;
 mod dynarrays;
 mod exceptions;
 mod forin;
@@ -35,6 +36,7 @@ mod rtti;
 mod strings;
 mod system;
 mod unicode;
+mod variants;
 
 /// The marker in an AnsiString's header (`BrutoAStrMarker` in
 /// `rtl/brutostrings.pp`).
@@ -1188,6 +1190,8 @@ impl<'ctx> CodeGen<'ctx> {
                 | PascalType::Specialize { .. }
                 | PascalType::Interface(_)
                 | PascalType::Enum { .. }
+                | PascalType::Variant
+                | PascalType::Currency
                 | PascalType::ShortString { .. } => {
                     self.builder
                         .build_store(alloca, llvm_ty.const_zero())
@@ -1661,7 +1665,11 @@ impl<'ctx> CodeGen<'ctx> {
                 CodeGenError::new("this value doesn't match the constant's type", Some(*span)),
             ),
             _ => {
-                let val = self.compile_expr(value)?;
+                let val = if matches!(resolved, PascalType::Currency | PascalType::Variant) {
+                    self.compile_expr_for(value, &resolved)?
+                } else {
+                    self.compile_expr(value)?
+                };
                 self.store_value(slot, val, &resolved, value.span())
             }
         }
@@ -1703,8 +1711,15 @@ impl<'ctx> CodeGen<'ctx> {
             })?;
             return self.store_initializer(slot, &c.value, &ty);
         }
-        let val = self.compile_expr(&c.value)?;
         let ty = self.const_decl_type(c);
+        let val = if matches!(
+            self.resolve_type(&ty),
+            PascalType::Currency | PascalType::Variant
+        ) {
+            self.compile_expr_for(&c.value, &ty)?
+        } else {
+            self.compile_expr(&c.value)?
+        };
         let alloca = *self.global_vars.get(&c.name).ok_or_else(|| {
             CodeGenError::new(
                 format!("constant '{}' was not declared", c.name),
@@ -2383,7 +2398,7 @@ impl<'ctx> CodeGen<'ctx> {
             if self.needs_arc(ret_ty)
                 && matches!(
                     self.resolve_type(ret_ty),
-                    PascalType::Record { .. } | PascalType::Array { .. }
+                    PascalType::Record { .. } | PascalType::Array { .. } | PascalType::Variant
                 )
             {
                 self.arc_return_slot(alloca, ret_ty, proc.span)?;
@@ -2479,6 +2494,16 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
             return self.short_to_c_string(temp, span);
         }
+        // A set stored in fewer than 32 bytes becomes the 256-bit form.
+        if let PascalType::Set { .. } = resolved {
+            return self.set_from_storage(val, &resolved, span);
+        }
+        // A Currency becomes the Real it stands for.
+        if resolved == PascalType::Currency
+            && let BasicValueEnum::IntValue(raw) = val
+        {
+            return self.currency_to_real(raw, span);
+        }
         // A Single becomes a Double.
         if resolved == PascalType::Single
             && let BasicValueEnum::FloatValue(fv) = val
@@ -2529,6 +2554,12 @@ impl<'ctx> CodeGen<'ctx> {
         match resolved {
             PascalType::UnicodeString => return self.to_ustr(val, span),
             PascalType::WideChar => return self.to_wide_char(val, span),
+            // A Real stored into a Currency (a Currency's own scaled
+            // Int64 arrives as an integer, from `compile_expr_for`).
+            PascalType::Currency if val.is_float_value() => {
+                return Ok(self.currency_from_value(val, span)?.into());
+            }
+            PascalType::Set { .. } => return self.set_to_storage(val, &resolved, span),
             _ => {}
         }
         // A UnicodeString or WideChar stored as an AnsiString.
@@ -2621,6 +2652,18 @@ impl<'ctx> CodeGen<'ctx> {
         if let Some(intf) = self.interface_of(target) {
             return self.compile_interface_value(expr, &intf);
         }
+        // To and from Variants.
+        if self.is_variant(target) {
+            return self.compile_as_variant(expr);
+        }
+        // A Currency: its scaled Int64.
+        if self.is_currency(target) {
+            return Ok(self.compile_currency_raw(expr)?.into());
+        }
+        if self.variant_converts_to(target) && self.expr_is_variant(expr) {
+            let v = self.compile_expr(expr)?;
+            return self.variant_to(v, target, expr.span());
+        }
         if matches!(
             self.resolve_type(target),
             PascalType::Proc {
@@ -2693,10 +2736,29 @@ impl<'ctx> CodeGen<'ctx> {
         expr: &Expr,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let ty = self.infer_declared_type(place);
-        if self.interface_of(&ty).is_some() {
+        if self.interface_of(&ty).is_some()
+            || self.is_variant(&ty)
+            || self.is_currency(&ty)
+            || (self.variant_converts_to(&ty) && self.expr_is_variant(expr))
+        {
             return self.compile_expr_for(expr, &ty);
         }
         self.compile_expr(expr)
+    }
+
+    /// The LLVM type of a Variant (FPC's `TVarData`).
+    pub(super) fn variant_type(&self) -> inkwell::types::StructType<'ctx> {
+        let i16_ty = self.context.i16_type();
+        self.context.struct_type(
+            &[
+                i16_ty.into(),
+                i16_ty.into(),
+                i16_ty.into(),
+                i16_ty.into(),
+                self.context.i64_type().into(),
+            ],
+            false,
+        )
     }
 
     /// Whether `expr` is a QWord (or an expression of QWords).
@@ -3104,6 +3166,13 @@ impl<'ctx> CodeGen<'ctx> {
                 span,
             } => {
                 self.set_debug_loc(*span);
+                if self
+                    .lookup_var_type(target.as_str())
+                    .is_some_and(|t| self.is_variant(t))
+                {
+                    let slot = *self.lookup_var(target.as_str()).unwrap();
+                    return self.store_variant_element(slot, &[index], expr, *span);
+                }
                 let idx_val = self.compile_expr(index)?;
                 let place = Expr::Index {
                     array: Box::new(Expr::Var(target.clone(), *span)),
@@ -3145,6 +3214,11 @@ impl<'ctx> CodeGen<'ctx> {
                         index: Box::new(index.clone()),
                         span: *span,
                     };
+                }
+                // `V[I, J] := X` with V (or an element on the way) a Variant.
+                if let Some((base, indices)) = self.variant_index_chain(&place) {
+                    let (slot, _) = self.resolve_array_base(base, *span)?;
+                    return self.store_variant_element(slot, &indices, expr, *span);
                 }
                 let val = self.compile_value_for(&place, expr)?;
                 let alloca = *self.lookup_var(target.as_str()).ok_or_else(|| {
@@ -3532,6 +3606,10 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Statement::PlaceAssignment { target, expr, span } => {
                 self.set_debug_loc(*span);
+                if let Some((base, indices)) = self.variant_index_chain(target) {
+                    let (slot, _) = self.resolve_array_base(base, *span)?;
+                    return self.store_variant_element(slot, &indices, expr, *span);
+                }
                 let target_ty = self.infer_declared_type(target);
                 let val = self.compile_expr_for(expr, &target_ty)?;
                 // A dynamic string's character is replaced through the
@@ -3992,6 +4070,8 @@ impl<'ctx> CodeGen<'ctx> {
             PascalType::Untyped => 1,
             PascalType::Real => 8,
             PascalType::Single => 4,
+            PascalType::Currency => 8,
+            PascalType::Variant => 16,
             PascalType::Boolean => 1,
             PascalType::Char => 1,
             PascalType::WideChar => 2,
@@ -4002,7 +4082,7 @@ impl<'ctx> CodeGen<'ctx> {
             } => 16, // { Code, Data }
             PascalType::Proc { .. } => 8, // function pointer
             PascalType::ConformantArray { .. } => 8, // base pointer
-            PascalType::Set { .. } => 32, // 4 x i64 = 256 bits
+            set @ PascalType::Set { .. } => self.set_layout(set).0,
             PascalType::Array { lo, hi, elem } => {
                 let count = (hi - lo + 1).max(0) as u64;
                 count * self.sizeof_type(elem)
@@ -4056,7 +4136,7 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
-        let cond_val = self.compile_expr(condition)?;
+        let cond_val = self.compile_expr_for(condition, &PascalType::Boolean)?;
 
         // Ensure condition is an i1 (bool)
         let cond_bool = if cond_val.is_int_value() {
@@ -4132,7 +4212,7 @@ impl<'ctx> CodeGen<'ctx> {
         } else {
             None
         };
-        let cond_val = self.compile_expr(condition)?;
+        let cond_val = self.compile_expr_for(condition, &PascalType::Boolean)?;
 
         let cond_bool = if cond_val.is_int_value() {
             let iv = cond_val.into_int_value();
@@ -4344,7 +4424,7 @@ impl<'ctx> CodeGen<'ctx> {
         } else {
             None
         };
-        let cond_val = self.compile_expr(condition)?;
+        let cond_val = self.compile_expr_for(condition, &PascalType::Boolean)?;
         let cond_bool = if cond_val.is_int_value() {
             let iv = cond_val.into_int_value();
             if iv.get_type().get_bit_width() == 1 {
@@ -4704,6 +4784,9 @@ impl<'ctx> CodeGen<'ctx> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
         self.set_debug_loc(span);
         let (slot, target_ty) = self.resolve_array_base(target, span)?;
+        if let Some(text) = self.currency_text(value, span)? {
+            return self.store_value(slot, text, &target_ty, span);
+        }
         let val = self.compile_expr(&value.expr)?;
         if let Some(text) = self.real_text(value, val, span)? {
             return self.store_value(slot, text, &target_ty, span);
@@ -4927,12 +5010,20 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
         let err = |e: inkwell::builder::BuilderError| CodeGenError::new(e.to_string(), Some(span));
+        if let Some(text) = self.currency_text(arg, span)? {
+            return Ok(text);
+        }
         let val = self.compile_expr(&arg.expr)?;
         // A real formats its width itself.
         if let Some(text) = self.real_text(arg, val, span)? {
             return Ok(text);
         }
         let declared = self.resolve_type(&self.infer_declared_type(&arg.expr));
+        let val = if declared == PascalType::Variant {
+            self.variant_to(val, &PascalType::String, span)?
+        } else {
+            val
+        };
         let text: BasicValueEnum = if self.is_ustr(val) || Self::is_wide_char(val) {
             self.ustr_to_ansi(val, span)?
         } else if let PascalType::Enum {
@@ -5048,7 +5139,7 @@ impl<'ctx> CodeGen<'ctx> {
         let code_slot = self.entry_alloca(i64_ty, "val_code").map_err(err)?;
         let helper = if matches!(
             self.resolve_type(&target_ty),
-            PascalType::Real | PascalType::Single
+            PascalType::Real | PascalType::Single | PascalType::Currency
         ) {
             "bruto_val_real"
         } else {
@@ -5387,6 +5478,26 @@ impl<'ctx> CodeGen<'ctx> {
         span: Span,
     ) -> Result<(), CodeGenError> {
         self.set_debug_loc(span);
+        // A set stored in fewer than 32 bytes: `S := S + [X]`.
+        if args.len() == 2
+            && self.is_addressable(&args[0])
+            && self.set_layout(&self.infer_declared_type(&args[0])).0 != 32
+        {
+            let op = if is_include { BinOp::Add } else { BinOp::Sub };
+            return self.compile_statement(&Statement::PlaceAssignment {
+                target: args[0].clone(),
+                expr: Expr::BinOp {
+                    op,
+                    left: Box::new(args[0].clone()),
+                    right: Box::new(Expr::SetConstructor {
+                        elements: vec![SetElement::Single(args[1].clone())],
+                        span,
+                    }),
+                    span,
+                },
+                span,
+            });
+        }
         // A set variable, field or element.
         let alloca = match &args[0] {
             Expr::Var(name, _) => *self.lookup_var(name.as_str()).ok_or_else(|| {
@@ -5698,7 +5809,29 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         for arg in &args[start_idx..] {
+            // A Currency, as FPC formats it.
+            if let Some(text) = self.currency_text(arg, span)? {
+                match file_target {
+                    Some(fp) => {
+                        let f = self.module.get_function("bruto_file_write_str").unwrap();
+                        self.builder
+                            .build_call(f, &[fp.into(), text.into()], "")
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(span)))?;
+                    }
+                    None => {
+                        self.call_ustr_runtime("bruto_astr_write", &[text.into()], span)?;
+                    }
+                }
+                continue;
+            }
             let val = self.compile_expr(&arg.expr)?;
+            // A Variant: its text, as VarToStr gives it.
+            let variant = self.expr_is_variant(&arg.expr);
+            let val = if variant {
+                self.variant_to(val, &PascalType::String, span)?
+            } else {
+                val
+            };
             // A real, as FPC formats it.
             if let Some(text) = self.real_text(arg, val, span)? {
                 match file_target {
@@ -5715,6 +5848,9 @@ impl<'ctx> CodeGen<'ctx> {
                 continue;
             }
             let mut arg_type = self.resolve_type(&self.infer_expr_type(&arg.expr));
+            if variant {
+                arg_type = PascalType::String;
+            }
             // An enumeration value: its name, left-justified in its width,
             // as FPC writes it.
             if let PascalType::Enum {
@@ -6685,6 +6821,9 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
                 self.widen_loaded(val, &pointed, *span)
             }
+            Expr::Index { array, .. } if self.expr_is_variant(array) => {
+                self.compile_variant_index(expr)
+            }
             Expr::Index { array, index, span } if self.is_string_expr(array) => {
                 let s = self.compile_expr(array)?.into_pointer_value();
                 let idx = self.compile_expr(index)?;
@@ -6821,6 +6960,17 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Err(CodeGenError::new("field access on non-record", Some(*span))),
                 }
             }
+            Expr::Call { name, args, span }
+                if args.len() == 1
+                    && let Some(target) = self.variant_cast_type(name, &args[0]) =>
+            {
+                if self.is_variant(&target) {
+                    self.compile_as_variant(&args[0])
+                } else {
+                    let v = self.compile_expr(&args[0])?;
+                    self.variant_to(v, &target, *span)
+                }
+            }
             Expr::Call { name, args, span } => {
                 // Type casts: integer(x), real(x), char(x), boolean(x)
                 if matches!(name.as_str(), "integer" | "real" | "char" | "boolean")
@@ -6919,10 +7069,11 @@ impl<'ctx> CodeGen<'ctx> {
                     {
                         let (address, _) = self.resolve_array_base(&args[0], *span)?;
                         let ty = self.llvm_type_for(&target);
-                        return self
+                        let val = self
                             .builder
                             .build_load(ty, address, "reinterpret")
-                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)));
+                            .map_err(|e| CodeGenError::new(e.to_string(), Some(*span)))?;
+                        return self.widen_loaded(val, &target, *span);
                     }
                     // `UnicodeString(P)` of a raw pointer (a collection item)
                     // takes the pointer as the string: a reinterpretation,
@@ -7296,7 +7447,8 @@ impl<'ctx> CodeGen<'ctx> {
                 if name == "round" && args.len() == 1 {
                     let val = self.compile_expr(&args[0])?;
                     let fval = self.promote_to_f64(val, *span)?;
-                    let round_fn = self.get_or_declare_f64_intrinsic("llvm.round.f64");
+                    // Halves to even, as FPC rounds.
+                    let round_fn = self.get_or_declare_f64_intrinsic("llvm.roundeven.f64");
                     let rounded = self
                         .builder
                         .build_call(round_fn, &[fval.into()], "rounded")
@@ -8083,8 +8235,9 @@ impl<'ctx> CodeGen<'ctx> {
                     })
                 }),
             },
-            PascalType::Set { elem } => PascalType::Set {
+            PascalType::Set { elem, pack } => PascalType::Set {
                 elem: Box::new(self.resolve_type_at(elem, behind_pointer)),
+                pack: *pack,
             },
             PascalType::File { elem } => PascalType::File {
                 elem: Box::new(self.resolve_type_at(elem, behind_pointer)),
@@ -8394,6 +8547,9 @@ impl<'ctx> CodeGen<'ctx> {
                 .as_basic_type_enum(),
             PascalType::Real => self.context.f64_type().as_basic_type_enum(),
             PascalType::Single => self.context.f32_type().as_basic_type_enum(),
+            PascalType::Currency => self.context.i64_type().as_basic_type_enum(),
+            // FPC's TVarData: the type code, three reserved words, the value.
+            PascalType::Variant => self.variant_type().as_basic_type_enum(),
             PascalType::Boolean => self.context.bool_type().as_basic_type_enum(),
             PascalType::Char => self.context.i8_type().as_basic_type_enum(),
             PascalType::WideChar => self.context.i16_type().as_basic_type_enum(),
@@ -8417,7 +8573,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .context
                 .ptr_type(AddressSpace::default())
                 .as_basic_type_enum(),
-            PascalType::Set { .. } => self.context.i64_type().array_type(4).as_basic_type_enum(),
+            set @ PascalType::Set { .. } => self.set_storage_type(set),
             PascalType::Array { lo, hi, elem } => {
                 let count = (hi - lo + 1).max(0) as u32;
                 let elem_ty = self.llvm_type_for(elem);
@@ -8579,6 +8735,20 @@ impl<'ctx> CodeGen<'ctx> {
         right: &Expr,
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        if (self.expr_is_variant(left) || self.expr_is_variant(right))
+            && let Some(result) = self.compile_variant_binop(op, left, right, span)?
+        {
+            return Ok(result);
+        }
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+            && self.currency_binop_type(
+                op,
+                &self.infer_declared_type(left),
+                &self.infer_declared_type(right),
+            )
+        {
+            return self.compile_currency_binop(op, left, right, span);
+        }
         // `Ev = nil`, `Ev <> Other`: method pointers compare by their code.
         if matches!(op, BinOp::Eq | BinOp::Neq)
             && [left, right].iter().any(|e| {
@@ -8666,8 +8836,9 @@ impl<'ctx> CodeGen<'ctx> {
             let sixty_four = i64_ty.const_int(64, false);
             let one_i64 = i64_ty.const_int(1, false);
 
-            // lhs is the ordinal, rhs is the set ([4 x i64])
-            let ord = lhs.into_int_value();
+            // lhs is the ordinal (`'a'` a character), rhs is the set
+            // ([4 x i64])
+            let ord = self.first_char_if_string(lhs, span)?.into_int_value();
             let ord = if ord.get_type().get_bit_width() < 64 {
                 self.builder
                     .build_int_z_extend(ord, i64_ty, "ord_ext")
@@ -9178,10 +9349,17 @@ impl<'ctx> CodeGen<'ctx> {
             let l = lhs.into_pointer_value();
             let r = rhs.into_pointer_value();
             // If either side is nil or a pointer (not string), compare addresses directly.
-            let lt = self.infer_expr_type(left);
-            let rt = self.infer_expr_type(right);
-            let is_ptr_cmp = matches!(op, BinOp::Eq | BinOp::Neq)
-                && (matches!(lt, PascalType::Pointer(_)) || matches!(rt, PascalType::Pointer(_)));
+            let lt = self.resolve_type(&self.infer_expr_type(left));
+            let rt = self.resolve_type(&self.infer_expr_type(right));
+            // Class references and procedural values compare as addresses
+            // too (not as the bytes they point at).
+            let address = |t: &PascalType| {
+                matches!(
+                    t,
+                    PascalType::Pointer(_) | PascalType::ClassOf(_) | PascalType::Proc { .. }
+                )
+            };
+            let is_ptr_cmp = matches!(op, BinOp::Eq | BinOp::Neq) && (address(&lt) || address(&rt));
             if is_ptr_cmp {
                 let i64_ty = self.context.i64_type();
                 let li = self
@@ -9314,6 +9492,9 @@ impl<'ctx> CodeGen<'ctx> {
         operand: &Expr,
         span: Span,
     ) -> Result<BasicValueEnum<'ctx>, CodeGenError> {
+        if self.expr_is_variant(operand) {
+            return self.compile_variant_unary(op, operand, span);
+        }
         let val = self.compile_expr(operand)?;
 
         match op {
@@ -9686,7 +9867,7 @@ impl<'ctx> CodeGen<'ctx> {
             && val.is_int_value()
         {
             let bits = self.to_i64(val, span)?;
-            let set_ty = self.llvm_type_for(target).into_array_type();
+            let set_ty = self.context.i64_type().array_type(4);
             return Ok(self
                 .builder
                 .build_insert_value(set_ty.const_zero(), bits, 0, "set_bits")
@@ -9916,11 +10097,11 @@ impl<'ctx> CodeGen<'ctx> {
         match ty {
             PascalType::SizedInt { .. } => PascalType::Integer,
             PascalType::ShortString { .. } => PascalType::String,
-            PascalType::Single => PascalType::Real,
+            PascalType::Single | PascalType::Currency => PascalType::Real,
             PascalType::Named(n) => match self.resolve_type(&PascalType::Named(n.clone())) {
                 PascalType::SizedInt { .. } => PascalType::Integer,
                 PascalType::ShortString { .. } => PascalType::String,
-                PascalType::Single => PascalType::Real,
+                PascalType::Single | PascalType::Currency => PascalType::Real,
                 _ => PascalType::Named(n),
             },
             other => other,
@@ -10025,6 +10206,7 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Nil(_) => PascalType::Pointer(Box::new(PascalType::Integer)),
             Expr::SetConstructor { .. } => PascalType::Set {
                 elem: Box::new(PascalType::Integer),
+                pack: 0,
             },
             Expr::BinOp {
                 op, left, right, ..
@@ -10038,6 +10220,9 @@ impl<'ctx> CodeGen<'ctx> {
                     | BinOp::Gte
                     | BinOp::In
                     | BinOp::Is => return PascalType::Boolean,
+                    _ if self.expr_is_variant(left) || self.expr_is_variant(right) => {
+                        return PascalType::Variant;
+                    }
                     BinOp::As => {
                         return match right.as_ref() {
                             Expr::Var(class, _) => PascalType::Named(class.clone()),
@@ -10049,6 +10234,9 @@ impl<'ctx> CodeGen<'ctx> {
                 // Each side's type once (a long `a + b + c...` stays linear).
                 let ld = self.infer_declared_type(left);
                 let rd = self.infer_declared_type(right);
+                if self.currency_binop_type(*op, &ld, &rd) {
+                    return PascalType::Currency;
+                }
                 // QWord arithmetic gives a QWord.
                 if self.qword_arith_types(left, &ld, right, &rd) {
                     return PascalType::SizedInt {
@@ -10097,6 +10285,7 @@ impl<'ctx> CodeGen<'ctx> {
                         {
                             PascalType::Set {
                                 elem: Box::new(PascalType::Integer),
+                                pack: 0,
                             }
                         } else if *op == BinOp::Add && textual(&lr) && textual(&rr) {
                             // Concatenation, characters included.
@@ -10110,6 +10299,12 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::UnaryOp { op, operand, .. } => {
+                let declared = self.resolve_type(&self.infer_declared_type(operand));
+                if declared == PascalType::Variant
+                    || (declared == PascalType::Currency && *op == UnaryOp::Neg)
+                {
+                    return declared;
+                }
                 let operand = self.resolve_type(&self.infer_expr_type(operand));
                 match op {
                     UnaryOp::Neg if operand == PascalType::Real => PascalType::Real,
@@ -10221,6 +10416,7 @@ impl<'ctx> CodeGen<'ctx> {
                     PascalType::String | PascalType::ShortString { .. } => PascalType::Char,
                     PascalType::UnicodeString => PascalType::WideChar,
                     PascalType::Pointer(elem) if *elem != PascalType::Untyped => *elem,
+                    PascalType::Variant => PascalType::Variant,
                     _ => PascalType::Integer,
                 }
             }

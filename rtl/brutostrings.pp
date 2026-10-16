@@ -116,6 +116,16 @@ procedure bruto_astr_release(S: Pointer);
 procedure bruto_astr_return(S: Pointer);
 function bruto_pool_mark: Int64;
 procedure bruto_pool_drain(Mark: Int64);
+{ Variants (16 bytes, as FPC's TVarData: a Word type, three reserved
+  Words and 8 bytes of data): an AnsiString, a UnicodeString (OleStr)
+  or a variant array (a dynamic array of variants) in the data is
+  counted like a string. }
+procedure bruto_var_addref(P: Pointer);
+procedure bruto_var_release(P: Pointer);
+procedure bruto_var_return(P: Pointer);
+{ A dynamic array block holding its own reference (see bruto_dynarr_block):
+  what a variant array's data is made of. }
+function bruto_dynarr_owned(Count, ElemSize: Int64; Cleanup, Addref: Pointer): Pointer;
 { Interface references (Obj, ITable): counted through the itable's
   _AddRef and _Release. }
 procedure bruto_intf_addref(Obj, ITable: Pointer);
@@ -403,6 +413,34 @@ begin
     bruto_pool_add(S);
 end;
 
+{ Whether the variant at P holds a counted pointer. }
+function bruto_var_counted(P: Pointer): Boolean;
+var
+  VType: Word;
+begin
+  VType := PWord(P)^;
+  bruto_var_counted := (VType = 8) or (VType = $100) or (VType = $102)
+    or ((VType and $2000) <> 0);
+end;
+
+procedure bruto_var_addref(P: Pointer);
+begin
+  if bruto_var_counted(P) then
+    bruto_astr_addref(PPointer(P + 8)^);
+end;
+
+procedure bruto_var_release(P: Pointer);
+begin
+  if bruto_var_counted(P) then
+    bruto_astr_release(PPointer(P + 8)^);
+end;
+
+procedure bruto_var_return(P: Pointer);
+begin
+  if bruto_var_counted(P) then
+    bruto_astr_return(PPointer(P + 8)^);
+end;
+
 function bruto_pool_mark: Int64;
 begin
   bruto_pool_mark := BrutoPoolCount;
@@ -478,6 +516,15 @@ begin
   if BrutoArc then
     bruto_pool_add(Header + 16);
   bruto_dynarr_block := Header + 16;
+end;
+
+function bruto_dynarr_owned(Count, ElemSize: Int64; Cleanup, Addref: Pointer): Pointer;
+var
+  P: Pointer;
+begin
+  P := bruto_dynarr_block(Count, ElemSize, Cleanup, Addref);
+  PBrutoCount(P - 12)^ := 1;
+  bruto_dynarr_owned := P;
 end;
 
 procedure bruto_dynarr_setlength(Slot: Pointer; NewCount, ElemSize: Int64; Cleanup, Addref: Pointer);

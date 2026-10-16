@@ -588,7 +588,7 @@ fn builtin_size(name: &str) -> Option<i64> {
         "word" | "smallint" | "int16" | "uint16" | "widechar" | "unicodechar" => 2,
         "longint" | "longword" | "cardinal" | "dword" | "int32" | "uint32" => 4,
         "integer" | "int64" | "qword" | "uint64" | "ptrint" | "ptruint" | "sizeint"
-        | "sizeuint" | "nativeint" | "nativeuint" | "real" | "double" | "pointer"
+        | "sizeuint" | "nativeint" | "nativeuint" | "real" | "double" | "currency" | "pointer"
         | "codepointer" | "string" | "unicodestring" | "widestring" | "ansistring" => 8,
         _ => return None,
     })
@@ -615,7 +615,9 @@ pub(crate) fn builtin_type(name: &str) -> Option<PascalType> {
         "ansistring" | "rawbytestring" | "utf8string" => PascalType::String,
         "unicodestring" | "widestring" => PascalType::UnicodeString,
         "single" => PascalType::Single,
-        "double" | "extended" | "currency" | "comp" => PascalType::Real,
+        "variant" | "olevariant" => PascalType::Variant,
+        "currency" => PascalType::Currency,
+        "double" | "extended" | "comp" => PascalType::Real,
         // A file variable is one pointer to the runtime's file record;
         // seen as FPC's `FileRec` / `TextRec`, that pointer is the handle.
         "filerec" | "textrec" => PascalType::Record {
@@ -855,7 +857,7 @@ impl ConstEnv {
             }
             PascalType::Array { elem, .. }
             | PascalType::Pointer(elem)
-            | PascalType::Set { elem }
+            | PascalType::Set { elem, .. }
             | PascalType::File { elem }
             | PascalType::ConformantArray { elem, .. } => self.resolve_type(elem, span)?,
             PascalType::Record {
@@ -891,6 +893,8 @@ impl ConstEnv {
             PascalType::Integer
             | PascalType::Real
             | PascalType::Single
+            | PascalType::Currency
+            | PascalType::Variant
             | PascalType::String
             | PascalType::Boolean
             | PascalType::Char

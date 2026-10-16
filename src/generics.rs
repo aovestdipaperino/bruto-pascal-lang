@@ -69,6 +69,7 @@ fn type_key(ty: &PascalType, aliases: &HashMap<String, PascalType>) -> String {
         PascalType::Integer => "integer".into(),
         PascalType::Real => "real".into(),
         PascalType::Single => "single".into(),
+        PascalType::Currency => "currency".into(),
         PascalType::String => "string".into(),
         PascalType::UnicodeString => "unicodestring".into(),
         PascalType::Boolean => "boolean".into(),
@@ -158,7 +159,7 @@ impl Generics {
             | PascalType::ArrayExpr { elem, .. }
             | PascalType::ConformantArray { elem, .. }
             | PascalType::Pointer(elem)
-            | PascalType::Set { elem }
+            | PascalType::Set { elem, .. }
             | PascalType::File { elem }
             | PascalType::DynArray(elem)
             | PascalType::OpenArray(elem)
@@ -342,6 +343,7 @@ impl Generics {
             PascalType::Integer => system("Int64"),
             PascalType::Real => system("Double"),
             PascalType::Single => system("Single"),
+            PascalType::Currency => system("Currency"),
             PascalType::String => system("AnsiString"),
             PascalType::UnicodeString => system("UnicodeString"),
             PascalType::Boolean => system("Boolean"),

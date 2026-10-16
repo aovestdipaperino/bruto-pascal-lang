@@ -216,7 +216,7 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
         PascalType::Array { elem, .. }
         | PascalType::ArrayExpr { elem, .. }
         | PascalType::Pointer(elem)
-        | PascalType::Set { elem }
+        | PascalType::Set { elem, .. }
         | PascalType::File { elem } => collect_type(elem, n),
         PascalType::ConformantArray {
             lo_name,
@@ -247,6 +247,8 @@ fn collect_type(ty: &PascalType, n: &mut Namer) {
         | PascalType::Untyped
         | PascalType::Real
         | PascalType::Single
+        | PascalType::Variant
+        | PascalType::Currency
         | PascalType::String
         | PascalType::Boolean
         | PascalType::Char

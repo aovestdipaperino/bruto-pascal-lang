@@ -94,6 +94,10 @@ function GetMethodProp(Instance: TObject; PropInfo: PPropInfo): TMethod; overloa
 function GetMethodProp(Instance: TObject; const PropName: string): TMethod; overload;
 procedure SetMethodProp(Instance: TObject; PropInfo: PPropInfo; const Value: TMethod); overload;
 procedure SetMethodProp(Instance: TObject; const PropName: string; const Value: TMethod); overload;
+function GetVariantProp(Instance: TObject; PropInfo: PPropInfo): Variant; overload;
+function GetVariantProp(Instance: TObject; const PropName: string): Variant; overload;
+procedure SetVariantProp(Instance: TObject; PropInfo: PPropInfo; const Value: Variant); overload;
+procedure SetVariantProp(Instance: TObject; const PropName: string; const Value: Variant); overload;
 
 implementation
 
@@ -112,6 +116,12 @@ type
   TGetStrIndex = function(Self: Pointer; Index: LongInt): AnsiString;
   TSetStr = procedure(Self: Pointer; const Value: AnsiString);
   TSetStrIndex = procedure(Self: Pointer; Index: LongInt; const Value: AnsiString);
+  TGetCurr = function(Self: Pointer): Currency;
+  TSetCurr = procedure(Self: Pointer; Value: Currency);
+  TGetVar = function(Self: Pointer): Variant;
+  TGetVarIndex = function(Self: Pointer; Index: LongInt): Variant;
+  TSetVar = procedure(Self: Pointer; const Value: Variant);
+  TSetVarIndex = procedure(Self: Pointer; Index: LongInt; const Value: Variant);
   TGetDouble = function(Self: Pointer): Double;
   TGetDoubleIndex = function(Self: Pointer; Index: LongInt): Double;
   TSetDouble = procedure(Self: Pointer; Value: Double);
@@ -715,26 +725,78 @@ begin
   SetStrProp(Instance, FindPropInfo(Instance, PropName), Value);
 end;
 
+function GetVariantProp(Instance: TObject; PropInfo: PPropInfo): Variant;
+var
+  Code: Pointer;
+begin
+  case PropInfo^.PropProcs and 3 of
+    ptField:
+      Result := PVariant(Pointer(Instance) + PtrUInt(PropInfo^.GetProc))^;
+    ptStatic, ptVirtual:
+      begin
+        Code := AccessorCode(Instance, PropInfo^.GetProc, PropInfo^.PropProcs and 3);
+        if HasIndex(PropInfo) then
+          Result := TGetVarIndex(Code)(Pointer(Instance), PropInfo^.Index)
+        else
+          Result := TGetVar(Code)(Pointer(Instance));
+      end;
+  end;
+end;
+
+function GetVariantProp(Instance: TObject; const PropName: string): Variant;
+begin
+  Result := GetVariantProp(Instance, FindPropInfo(Instance, PropName));
+end;
+
+procedure SetVariantProp(Instance: TObject; PropInfo: PPropInfo; const Value: Variant);
+var
+  Code: Pointer;
+begin
+  case (PropInfo^.PropProcs shr 2) and 3 of
+    ptField:
+      if PropInfo^.SetProc <> nil then
+        PVariant(Pointer(Instance) + PtrUInt(PropInfo^.SetProc))^ := Value;
+    ptStatic, ptVirtual:
+      begin
+        Code := AccessorCode(Instance, PropInfo^.SetProc, (PropInfo^.PropProcs shr 2) and 3);
+        if HasIndex(PropInfo) then
+          TSetVarIndex(Code)(Pointer(Instance), PropInfo^.Index, Value)
+        else
+          TSetVar(Code)(Pointer(Instance), Value);
+      end;
+  end;
+end;
+
+procedure SetVariantProp(Instance: TObject; const PropName: string; const Value: Variant);
+begin
+  SetVariantProp(Instance, FindPropInfo(Instance, PropName), Value);
+end;
+
 function GetFloatProp(Instance: TObject; PropInfo: PPropInfo): Double;
 var
   P, Code: Pointer;
-  IsSingle: Boolean;
+  IsSingle, IsCurr: Boolean;
 begin
   Result := 0;
   IsSingle := GetTypeData(PropInfo^.PropType)^.FloatType = ftSingle;
+  IsCurr := GetTypeData(PropInfo^.PropType)^.FloatType = ftCurr;
   case PropInfo^.PropProcs and 3 of
     ptField:
       begin
         P := Pointer(Instance) + PtrUInt(PropInfo^.GetProc);
         if IsSingle then
           Result := PSingle(P)^
+        else if IsCurr then
+          Result := PCurrency(P)^
         else
           Result := PDouble(P)^;
       end;
     ptStatic, ptVirtual:
       begin
         Code := AccessorCode(Instance, PropInfo^.GetProc, PropInfo^.PropProcs and 3);
-        if IsSingle then
+        if IsCurr then
+          Result := TGetCurr(Code)(Pointer(Instance))
+        else if IsSingle then
           Result := TGetSingle(Code)(Pointer(Instance))
         else if HasIndex(PropInfo) then
           Result := TGetDoubleIndex(Code)(Pointer(Instance), PropInfo^.Index)
@@ -752,9 +814,10 @@ end;
 procedure SetFloatProp(Instance: TObject; PropInfo: PPropInfo; Value: Double);
 var
   P, Code: Pointer;
-  IsSingle: Boolean;
+  IsSingle, IsCurr: Boolean;
 begin
   IsSingle := GetTypeData(PropInfo^.PropType)^.FloatType = ftSingle;
+  IsCurr := GetTypeData(PropInfo^.PropType)^.FloatType = ftCurr;
   case (PropInfo^.PropProcs shr 2) and 3 of
     ptField:
       if PropInfo^.SetProc <> nil then
@@ -762,13 +825,17 @@ begin
         P := Pointer(Instance) + PtrUInt(PropInfo^.SetProc);
         if IsSingle then
           PSingle(P)^ := Value
+        else if IsCurr then
+          PCurrency(P)^ := Value
         else
           PDouble(P)^ := Value;
       end;
     ptStatic, ptVirtual:
       begin
         Code := AccessorCode(Instance, PropInfo^.SetProc, (PropInfo^.PropProcs shr 2) and 3);
-        if IsSingle then
+        if IsCurr then
+          TSetCurr(Code)(Pointer(Instance), Value)
+        else if IsSingle then
           TSetSingle(Code)(Pointer(Instance), Value)
         else if HasIndex(PropInfo) then
           TSetDoubleIndex(Code)(Pointer(Instance), PropInfo^.Index, Value)
