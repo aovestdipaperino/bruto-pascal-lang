@@ -1,5 +1,7 @@
 # Bruto Pascal Lang
 
+[![GitHub stars](https://img.shields.io/github/stars/aovestdipaperino/bruto-pascal-lang?logo=github&color=brightgreen)](https://github.com/aovestdipaperino/bruto-pascal-lang/stargazers)
+
 A Mini-Pascal compiler implementing most of Wirth's original Pascal (1973 Report)
 plus the practical subset of ISO 7185 / Turbo Pascal extensions, suitable for
 [bruto-ide](https://github.com/aovestdipaperino/bruto-ide).
